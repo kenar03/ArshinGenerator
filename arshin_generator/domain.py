@@ -92,6 +92,7 @@ class RegistryEntry:
     public_id: str = ""
     scheme: str = ""
     model: str = ""
+    choice_ids: tuple[str, ...] = ()
 
 
 @dataclass
@@ -103,6 +104,9 @@ class Result:
     issues: list[str] = field(default_factory=list)
     candidate: str = ""
     shared_issues: tuple[str, ...] = ()
+    equipment_issues: tuple[str, ...] = ()
+    missing_fields: tuple[str, ...] = ()
+    repair_fields: set[str] = field(default_factory=set)
 
     def value(self, name: str) -> Scalar:
         return self.fields[name].value if name in self.fields else None

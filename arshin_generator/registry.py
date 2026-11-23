@@ -96,7 +96,7 @@ def resolve(item: Equipment, entries: list[RegistryEntry], when: date | None,
         entry for entry in entries
         if _same_equipment(item, entry) and not registry_issues(entry)
     ]
-    if online and online.state in {"found", "choice", "conflict", "missing"}:
+    if online and online.state in {"found", "choice", "conflict", "missing", "expired", "response"}:
         valid = [candidate.entry for candidate in online.candidates if candidate.eligible]
         if online.state == "found" and len(valid) == 1:
             return valid[0], ""
@@ -119,6 +119,36 @@ def resolve(item: Equipment, entries: list[RegistryEntry], when: date | None,
     if online:
         return None, online.message
     return None, "Нет точного подтверждённого соответствия ФИФ ОЕИ"
+
+
+def resolve_many(item: Equipment, entries: list[RegistryEntry], when: date | None,
+                 online: EquipmentLookup | None = None) -> tuple[list[RegistryEntry], str]:
+    saved = [entry for entry in entries if entry.choice_ids and _same_equipment(item, entry)
+             and not registry_issues(entry) and when and iso_date(entry.valid_from) <= when <= iso_date(entry.valid_until)]
+    if not saved:
+        entry, reason = resolve(item, [entry for entry in entries if not entry.choice_ids], when, online)
+        return ([entry] if entry else []), reason
+    latest = saved[-1]
+    saved = [entry for entry in saved if entry.choice_ids == latest.choice_ids and entry.confirmed_at == latest.confirmed_at]
+    requested = set(latest.choice_ids)
+    if {entry.public_id for entry in saved} != requested:
+        return [], "Нужно уточнить ранее выбранные карточки: действует не весь набор"
+    if online and online.state in {"found", "choice", "conflict", "missing", "expired", "response"}:
+        matches = {}
+        for candidate in online.candidates:
+            if candidate.eligible:
+                human = next((entry for entry in saved if _choice_matches(entry, candidate.entry)), None)
+                if human:
+                    actual = candidate.entry
+                    matches[actual.public_id] = replace(
+                        actual, evidence=f"{actual.evidence} · Выбор: {human.evidence}",
+                        confirmer=human.confirmer, confirmed_at=human.confirmed_at
+                    )
+        if matches.keys() != requested:
+            return [], online.message or "Проверьте ранее выбранные карточки"
+    else:
+        matches = {entry.public_id: entry for entry in saved}
+    return [matches[key] for key in latest.choice_ids], ""
 
 
 def _latest(rows: list[dict], when: date) -> list[dict]:
@@ -183,6 +213,24 @@ def _ordinary(item: Equipment, when: date, client: PublicClient) -> tuple[list[E
     return result, False
 
 
+def _linked_verification(client, proof, official_id, number, serial, model):
+    detail = client.detail("vri", proof["vri_id"])
+    mi = detail.get("miInfo")
+    eta = mi.get("etaMI") if isinstance(mi, dict) else None
+    info = detail.get("vriInfo")
+    if not isinstance(eta, dict) or not isinstance(info, dict):
+        return "Связанная поверка не подтверждает категорию эталона"
+    if (eta.get("regNumber"), eta.get("mitypeNumber"), eta.get("manufactureNum")) != (official_id, number, serial):
+        return "Реквизиты эталона расходятся со связанной поверкой"
+    if _notation(str(eta.get("modification") or eta.get("mitypeType") or "")) != _notation(model):
+        return "Модель расходится со связанной поверкой"
+    if (not isinstance(info.get("applicable"), dict) or info.get("inapplicable") is not None or
+            public_date(info.get("vrfDate")) != public_date(proof.get("verification_date")) or
+            public_date(info.get("validDate")) != public_date(proof.get("valid_date"))):
+        return "Результат или срок расходятся со связанной поверкой"
+    return ""
+
+
 def _standards(item: Equipment, when: date, client: PublicClient) -> tuple[list[EquipmentCandidate], bool]:
     if item.registration:
         requested = item.registration
@@ -229,6 +277,8 @@ def _standards(item: Equipment, when: date, client: PublicClient) -> tuple[list[
         if len(latest) > 1:
             problem = "Несколько связанных поверок на одну дату"
         proof = latest[0] if latest else {}
+        if not problem and proof.get("vri_id") and not _interval(proof, when)[2]:
+            problem = _linked_verification(client, proof, official_id, number, serial, model)
         candidates.append(_candidate(item, "mieta", record_id, official_id, number, serial, model, scheme,
                                      proof, when, problem or ("Нет связанной поверки на дату протокола" if not latest else "")))
     return candidates, corrected
@@ -246,18 +296,22 @@ def lookup_equipment(item: Equipment, when: date, client: PublicClient | None = 
         candidates, corrected = (_standards(item, when, client) if item.category == "mieta"
                                  else _ordinary(item, when, client))
     except PublicDataError as exc:
-        return EquipmentLookup("unavailable", f"Онлайн-проверка: {exc}")
+        if exc.kind == "connection":
+            return EquipmentLookup("unavailable", "Не удалось подключиться к реестру. Повторите проверку")
+        return EquipmentLookup("response", "Ответ реестра не удалось проверить. Повторите проверку")
     if not candidates:
-        return EquipmentLookup("missing", "Ошибка: точная публичная карточка не найдена")
+        return EquipmentLookup("missing", "Средство поверки не найдено")
     available = [c for c in candidates if c.eligible]
     if len(available) == 1 and not corrected:
         return EquipmentLookup("found", "", tuple(candidates))
     if available:
-        reason = ("Неоднозначность: проверьте алфавит полного регистрационного номера" if corrected
-                  else "Неоднозначность: выберите подходящую карточку ФИФ ОЕИ")
+        reason = ("Проверьте написание номера записи" if corrected
+                  else "Найдено несколько подходящих записей. Требуется выбор")
         return EquipmentLookup("choice", reason, tuple(candidates))
+    if all(c.entry.valid_until and iso_date(c.entry.valid_until) < when for c in candidates):
+        return EquipmentLookup("expired", "Срок поверки средства истёк", tuple(candidates))
     if len(candidates) == 1:
         candidate = candidates[0]
         hint = f" · до {candidate.entry.valid_until}" if candidate.entry.valid_until else ""
-        return EquipmentLookup("conflict", f"Ошибка: {candidate.status}{hint}", tuple(candidates))
+        return EquipmentLookup("conflict", f"{candidate.status}{hint}", tuple(candidates))
     return EquipmentLookup("conflict", "Ошибка: публичные карточки не подтверждают реквизиты или срок", tuple(candidates))

@@ -35,6 +35,9 @@ QLabel#subtitle {{ color: {MAST_SECONDARY}; font-size: 10pt; }}
 QLabel#summary {{ color: {MAST_SUMMARY}; font-size: 12pt; font-weight: 600; }}
 QLabel#heading {{ color: {INK}; font-size: 14pt; font-weight: 600; }}
 QLabel#muted {{ color: {MUTED}; }}
+QLabel#workTitle {{ color: {INK}; font-size: 23pt; font-weight: 600; }}
+QFrame#emptyQueue {{ background: {SURFACE}; border: 1px solid {BORDER}; border-radius: 9px; }}
+QPushButton#rowAction {{ margin: 4px 6px; padding: 5px 10px; }}
 
 QPushButton, QToolButton {{
     color: {INK}; background: {SURFACE}; border: 1px solid {BORDER}; border-radius: 6px;

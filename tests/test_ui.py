@@ -3,18 +3,20 @@ from datetime import date
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import patch
 
-from PySide6.QtCore import QEventLoop, QTimer, Qt
+from PySide6.QtCore import QEventLoop, QItemSelectionModel, QTimer, Qt
 from PySide6.QtGui import QColor, QPalette
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QComboBox, QLineEdit, QTableView, QTreeWidget
 
-from arshin_generator.arshin import Schema, export
+from arshin_generator.arshin import Schema
 from arshin_generator.storage import Storage
-from arshin_generator.registry import lookup_equipment, lookup_key
-from arshin_generator.ui.dialogs import EquipmentReviewDialog, XmlDialog
+from arshin_generator.registry import EquipmentLookup, lookup_equipment, lookup_key, resolve_many
+from arshin_generator.ui.dialogs import EquipmentReviewPanel, XmlDialog
 from arshin_generator.ui.main import MainWindow
 from arshin_generator.ui.style import apply_theme
+from arshin_generator.ui.workflow import PreviewDialog, RepairDialog, save_corrections
 from tests.test_workflow import SAMPLE, approve, equipment, fixture
 from tests.test_public_registry import FixtureClient, etalon, mieta
 
@@ -74,30 +76,55 @@ class InterfaceTests(unittest.TestCase):
                 loop.exec()
             self.assertIsNone(main.thread)
             self.assertEqual(main.source_model.rowCount(), 1)
-            self.assertEqual(main.result_model.rowCount(), 25)
+            self.assertEqual(len(main.results), 25)
+            self.assertTrue(all(result.value("outcome") == "pass" for result in main.results))
             self.assertFalse(main.export_btn.isEnabled())
-            QTest.mouseClick(main.preview_btn, Qt.MouseButton.LeftButton)
-            self.assertEqual(main.tabs.currentIndex(), 1)
-            main.search.setText("018W6")
-            self.assertEqual(main.result_model.rowCount(), 1)
-            self.assertIn("018W6", main.card.toPlainText())
-            self.assertNotIn("Учебная книга", main.card.toPlainText())
-            self.assertNotIn("Нет точного подтверждённого соответствия ФИФ ОЕИ", main.card.toPlainText())
-            self.assertTrue(main.protocol_issues_btn.isVisible())
-            QTest.mouseClick(main.protocol_issues_btn, Qt.MouseButton.LeftButton)
-            self.assertEqual(main.tabs.currentIndex(), 0)
-            self.assertEqual(main.card.toPlainText().count("Нет точного подтверждённого соответствия ФИФ ОЕИ"), 8)
-            main.show_results()
-            self.assertIn("Данные!I", main.card.toPlainText())
-            main.search.clear()
+            action = main.source.indexWidget(main.source_model.index(0, 3))
+            self.assertEqual(action.text(), "Исправить")
+            with patch.object(RepairDialog, "exec", return_value=0) as opened:
+                QTest.mouseClick(action, Qt.MouseButton.LeftButton)
+                opened.assert_called_once()
+            protocol = main.protocols[0]
+            main.lookups = {
+                lookup_key(item, protocol.fields["verification_date"].value):
+                EquipmentLookup("unavailable", "Не удалось подключиться к реестру. Повторите проверку")
+                for item in protocol.equipment
+            }
+            main.recheck()
+            self.assertEqual(main.source_model.rows[0][1][2], "Нет связи с реестром")
+            repair = RepairDialog(main, protocol)
+            self.assertEqual(repair.tabs.tabText(0), "Средства поверки")
+            equipment_panel = repair.tabs.widget(0)
+            self.assertEqual(equipment_panel.item_model.rowCount(), 8)
+            self.assertNotIn("не найдено", " ".join(row[1][-1] for row in equipment_panel.item_model.rows))
+            repair.close()
+            preview = PreviewDialog(main, main.results)
+            self.assertEqual(preview.model.rowCount(), 25)
+            self.assertEqual(preview.model.headers, ("Заводской номер", "Модификация", "Дата поверки", "Результат"))
+            self.assertTrue(preview.card_btn.isEnabled())
+            with patch("arshin_generator.ui.workflow.QDialog.exec", return_value=0) as opened:
+                preview.open_card()
+                opened.assert_called_once()
+            preview.close()
+            save_corrections(storage, protocol, {"sign_pass": True, "sign_mi": False})
+            main.recheck()
+            self.assertTrue(all(result.value("sign_pass") is True and result.value("sign_mi") is False
+                                for result in main.results))
             p = fixture(path / "ui-test.xlsx", "ТЕСТ-ИНТЕРФЕЙС", "001B6")
             storage.save_equipment(equipment())
             approve(storage, p)
             main.protocols = [p]
-            QTest.mouseClick(main.check_btn, Qt.MouseButton.LeftButton)
+            main.lookups.clear()
+            main.recheck()
             self.assertTrue(main.export_btn.isEnabled())
-            self.assertTrue(main.view_record_btn.isEnabled())
-            files = export(main.results, schema, path, storage, [], "Тест")
+            self.assertEqual(main.source_model.rows[0][1][2], "Готов к выгрузке")
+            with patch("arshin_generator.ui.main.QFileDialog.getExistingDirectory", return_value=str(path)), \
+                    patch.object(main, "show_saved") as saved:
+                QTest.mouseClick(main.export_btn, Qt.MouseButton.LeftButton)
+                saved.assert_called_once()
+            files, records = saved.call_args.args
+            self.assertEqual(len(records), 1)
+            self.assertTrue(files[0].is_file())
             context = storage.export_context(storage.history()[0]["id"])
             xml = XmlDialog(main, files, schema, context)
             xml.search.setText("ТЕСТ-ИНТЕРФЕЙС")
@@ -106,6 +133,9 @@ class InterfaceTests(unittest.TestCase):
             self.assertIn("001B6", xml.raw.toPlainText())
             self.assertIn("01234567890", xml.raw.toPlainText())
             self.assertIn("Тестова А.В.", xml.raw.toPlainText())
+            self.assertFalse(xml.tabs.isTabVisible(1))
+            xml.toggle_technical(True)
+            self.assertTrue(xml.tabs.isTabVisible(1))
             xml.close()
             main.close()
 
@@ -126,11 +156,21 @@ class InterfaceTests(unittest.TestCase):
                 cases.append((row, detail))
             found = lookup_equipment(item, day, FixtureClient(cases))
             self.assertEqual(found.state, "choice")
-            dialog = EquipmentReviewDialog(None, storage, protocol, {lookup_key(item, day.isoformat()): found})
+            dialog = EquipmentReviewPanel(None, storage, protocol, {lookup_key(item, day.isoformat()): found})
             self.assertEqual(dialog.candidate_model.rowCount(), 2)
             self.assertFalse(dialog.select_btn.isEnabled())
-            dialog.candidates.selectRow(1)
+            for i in range(2):
+                dialog.candidates.selectionModel().select(
+                    dialog.candidate_model.index(i, 0), QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows
+                )
             self.assertTrue(dialog.select_btn.isEnabled())
+            self.assertEqual(len(dialog.selected_candidates()), 2)
+            dialog.choose()
+            entries, issue = resolve_many(item, Storage(path / "ui.sqlite3").entries(), day, found)
+            self.assertEqual(len(entries), 2)
+            self.assertFalse(issue)
+            only_one = type(found)("found", "", (found.candidates[0],))
+            self.assertFalse(resolve_many(item, storage.entries(), day, only_one)[0])
             dialog.close()
 
 

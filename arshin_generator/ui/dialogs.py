@@ -1,4 +1,5 @@
 from dataclasses import replace
+from getpass import getuser
 import json
 import logging
 from pathlib import Path
@@ -9,16 +10,16 @@ from lxml import etree
 from PySide6.QtCore import QThread, QUrl, Signal
 from PySide6.QtGui import QDesktopServices, QFontDatabase, QTextCursor
 from PySide6.QtWidgets import (
-    QComboBox, QDialog, QFileDialog, QHBoxLayout, QLineEdit, QPlainTextEdit, QTabWidget,
+    QAbstractItemView, QComboBox, QDialog, QFileDialog, QHBoxLayout, QLineEdit, QPlainTextEdit, QTabWidget,
     QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
 from ..arshin import NS, open_xml
 from ..domain import RegistryEntry
-from ..public_registry import API, PUBLIC_CARD, find_public_verifications
-from ..registry import CATEGORIES, iso_date, lookup_key, registry_issues, resolve
+from ..public_registry import PUBLIC_CARD, find_public_verifications
+from ..registry import CATEGORIES, iso_date, lookup_key, registry_issues, resolve_many
 from ..storage import PORTAL_STATES
-from .common import Form, button, confirmation_values, label, message, selected, table
+from .common import Form, button, confirmation_values, fit_window, label, message, selected, table
 
 TAGS = {
     "application": "Пакет поверок", "result": "Результат поверки", "miInfo": "Сведения о СИ",
@@ -65,7 +66,7 @@ class XmlDialog(QDialog):
     def __init__(self, parent, paths, schema, protocols=None):
         super().__init__(parent)
         self.setWindowTitle("Просмотр и проверка XML")
-        self.resize(1060, 690)
+        fit_window(self, 930, 650)
         self.schema = schema
         self.protocols = protocols or {}
         self.paths = paths
@@ -111,8 +112,14 @@ class XmlDialog(QDialog):
         self.errors = QPlainTextEdit()
         self.errors.setReadOnly(True)
         self.tabs.addTab(self.errors, "Диагностика")
+        self.tabs.setTabVisible(1, False)
+        self.tabs.setTabVisible(2, False)
         layout.addWidget(self.tabs, 1)
         actions = QHBoxLayout()
+        details = button("Технический режим")
+        details.setCheckable(True)
+        details.toggled.connect(self.toggle_technical)
+        actions.addWidget(details)
         actions.addStretch()
         actions.addWidget(button("Закрыть", self.accept))
         layout.addLayout(actions)
@@ -120,6 +127,12 @@ class XmlDialog(QDialog):
         self.search.textChanged.connect(self.filter)
         selector.currentIndexChanged.connect(lambda: self.load(selector.currentData()))
         self.load(paths[0])
+
+    def toggle_technical(self, enabled):
+        if not enabled:
+            self.tabs.setCurrentIndex(0)
+        self.tabs.setTabVisible(1, enabled)
+        self.tabs.setTabVisible(2, enabled)
 
     def load(self, path):
         self.records = []
@@ -182,37 +195,39 @@ class XmlDialog(QDialog):
                 message(self, "Поиск по XML", "Фраза не найдена в тексте файла.")
 
 
-class EquipmentReviewDialog(QDialog):
+class EquipmentReviewPanel(QWidget):
+    changed = Signal()
+    retry = Signal()
+
     def __init__(self, parent, storage, protocol, lookups):
         super().__init__(parent)
-        self.setWindowTitle("Оборудование протокола")
-        self.resize(1100, 620)
         self.storage = storage
         self.protocol = protocol
         self.lookups = lookups
         self.day = iso_date(protocol.fields["verification_date"].value)
         box = QVBoxLayout(self)
-        box.setContentsMargins(18, 16, 18, 16)
-        box.addWidget(label(f"Оборудование · {protocol.number}", "heading"))
-        box.addWidget(label(f"Дата поверки: {self.day or 'уточняется'}. Выберите позицию, чтобы увидеть найденные карточки."))
-        self.items, self.item_model = table(("Средство", "Номер из Excel", "Заводской №", "Статус"), (345, 160, 112))
+        box.setContentsMargins(8, 12, 8, 0)
+        self.items, self.item_model = table(("Средство поверки", "Заводской №", "Состояние"), (300, 105))
+        self.items.setMinimumHeight(96)
         box.addWidget(self.items, 2)
         self.note = label("")
         box.addWidget(self.note)
         self.candidates, self.candidate_model = table(
-            ("Карточка", "Тип", "Заводской №", "Модель", "Поверена", "Действует до", "Сведения"),
-            (165, 85, 104, 150, 100, 100)
+            ("Номер записи", "Модель", "Зав. №", "Поверена", "Действует до", "Схема / состояние"),
+            (165, 132, 75, 90, 106)
         )
+        self.candidates.setMinimumHeight(100)
+        self.candidates.horizontalHeader().setStretchLastSection(True)
         box.addWidget(self.candidates, 2)
         actions = QHBoxLayout()
-        self.select_btn = button("Подтвердить выбранную карточку", self.choose, primary=True)
+        self.select_btn = button("Подтвердить", self.choose, primary=True)
         actions.addWidget(self.select_btn)
-        actions.addWidget(button("Открыть карточку", self.open_card))
+        self.retry_btn = button("Повторить поиск", self.retry.emit)
+        actions.addWidget(self.retry_btn)
         actions.addStretch()
-        actions.addWidget(button("Закрыть", self.accept))
         box.addLayout(actions)
         self.items.selectionModel().currentChanged.connect(self.refresh_candidates)
-        self.candidates.selectionModel().currentChanged.connect(self.refresh_button)
+        self.candidates.selectionModel().selectionChanged.connect(self.refresh_button)
         self.refresh_items()
 
     def lookup(self, item):
@@ -223,10 +238,9 @@ class EquipmentReviewDialog(QDialog):
         rows = []
         for item in self.protocol.equipment:
             live = self.lookup(item)
-            resolved, issue = resolve(item, entries, self.day, live)
-            status = (f"Проверено · до {resolved.valid_until}" if resolved and live and live.state in {"found", "choice"}
-                      else "Локальное подтверждение" if resolved else issue)
-            rows.append((item, (item.name or item.description, item.source_id, item.serial, status)))
+            resolved, issue = resolve_many(item, entries, self.day, live)
+            if not resolved:
+                rows.append((item, (item.name or item.description, item.serial, issue)))
         self.item_model.update(rows)
         if rows:
             index = next((i for i, row in enumerate(rows) if row[0] == current), 0)
@@ -237,48 +251,46 @@ class EquipmentReviewDialog(QDialog):
         item = selected(self.items)
         live = self.lookup(item)
         candidates = live.candidates if live else ()
-        note = live.message if live and live.message else (
-            "Карточки получены из ФИФ ОЕИ." if live else "Запустите «Проверить данные» для запроса в ФИФ ОЕИ."
-        )
-        self.note.setText(note + (f" · {item.source}" if item else ""))
+        several = bool(item and item.category == "mieta" and sum(c.eligible for c in candidates) > 1)
+        self.candidates.setSelectionMode(QAbstractItemView.SelectionMode.MultiSelection if several else
+                                         QAbstractItemView.SelectionMode.SingleSelection)
+        note = live.message if live and live.message else "Проверьте реквизиты оборудования в протоколе."
+        if several:
+            note += ". Нажмите на каждую запись, которая действительно использовалась."
+        if item:
+            name = item.name or item.description
+            number = item.registration or item.type_number
+            note = f"{name}{' · ' + number if number else ''}\n{note}"
+        self.note.setText(note if item else "В протоколе нужно указать средства поверки.")
         self.candidate_model.update([
-            (c, (c.entry.identifier or c.entry.public_id, c.entry.type_number, c.entry.registry_serial,
-                 c.entry.model, c.entry.valid_from,
+            (c, (c.entry.identifier or c.entry.public_id, c.entry.model, c.entry.registry_serial, c.entry.valid_from,
                  c.entry.valid_until, " · ".join(filter(None, (c.status, c.entry.scheme)))))
             for c in candidates
         ])
-        if candidates and live.state != "choice":
-            self.candidates.selectRow(0)
+        self.candidates.setVisible(bool(candidates))
+        self.retry_btn.setVisible(bool(live and live.state in {"unavailable", "response"}))
         self.refresh_button()
 
     def refresh_button(self, *_):
-        candidate = selected(self.candidates)
+        candidates = self.selected_candidates()
         live = self.lookup(selected(self.items))
-        self.select_btn.setEnabled(bool(candidate and candidate.eligible and live and live.state == "choice"))
+        choosing = bool(live and live.state in {"found", "choice"})
+        self.select_btn.setVisible(choosing)
+        self.select_btn.setEnabled(bool(choosing and candidates and all(c.eligible for c in candidates)))
 
-    def open_card(self):
-        candidate = selected(self.candidates)
-        if candidate:
-            entry = candidate.entry
-            base = API + "mieta/" if entry.category == "mieta" else PUBLIC_CARD
-            QDesktopServices.openUrl(QUrl(base + quote(entry.public_id, safe="")))
+    def selected_candidates(self):
+        indexes = self.candidates.selectionModel().selectedRows()
+        return [self.candidate_model.rows[index.row()][0] for index in sorted(indexes, key=lambda i: i.row())]
 
     def choose(self):
-        item = selected(self.items)
-        candidate = selected(self.candidates)
-        if not candidate or not candidate.eligible:
+        candidates = self.selected_candidates()
+        if not candidates or not all(candidate.eligible for candidate in candidates):
             return
-        entry = candidate.entry
-        form = Form(self, "Подтверждение карточки",
-                    f"{entry.identifier or entry.public_id} · {entry.model} · {entry.scheme or entry.type_number}",
-                    size=(650, 310))
-        form.confirmation(self.storage.setting("confirmer"))
-        form.validate = lambda values: confirmation_values(form, values)
-        if form.exec():
-            evidence, confirmer = confirmation_values(form, form.values())
-            self.storage.save_equipment_choice(replace(entry, evidence=evidence, confirmer=confirmer))
-            self.storage.set_setting("confirmer", confirmer)
-            self.refresh_items(item)
+        self.storage.save_equipment_choices([
+            replace(c.entry, evidence="Подтверждено выбором публичной карточки", confirmer=getuser())
+            for c in candidates
+        ])
+        self.changed.emit()
 
 
 class RegistryDialog(QDialog):

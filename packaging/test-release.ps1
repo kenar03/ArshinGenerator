@@ -1,4 +1,4 @@
-﻿param([switch] $TestInstaller)
+﻿param([switch] $TestInstaller, [switch] $CheckConnection)
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot
 $release = Join-Path $root 'release'
@@ -40,6 +40,19 @@ function Test-Executable($exe, $report, [switch] $ImportSample) {
     }
 }
 
+function Test-RegistryConnection($exe, $report) {
+    $args = @('--check-connection', ('"' + $report + '"'))
+    $process = Start-Process -FilePath $exe -ArgumentList $args -WindowStyle Hidden -PassThru
+    if (-not $process.WaitForExit(90000)) { throw "Registry connection check timed out for $exe." }
+    if (-not (Test-Path -LiteralPath $report)) { throw "Missing registry report, exit $($process.ExitCode)." }
+    $reportData = Get-Content -Raw -Encoding utf8 -LiteralPath $report | ConvertFrom-Json
+    foreach ($name in 'MIT','MIETA','VRI') {
+        if ($reportData.registries.$name -ne 'Доступен') { throw "Registry check failed for ${name}. See $report." }
+    }
+    if ($process.ExitCode -ne 0) { throw "Registry connection check returned exit $($process.ExitCode)." }
+    $reportData
+}
+
 $result = [ordered]@{ test_path = $qa; excel_unchanged = $false }
 if (-not $TestInstaller) {
     Expand-Archive -LiteralPath (Join-Path $release 'ArshinGenerator-Portable-x64.zip') -DestinationPath $qa
@@ -52,6 +65,9 @@ if (-not $TestInstaller) {
     if ($after.previous -ne '1' -or $after.data -ne (Join-Path $relocated 'data') -or
             $after.input_folder -ne $before.input_folder) { throw 'Portable data did not survive the move.' }
     $result.portable = @{ started = $true; relocated = $true; restored_last_folder = $true; sample_results = 25 }
+    if ($CheckConnection) {
+        $result.connection = Test-RegistryConnection (Join-Path $relocated 'ArshinGenerator.exe') (Join-Path $qa 'portable-connection.json')
+    }
 }
 else {
     $installTarget = Join-Path $qa 'Тест установки'
@@ -83,6 +99,9 @@ else {
             $exe = Join-Path $installTarget 'ArshinGenerator.exe'
             $before = Test-Executable $exe (Join-Path $qa 'installed-1.json') -ImportSample
             $after = Test-Executable $exe (Join-Path $qa 'installed-2.json')
+            if ($CheckConnection) {
+                $result.connection = Test-RegistryConnection $exe (Join-Path $qa 'installed-connection.json')
+            }
         }
         finally {
             $env:LOCALAPPDATA = $oldLocal

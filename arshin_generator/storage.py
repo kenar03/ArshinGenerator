@@ -1,3 +1,4 @@
+from collections import defaultdict
 from contextlib import contextmanager, closing
 from dataclasses import asdict, replace
 from datetime import datetime
@@ -162,6 +163,39 @@ class Storage:
                     db.execute("update equipment set active=0 where id=?", (row["id"],))
             db.execute("insert into equipment(data) values (?)", (encode(item),))
             self._audit(db, "Выбор публичной карточки", item)
+
+    def save_equipment_choices(self, entries: list[RegistryEntry]) -> None:
+        if not entries:
+            raise ValueError("Выберите хотя бы одну карточку.")
+        keys = {(item.local_id, item.serial, item.name, item.category) for item in entries}
+        ids = tuple(dict.fromkeys(item.public_id for item in entries))
+        if len(keys) != 1 or len(ids) != len(entries) or not all(ids):
+            raise ValueError("Карточки должны принадлежать одной позиции протокола.")
+        if len(ids) > 1 and entries[0].category != "mieta":
+            raise ValueError("Для обычного средства выберите одну поверку.")
+        start = max(entry.valid_from for entry in entries)
+        end = min(entry.valid_until for entry in entries)
+        if not start or not end or start > end:
+            raise ValueError("У выбранных карточек нет общего срока действия.")
+        changed = now()
+        with self.session() as db:
+            prior_groups = defaultdict(list)
+            for row in db.execute("select id,data from equipment where active=1").fetchall():
+                previous = json.loads(row["data"])
+                if tuple(previous.get(key) for key in ("local_id", "serial", "name", "category")) in keys:
+                    group = ((previous["confirmed_at"], tuple(previous["choice_ids"]))
+                             if previous.get("choice_ids") else row["id"])
+                    prior_groups[group].append((row["id"], previous))
+            for group in prior_groups.values():
+                if max(item["valid_from"] for _, item in group) <= end and start <= min(
+                    item["valid_until"] for _, item in group
+                ):
+                    db.executemany("update equipment set active=0 where id=?", [(i,) for i, _ in group])
+            for entry in entries:
+                data = asdict(replace(entry, confirmed_at=changed, choice_ids=ids))
+                data.pop("id")
+                db.execute("insert into equipment(data) values (?)", (encode(data),))
+                self._audit(db, "Выбор публичной карточки", data)
 
     def archive_equipment(self, entry: RegistryEntry, reason: str) -> None:
         with self.session() as db:

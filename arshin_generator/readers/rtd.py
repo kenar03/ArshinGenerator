@@ -95,11 +95,7 @@ def _equipment(t, catalog, etalons) -> list[Equipment]:
                 else:
                     category = ""
         else:
-            # A hand-entered строка can still supply explicit individual attributes.
-            ordinary = re.fullmatch(r"г/р\s*№\s*([0-9]+-[0-9]+)\s+(.+?)\s+№\s*(\S+)", text, re.I)
-            local_id, name, factory = ordinary.groups() if ordinary else ("", "", "")
-            if ordinary and not matches:
-                category, type_number = "mis", local_id
+            local_id, name, factory = "", "", ""
         hints = {
             f"Эталоны!F{k}:G{k}: {_text(row[5])}, до {_text(row[6])}"
             for k, row in enumerate(etalons[2:], 2)

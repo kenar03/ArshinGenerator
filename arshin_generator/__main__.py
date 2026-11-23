@@ -11,6 +11,7 @@ from PySide6.QtWidgets import QApplication
 
 from arshin_generator import VERSION
 from arshin_generator.arshin import Schema
+from arshin_generator.public_registry import check_connection
 from arshin_generator.storage import Storage, data_directory
 from arshin_generator.ui.common import message
 from arshin_generator.ui.main import MainWindow
@@ -21,7 +22,15 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="Аршин · Генератор XML")
     parser.add_argument("paths", nargs="*", type=Path)
     parser.add_argument("--smoke-check", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--check-connection", type=Path, help=argparse.SUPPRESS)
     arguments = parser.parse_args(argv)
+    if arguments.check_connection:
+        log = arguments.check_connection.with_suffix(".log")
+        logging.basicConfig(level=logging.INFO, filename=log, encoding="utf-8",
+                            format="%(asctime)s %(levelname)s %(message)s")
+        report = {"version": VERSION, "registries": check_connection()}
+        arguments.check_connection.write_text(json.dumps(report, ensure_ascii=False), encoding="utf-8")
+        return int(any(status != "Доступен" for status in report["registries"].values()))
     app = QApplication([sys.argv[0]])
     app.setApplicationName("Аршин · Генератор XML")
     app.setApplicationVersion(VERSION)

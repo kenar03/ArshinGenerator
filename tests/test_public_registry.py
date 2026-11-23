@@ -10,7 +10,7 @@ from urllib.error import HTTPError
 from arshin_generator.arshin import NS, Schema, format_packets
 from arshin_generator.domain import Equipment
 from arshin_generator.public_registry import PublicClient, PublicDataError
-from arshin_generator.registry import lookup_equipment, lookup_key, resolve
+from arshin_generator.registry import lookup_equipment, lookup_key, resolve, resolve_many
 from arshin_generator.storage import Storage
 from arshin_generator.validation import check
 
@@ -46,7 +46,7 @@ class FixtureClient:
     def items(self, resource, **filters):
         self.requests.append((resource, filters))
         if self.unavailable:
-            raise PublicDataError("Реестр недоступен.")
+            raise PublicDataError("Реестр недоступен.", kind="connection")
         if resource == "mit":
             return [{"number": filters["number"], "mit_uuid": "test", "notation": "ПТСВ"}]
         if resource == "mieta":
@@ -57,13 +57,17 @@ class FixtureClient:
 
     def detail(self, resource, record_id):
         self.requests.append((resource, record_id))
-        self.assert_mieta(resource)
-        return next(detail for row, detail in self.standards if row["rmieta_id"] == record_id)
-
-    @staticmethod
-    def assert_mieta(resource):
-        if resource != "mieta":
-            raise AssertionError(resource)
+        if resource == "mieta":
+            return next(detail for row, detail in self.standards if row["rmieta_id"] == record_id)
+        if resource == "vri":
+            detail, proof = next((detail, proof) for _, detail in self.standards
+                                 for proof in detail["cresults"] if proof["vri_id"] == record_id)
+            return {
+                "miInfo": {"etaMI": {"regNumber": detail["number"], "mitypeNumber": detail["mitype_num"],
+                                     "manufactureNum": detail["factory_num"], "modification": detail["modification"]}},
+                "vriInfo": {"applicable": {}, "vrfDate": proof["verification_date"], "validDate": proof["valid_date"]},
+            }
+        raise AssertionError(resource)
 
 
 class RegistryLookupTests(unittest.TestCase):
@@ -89,7 +93,7 @@ class RegistryLookupTests(unittest.TestCase):
             actual = resolve(edited, Storage(path).entries(), DAY, found)[0]
         self.assertEqual((actual.identifier, actual.valid_until), ("32777.06.2Р.01000002", "2027-04-13"))
         conflict = lookup_equipment(item, date(2028, 1, 1), self.client)
-        self.assertEqual(conflict.state, "conflict")
+        self.assertEqual(conflict.state, "expired")
         self.assertIsNone(resolve(item, [selected], DAY, conflict)[0])
 
     def test_complete_registration_disambiguates_but_latin_spelling_requires_review(self):
@@ -126,6 +130,50 @@ class RegistryLookupTests(unittest.TestCase):
             root, issues, _ = schema.inspect(payload)
             self.assertFalse(issues)
             self.assertEqual([node.text for node in root.findall(f".//{{{NS}}}mieta/{{{NS}}}number")], numbers)
+
+    def test_selected_schemes_survive_xml_and_disjoint_renewal(self):
+        numbers = [self.first[0]["number"], self.second[0]["number"]]
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            protocol = fixture(root / "source.xlsx", "ТЕСТ-ВЫБРАНЫ-СХЕМЫ", "012B6")
+            item = etalon()
+            protocol.equipment = [item]
+            day = date.fromisoformat(protocol.fields["verification_date"].value)
+            early_cards = [(row, {**detail, "cresults": [
+                {**detail["cresults"][0], "verification_date": "01.01.2026"}]})
+                           for row, detail in (self.first, self.second)]
+            current = lookup_equipment(item, day, FixtureClient(early_cards))
+            self.assertEqual(current.state, "choice")
+            storage = Storage(root / "database.sqlite3")
+            approve(storage, protocol)
+            selected = [candidate.entry for candidate in current.candidates if candidate.eligible]
+            storage.save_equipment_choices(selected)
+            storage.save_equipment_choices([replace(
+                selected[0], valid_from="2027-05-01", valid_until="2028-04-30", public_id="200001"
+            )])
+            self.assertEqual([entry.identifier for entry in resolve_many(item, storage.entries(), day)[0]], numbers)
+            lookups = {lookup_key(item, day.isoformat()): current}
+            result = check([protocol], storage.confirmations(), storage.entries(), lookups)
+            self.assertFalse(result[0].blockers)
+            schema = Schema()
+            payload = format_packets(result, schema)[0][0]
+            parsed, issues, _ = schema.inspect(payload)
+            self.assertFalse(issues)
+            self.assertEqual([node.text for node in parsed.findall(f".//{{{NS}}}mieta/{{{NS}}}number")], numbers)
+
+    def test_mieta_rejects_mismatched_linked_verification(self):
+        class WrongSerial(FixtureClient):
+            def detail(self, resource, record_id):
+                result = super().detail(resource, record_id)
+                if resource == "vri":
+                    result["miInfo"]["etaMI"]["manufactureNum"] = "000000"
+                return result
+
+        client = WrongSerial((self.first,))
+        found = lookup_equipment(etalon(), DAY, client)
+        self.assertIn(("vri", "1-100001"), client.requests)
+        self.assertEqual(found.state, "conflict")
+        self.assertIn("расходятся со связанной поверкой", found.message)
 
     def test_full_identifier_does_not_override_serial_or_model(self):
         number = self.first[0]["number"]

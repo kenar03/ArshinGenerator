@@ -140,6 +140,7 @@ def fixture(path, number, serial, *, dual=False, outcome="СООТВЕТСТВУ
     r["A61"] = "ТСП-0193-01-100"
     e["G1"] = "Поверен до"
     o["E1"] = "Строка для протокола"
+    o.append(["10000-10", "Учебное средство", "001", "г/р", t["A10"].value])
     for col, value in {1: "Блок", 2: "Прибор №", 3: "ЧЭ №", 7: "Номер с кодом", 9: "Статус ЧЭ"}.items():
         d.cell(1, col, value)
     if print_limit is not None:

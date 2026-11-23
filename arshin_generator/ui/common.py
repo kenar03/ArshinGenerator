@@ -110,35 +110,19 @@ def selected(view):
     return model.rows[index.row()][0] if index.isValid() and index.row() < len(model.rows) else None
 
 
-class Form(QDialog):
-    def __init__(self, parent, title, guidance="", *, size=(610, 700), save="Подтвердить"):
-        super().__init__(parent)
-        self.setWindowTitle(title)
-        self.resize(*size)
-        self.controls = {}
-        self.width_types = {}
-        self.validate = None
-        outer = QVBoxLayout(self)
-        outer.setContentsMargins(18, 16, 18, 16)
-        outer.addWidget(label(title, "heading"))
-        if guidance:
-            outer.addWidget(label(guidance))
-        scroll = QScrollArea()
-        content = QWidget()
-        self.form = QFormLayout(content)
+def fit_window(widget, width, height):
+    area = widget.screen().availableGeometry()
+    widget.resize(min(width, area.width() - 24), min(height, area.height() - 52))
+
+
+class Fields(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.form = QFormLayout(self)
         self.form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
         self.form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
         self.form.setVerticalSpacing(9)
-        scroll.setWidget(content)
-        scroll.setWidgetResizable(True)
-        outer.addWidget(scroll, 1)
-        actions = QHBoxLayout()
-        actions.addStretch()
-        actions.addWidget(button("Отмена", self.reject))
-        confirm = button(save, self._accept, primary=True)
-        confirm.setDefault(True)
-        actions.addWidget(confirm)
-        outer.addLayout(actions)
+        self.controls = {}
 
     def field(self, key, title, kind="text", value=None, choices=None, readonly=False):
         if choices is not None or kind in ("bool", "choice", "outcome"):
@@ -169,10 +153,6 @@ class Form(QDialog):
         self.form.addRow(title, control)
         return control
 
-    def confirmation(self, confirmer="", evidence=""):
-        self.field("_evidence", "Основание подтверждения", value=evidence)
-        self.field("_confirmer", "Кто подтвердил", value=confirmer)
-
     def values(self):
         answer = {}
         for key, control in self.controls.items():
@@ -183,6 +163,41 @@ class Form(QDialog):
             else:
                 answer[key] = control.text().strip()
         return answer
+
+
+class Form(QDialog):
+    def __init__(self, parent, title, guidance="", *, size=(610, 700), save="Подтвердить"):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        fit_window(self, *size)
+        self.editor = Fields()
+        self.validate = None
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(18, 16, 18, 16)
+        outer.addWidget(label(title, "heading"))
+        if guidance:
+            outer.addWidget(label(guidance))
+        scroll = QScrollArea()
+        scroll.setWidget(self.editor)
+        scroll.setWidgetResizable(True)
+        outer.addWidget(scroll, 1)
+        actions = QHBoxLayout()
+        actions.addStretch()
+        actions.addWidget(button("Отмена", self.reject))
+        confirm = button(save, self._accept, primary=True)
+        confirm.setDefault(True)
+        actions.addWidget(confirm)
+        outer.addLayout(actions)
+
+    def field(self, key, title, kind="text", value=None, choices=None, readonly=False):
+        return self.editor.field(key, title, kind, value, choices, readonly)
+
+    def confirmation(self, confirmer="", evidence=""):
+        self.field("_evidence", "Основание подтверждения", value=evidence)
+        self.field("_confirmer", "Кто подтвердил", value=confirmer)
+
+    def values(self):
+        return self.editor.values()
 
     def _accept(self):
         try:
