@@ -4,19 +4,21 @@ import logging
 import re
 import sqlite3
 
-from PySide6.QtCore import QThread, Signal
+from PySide6.QtCore import QThread, Qt, Signal
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QDialog, QHBoxLayout, QPlainTextEdit, QScrollArea, QTreeWidget, QVBoxLayout, QWidget,
+    QCheckBox, QComboBox, QDialog, QHBoxLayout, QScrollArea, QTreeWidget, QVBoxLayout, QWidget,
 )
 
-from ..arshin import CHECK_NOTICE, result_element
+from ..arshin import NS, result_element
 from ..confirmations import get_confirmation, individual_key, protocol_key, with_guards
 from ..domain import OUTCOMES
 from ..laboratory import DEFAULT_FIELDS, expiry_rule, validate_defaults
 from ..normalization import metrologist, serial_list
 from ..public_registry import check_connection
 from ..registry import iso_date
-from ..validation import INDIVIDUAL_FIELDS, MISSING_STICKER, SHARED_FIELDS, modification_key, valid_modification
+from ..validation import (
+    INDIVIDUAL_FIELDS, INVALID_STICKER, SHARED_FIELDS, modification_key, valid_modification, valid_sticker,
+)
 from .common import Fields, Form, button, fit_window, label, message, selected, table
 from .dialogs import EquipmentReviewPanel, tree_items
 
@@ -58,15 +60,14 @@ def correction_rows(confirmations, protocol, values, instrument=None):
 
 
 class RepairDialog(QDialog):
-    def __init__(self, window, protocol, *, check_only=False):
+    def __init__(self, window, protocol):
         super().__init__(window)
         self.window = window
         self.protocol = protocol
-        self.check_only = check_only
         self.party_draft = {}
         self.individual_drafts = {}
         self.sign_exceptions = False
-        self.setWindowTitle("Уточнение для проверочного XML" if check_only else "Уточнение протокола")
+        self.setWindowTitle("Уточнение протокола")
         fit_window(self, 1000, 715)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(18, 16, 18, 16)
@@ -90,12 +91,10 @@ class RepairDialog(QDialog):
 
     def refresh(self):
         p = self.protocol
-        records = ([r for r in self.window.assess(self.window.check_schema) if r.protocol is p]
-                   if self.check_only else self.window.group[id(p)])
+        records = self.window.group[id(p)]
         self.records = records
         good = sum(not record.blockers for record in records)
-        purpose = "Готово для проверочного XML" if self.check_only else "Готово к выгрузке"
-        status = f"Найдено приборов: {len(records)}    ·    {purpose}: {good}"
+        status = f"Найдено приборов: {len(records)}    ·    Готово к выгрузке: {good}"
         page = QWidget()
         body = QVBoxLayout(page)
         body.setContentsMargins(12, 12, 12, 12)
@@ -125,14 +124,6 @@ class RepairDialog(QDialog):
                 if not self.equipment_panel.pending or not p.equipment:
                     body.addWidget(label(readable(issue)))
         if records:
-            schema = Counter(issue for record in records for issue in record.schema_issues)
-            if schema:
-                body.addWidget(label("Совместимость формата XML", "heading"))
-                for issue, count in schema.items():
-                    body.addWidget(label(f"{issue} Приборов: {count}."))
-                if MISSING_STICKER in schema:
-                    body.addWidget(label("Для локальной проверки без наклеек откройте "
-                                         "«Настройки → Проверочный XML без наклеек…»."))
             self.add_instrument_fields(body, records)
         for notice in p.notices:
             body.addWidget(label(readable(notice)))
@@ -170,8 +161,7 @@ class RepairDialog(QDialog):
     def add_instrument_fields(self, box, records):
         measurements = Counter(readable(issue) for record in records for issue in record.measurement_issues)
         details = Counter(readable(issue) for record in records for issue in record.issues
-                          if not issue.startswith(PARTY_ISSUES) and
-                          issue not in record.schema_issues and issue not in record.measurement_issues)
+                          if not issue.startswith(PARTY_ISSUES) and issue not in record.measurement_issues)
         for title, issues in (("Измерения и заключения", measurements), ("Реквизиты приборов", details)):
             if issues:
                 box.addWidget(label(title, "heading"))
@@ -266,8 +256,8 @@ class RepairDialog(QDialog):
                 raise ValueError("Точный список должен совпасть с измеренными приборами.")
             records = {record.instrument.serial: record for record in self.records}
             for serial, changes in self.individual_drafts.items():
-                if changes.get("sticker") and not re.fullmatch(r"[0-9]{11}", changes["sticker"]):
-                    raise ValueError(f"Прибор {serial}. Введите фактический номер наклейки из 11 цифр.")
+                if not valid_sticker(changes.get("sticker")):
+                    raise ValueError(f"Прибор {serial}. {INVALID_STICKER}")
                 if changes.get("outcome") == "pass" and records[serial].candidate == "fail":
                     raise ValueError(f"Прибор {serial}. Пригодность противоречит измерениям.")
         except ValueError as exc:
@@ -397,90 +387,48 @@ class ExpiryRules(QDialog):
 
 
 class PreviewDialog(QDialog):
-    def __init__(self, parent, records, *, check_only=False, sources=(), repair=None):
+    def __init__(self, parent, records, *, type_titles=None):
         super().__init__(parent)
-        self.check_only = check_only
-        self.repair = repair
-        title = "Проверочный XML без наклеек" if check_only else "Результаты перед выгрузкой"
+        self.type_titles = type_titles or {}
+        title = "Результаты перед выгрузкой"
         self.setWindowTitle(title)
         fit_window(self, 830, 570)
         box = QVBoxLayout(self)
         box.setContentsMargins(18, 16, 18, 16)
         box.addWidget(label(title, "heading"))
-        if check_only:
-            box.addWidget(label(CHECK_NOTICE))
-        self.summary = label("")
-        box.addWidget(self.summary)
-        if check_only:
-            self.problems = QPlainTextEdit()
-            self.problems.setReadOnly(True)
-            self.problems.setMaximumHeight(145)
-            box.addWidget(self.problems)
+        ready = sum(not record.blockers for record in records)
+        box.addWidget(label(f"Готово к выгрузке {ready} из {len(records)}. Выберите прибор для просмотра карточки."))
+        self.type_label = label("")
+        box.addWidget(self.type_label)
         self.view, self.model = table(("Заводской номер", "Модификация", "Дата поверки", "Результат"), (130, 170, 120))
         box.addWidget(self.view, 1)
         actions = QHBoxLayout()
-        self.card_btn = button("Карточка прибора", self.open_card, primary=not check_only)
+        self.card_btn = button("Карточка прибора", self.open_card, primary=True)
         actions.addWidget(self.card_btn)
-        if check_only:
-            self.repair_btn = button("Исправить протокол", self.repair_selected)
-            actions.addWidget(self.repair_btn)
         actions.addStretch()
-        actions.addWidget(button("Закрыть", self.reject if check_only else self.accept))
-        if check_only:
-            self.make_btn = button("Сформировать проверочный XML", self.accept, primary=True)
-            actions.addWidget(self.make_btn)
+        actions.addWidget(button("Закрыть", self.accept))
         box.addLayout(actions)
-        self.view.selectionModel().currentChanged.connect(self.update_buttons)
+        self.view.selectionModel().currentChanged.connect(self.select_record)
         self.view.doubleClicked.connect(self.open_card)
-        self.set_records(records, sources)
-
-    def set_records(self, records, sources=()):
-        self.records = tuple(records)
-        self.sources = sources
-        ready = sum(not record.blockers for record in records)
-        if self.check_only:
-            absent = sum(r.value("outcome") == "pass" and not r.value("sticker") for r in records)
-            self.summary.setText(f"Записей для проверки: {ready} из {len(records)}. "
-                                 f"Схема 2020 допускает отсутствие наклеек. Без номера: {absent}.")
-            issues = self.check_problems()
-            self.problems.setPlainText(issues)
-            self.problems.setVisible(bool(issues))
-            self.make_btn.setEnabled(bool(records) and ready == len(records) and not sources)
-        else:
-            self.summary.setText(f"Готово к выгрузке {ready} из {len(records)}. Выберите прибор для просмотра карточки.")
         self.model.update([(r, (r.instrument.serial, r.value("modification") or r.protocol.proposed_modification,
                                 display_day(r.value("verification_date")), OUTCOMES[r.value("outcome") or ""] +
-                                (" · нужна наклейка для XML 2022" if r.blockers == (MISSING_STICKER,) else
-                                 " · требуется уточнение" if r.blockers else ""))) for r in records])
+                                (" · требуется уточнение" if r.blockers else ""))) for r in records])
         if records:
             self.view.selectRow(0)
-        self.update_buttons()
+        self.select_record()
 
-    def check_problems(self):
-        groups = {name: [] for name in ("Средства поверки", "Реквизиты", "Измерения и заключения", "Формат XML")}
-        for item in self.sources:
-            groups["Реквизиты"].extend(f"{item['protocol']}: {issue}" for issue in item["issues"])
-        for record in self.records:
-            groups["Средства поверки"].extend(record.equipment_issues)
-            groups["Измерения и заключения"].extend(record.measurement_issues)
-            groups["Формат XML"].extend(record.schema_issues)
-            classified = {*record.equipment_issues, *record.measurement_issues, *record.schema_issues}
-            groups["Реквизиты"].extend(issue for issue in record.blockers if issue not in classified)
-        return "\n\n".join(f"{title}\n" + "\n".join(f"• {readable(issue)}" for issue in dict.fromkeys(issues))
-                           for title, issues in groups.items() if issues)
+    def type_text(self, item):
+        number = item.value("type_number")
+        if not number:
+            return ""
+        return " · ".join(filter(None, ("Тип СИ", number, self.type_titles.get(number))))
 
-    def update_buttons(self, *_):
+    def select_record(self, *_):
         item = selected(self.view)
         self.card_btn.setEnabled(item is not None)
-        if self.check_only:
-            self.repair_btn.setVisible(bool(self.repair and any(r.blockers for r in self.records)))
-            self.repair_btn.setEnabled(bool(item and item.blockers))
-
-    def repair_selected(self):
-        item = selected(self.view)
-        if self.repair and item and item.blockers:
-            records, sources = self.repair(item.protocol)
-            self.set_records(records, sources)
+        title = self.type_text(item) if item else ""
+        self.type_label.setText(title)
+        self.type_label.setVisible(bool(title))
 
     def open_card(self, *_):
         item = selected(self.view)
@@ -491,6 +439,11 @@ class PreviewDialog(QDialog):
         fit_window(dialog, 700, 590)
         box = QVBoxLayout(dialog)
         box.addWidget(label(f"Прибор {item.instrument.serial}", "heading"))
+        if type_text := self.type_text(item):
+            box.addWidget(label(type_text))
+        method = label(f"Методика поверки · {item.value('method') or 'не указана в протоколе'}")
+        method.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        box.addWidget(method)
         if item.blockers:
             box.addWidget(label("Предварительные сведения. Запись требует уточнения перед выгрузкой."))
         tree = QTreeWidget()
@@ -498,7 +451,8 @@ class PreviewDialog(QDialog):
         tree.setColumnWidth(0, 245)
         try:
             for child in result_element(item):
-                tree_items(child, tree)
+                if child.tag != f"{{{NS}}}docTitle":
+                    tree_items(child, tree)
         except ValueError:
             message(self, "Карточка прибора", "Сведения содержат недопустимые символы.", error=True)
             return

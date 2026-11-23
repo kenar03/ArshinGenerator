@@ -14,7 +14,7 @@ from PySide6.QtWidgets import (
     QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
-from ..arshin import CHECK_NOTICE, NS, is_check_document, open_xml
+from ..arshin import NS, open_xml
 from ..domain import RegistryEntry
 from ..public_registry import PUBLIC_CARD, find_public_verifications
 from ..registry import CATEGORIES, iso_date, lookup_key, registry_issues, resolve_many
@@ -63,12 +63,11 @@ def tree_items(element, parent):
 
 
 class XmlDialog(QDialog):
-    def __init__(self, parent, paths, schema, protocols=None, *, check_schema=None):
+    def __init__(self, parent, paths, schema, protocols=None):
         super().__init__(parent)
         self.setWindowTitle("Просмотр и проверка XML")
         fit_window(self, 930, 650)
         self.schema = schema
-        self.check_schema = check_schema
         self.protocols = protocols or {}
         self.paths = paths
         self.records = []
@@ -139,9 +138,7 @@ class XmlDialog(QDialog):
         self.records = []
         self.raw.clear()
         try:
-            root, issues, details = open_xml(path, self.schema, check_schema=self.check_schema)
-            test_document = is_check_document(root)
-            active_schema = (self.check_schema or self.schema) if test_document else self.schema
+            root, issues, details = open_xml(path, self.schema)
             self.raw.setPlainText(etree.tostring(root.getroottree(), encoding="unicode", pretty_print=True))
             for record in root.findall(f"{{{NS}}}result"):
                 serial_number = next(iter(record.xpath(
@@ -155,8 +152,7 @@ class XmlDialog(QDialog):
                 identity = (serial_number, day, type_number)
                 self.records.append((record, (serial_number, day, title), self.protocols.get(identity, "")))
             summary = "Есть ошибки XML или размера." if issues else "XML соответствует выбранной XSD."
-            self.status.setText(f"{summary}  Записей: {len(self.records)}.  {active_schema.path.name}" +
-                                (f"\n{CHECK_NOTICE}" if test_document else ""))
+            self.status.setText(f"{summary}  Записей: {len(self.records)}.  {self.schema.path.name}")
             self.errors.setPlainText("\n".join(issues + (["", *details] if details else [])) or "Ошибок XSD нет.")
             if details:
                 logging.warning("Проверка %s: %s", path, "\n".join(details))

@@ -164,7 +164,7 @@ def read(book, protocol: Protocol) -> None:
     kind = _text(t[1][1]).casefold()
     put("verification_type", {"первичной": "1", "первичная": "1",
                               "периодической": "2", "периодическая": "2"}.get(kind), "Таблицы!B1", kind)
-    put("method", _present(report[33][0]), "Отчёт!A33")
+    put("method", " ".join(_present(report[33][0]).split()), "Отчёт!A33", report[33][0])
     put("owner", _present(report[24][9]), "Отчёт!J24")
     put("metrologist", _present(t[23][1]), "Таблицы!B23")
     put("sticker", _present(t[20][1]), "Таблицы!B20", t[20][1])

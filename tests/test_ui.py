@@ -8,9 +8,9 @@ from unittest.mock import patch
 from PySide6.QtCore import QEventLoop, QItemSelectionModel, QTimer, Qt
 from PySide6.QtGui import QColor, QPalette
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QComboBox, QLineEdit, QTableView, QTreeWidget
+from PySide6.QtWidgets import QApplication, QComboBox, QDialog, QLabel, QLineEdit, QTableView, QTreeWidget
 
-from arshin_generator.arshin import CHECK_NOTICE, NS, Schema, is_check_document, open_xml, result_element, signature
+from arshin_generator.arshin import NS, SCHEMA_HASH, Schema, open_xml, result_element, signature
 from arshin_generator.confirmations import protocol_key
 from arshin_generator.domain import RegistryEntry
 from arshin_generator.readers import read_protocol
@@ -20,8 +20,7 @@ from arshin_generator.ui.dialogs import EquipmentReviewPanel, XmlDialog
 from arshin_generator.ui.main import MainWindow
 from arshin_generator.ui.style import apply_theme
 from arshin_generator.ui.workflow import PreviewDialog, RepairDialog, correction_rows
-from arshin_generator.validation import MISSING_STICKER
-from tests.test_workflow import SAMPLE, approve, equipment, fixture
+from tests.test_workflow import SAMPLE, SAMPLE_METHOD, approve, equipment, fixture
 from tests.test_public_registry import FixtureClient, etalon, mieta
 
 
@@ -153,7 +152,7 @@ class InterfaceTests(unittest.TestCase):
             xml.close()
             main.close()
 
-    def test_check_export_from_the_loaded_protocol(self):
+    def test_main_export_from_the_loaded_protocol_without_stickers(self):
         with TemporaryDirectory() as directory:
             path = Path(directory)
             storage = Storage(path / "ui.sqlite3")
@@ -170,80 +169,85 @@ class InterfaceTests(unittest.TestCase):
             storage.set_setting("output_folder", str(path))
             main = MainWindow(storage, Schema(), online=False)
             main.protocols = [protocol]
+            main.type_titles = {"56560-14": "Термопреобразователи сопротивления"}
             main.recheck()
-            self.assertTrue(all(r.blockers == (MISSING_STICKER,) for r in main.results))
-            self.assertFalse(main.export_btn.isEnabled())
-            self.assertIn("нужны наклейки", main.source_model.rows[0][1][2])
-            self.assertTrue(main.check_export_action.isEnabled())
+            self.assertTrue(all(not r.blockers for r in main.results))
+            self.assertTrue(main.export_btn.isEnabled())
+            preview = PreviewDialog(main, main.results, type_titles=main.type_titles)
+            self.assertIn("56560-14 · Термопреобразователи сопротивления", preview.type_label.text())
+            self.assertEqual(preview.model.rowCount(), 25)
 
-            def confirm_preview(preview):
-                self.assertTrue(preview.make_btn.isEnabled())
-                self.assertIn("Без номера: 25", preview.summary.text())
-                self.assertEqual(preview.model.rowCount(), 25)
-                self.assertEqual(preview.problems.toPlainText(), "")
-                preview.make_btn.click()
-                return preview.result()
+            def inspect_card(card):
+                texts = [label.text() for label in card.findChildren(QLabel)]
+                self.assertIn(f"Методика поверки · {SAMPLE_METHOD}", texts)
+                self.assertIn(preview.type_label.text(), texts)
+                return 0
 
-            class ConfirmedPreview(PreviewDialog):
-                def exec(self):
-                    return confirm_preview(self)
+            with patch.object(QDialog, "exec", new=inspect_card):
+                preview.open_card()
+            preview.close()
 
             with (
-                patch("arshin_generator.ui.main.PreviewDialog", ConfirmedPreview),
                 patch.object(main, "show_saved") as saved,
+                patch.object(main, "confirm_export_scope") as confirm,
             ):
-                main.check_export_action.trigger()
+                main.export_btn.click()
                 saved.assert_called_once()
+                confirm.assert_not_called()
             files, records = saved.call_args.args
-            self.assertTrue(saved.call_args.kwargs["check_only"])
             [file] = files
-            self.assertIn("ПРОВЕРОЧНЫЙ_2020", file.name)
-            root, issues, _ = open_xml(file, main.schema, check_schema=main.check_schema)
+            self.assertEqual(file.name, "Аршин_001.xml")
+            root, issues, _ = open_xml(file, main.schema)
             self.assertFalse(issues)
-            self.assertTrue(is_check_document(root))
+            self.assertIsNone(root.getprevious())
             self.assertEqual([signature(r) for r in root], [signature(result_element(r)) for r in records])
             self.assertFalse(root.findall(f".//{{{NS}}}stickerNum"))
+            self.assertFalse(root.findall(f".//{{{NS}}}crtmitypeTitle"))
+            self.assertFalse(root.findall(f".//{{{NS}}}milmitypeTitle"))
+            self.assertEqual([r.text for r in root.findall(f".//{{{NS}}}mitypeNumber")], ["56560-14"] * 25)
+            self.assertEqual([r.text for r in root.findall(f".//{{{NS}}}docTitle")], [SAMPLE_METHOD] * 25)
             self.assertEqual([r.instrument.serial for r in records], [f"{i:03d}W6" for i in range(9, 34)])
             for record in records:
                 self.assertEqual(len(record.equipment), 7)
                 self.assertIs(record.value("sign_pass"), True)
                 self.assertIs(record.value("sign_mi"), False)
                 self.assertEqual(record.value("valid_date"), "2027-01-14")
-            self.assertEqual(len(open_xml(file, main.schema)[1]), 25)
-            self.assertEqual(storage.history(), [])
-            self.assertFalse(storage.seen([r.identity for r in records]))
-            self.assertFalse(main.export_btn.isEnabled())
-            file = file.rename(file.with_name("Переименованный.xml"))
-            viewer = XmlDialog(main, [file], main.schema, check_schema=main.check_schema)
-            self.assertIn(CHECK_NOTICE, viewer.status.text())
+            [history] = storage.history()
+            self.assertEqual(history["schema_hash"], SCHEMA_HASH)
+            self.assertEqual(history["status"], "Сформирован")
+            self.assertEqual(len(storage.seen([r.identity for r in records])), 25)
+            with patch.object(main, "confirm_export_scope", return_value=False) as confirm:
+                main.export_btn.click()
+                self.assertEqual(len(confirm.call_args.args[2]), 25)
+            self.assertEqual(len(storage.history()), 1)
+            viewer = XmlDialog(main, [file], main.schema, storage.export_context(history["id"]))
             self.assertIn("соответствует", viewer.status.text())
             self.assertIn("import.2020-06-19.xsd", viewer.status.text())
             self.assertEqual(viewer.model.rowCount(), 25)
             viewer.close()
             main.close()
 
-    def test_check_preview_keeps_other_blockers(self):
+    def test_missing_method_owner_and_measurements_remain_blocking(self):
         with TemporaryDirectory() as directory:
             path = Path(directory)
-            protocol = fixture(path / "incomplete.xlsx", "НЕПОЛНЫЕ-ДАННЫЕ", "001B6", complete=False, sticker="")
+            protocol = fixture(path / "incomplete.xlsx", "НЕПОЛНЫЕ-ДАННЫЕ", "001B6",
+                               complete=False, sticker="", owner="", method="")
             main = MainWindow(Storage(path / "ui.sqlite3"), Schema(), online=False)
             main.protocols = [protocol]
             main.recheck()
-            preview = PreviewDialog(main, main.assess(main.check_schema), check_only=True,
-                                    repair=main.repair_check_protocol)
-            problems = preview.problems.toPlainText()
-            self.assertFalse(preview.make_btn.isEnabled())
-            self.assertIn("Средства поверки", problems)
-            self.assertIn("Реквизиты", problems)
-            self.assertIn("владельца СИ", problems)
-            self.assertIn("Измерения и заключения", problems)
-            self.assertIn("неполные измерения", problems)
-            self.assertNotIn(MISSING_STICKER, problems)
-            repair = RepairDialog(main, protocol, check_only=True)
+            self.assertFalse(main.export_btn.isEnabled())
+            [record] = main.results
+            self.assertTrue(record.equipment_issues)
+            self.assertTrue(any("неполные измерения" in issue for issue in record.measurement_issues))
+            common = " ".join(record.shared_issues)
+            self.assertIn("владельца", common)
+            self.assertIn("Методика поверки", common)
+            self.assertIn("«Отчёт»", common)
+            self.assertNotIn("наклейки", " ".join(record.blockers))
+            repair = RepairDialog(main, protocol)
             self.assertIn("owner", repair.party_editor.controls)
             self.assertNotIn("sticker", repair.item_editor.controls)
             repair.close()
-            preview.close()
             main.close()
 
     def test_equipment_candidates_require_an_explicit_selection(self):

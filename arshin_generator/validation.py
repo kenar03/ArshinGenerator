@@ -8,11 +8,11 @@ from .laboratory import apply_defaults
 from .normalization import CANONICAL_NAME, metrologist, serial_list
 from .registry import iso_date, lookup_key, resolve_many
 
-RULES = "1.3.1"
+RULES = "1.4.1"
 PASS = "СООТВЕТСТВУЕТ"
 FAIL = "НЕ СООТВЕТСТВУЕТ"
-MISSING_STICKER = "Для рабочего XML 2022 у пригодного прибора требуется номер наклейки из 11 цифр."
-INVALID_STICKER = "Номер наклейки в рабочем XML 2022 должен состоять из 11 цифр."
+INVALID_STICKER = "Указанный номер наклейки должен содержать не более 128 символов, допустимых в XML."
+XML_FORBIDDEN = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\ud800-\udfff\ufffe\uffff]")
 SHARED_FIELDS = (
     ("verification_type", "Вид поверки", "choice"),
     ("sign_cipher", "Шифр знака", "text"),
@@ -36,7 +36,7 @@ SHARED_FIELDS = (
 INDIVIDUAL_FIELDS = (
     ("outcome", "Окончательное заключение", "outcome"),
     ("reasons", "Причина непригодности", "text"),
-    ("sticker", "Номер наклейки (11 цифр)", "text"),
+    ("sticker", "Номер наклейки", "text"),
     ("sign_pass", "Знак в паспорте", "bool"),
     ("sign_mi", "Знак на приборе", "bool"),
     ("manufacture_year", "Год выпуска", "text"),
@@ -112,14 +112,22 @@ def _report_agrees(protocol, evidence, shared):
     return protocol.declared == 1 and all(failing) and bool(reasons)
 
 
-def _check_common(protocol, fields, require_owner):
+def valid_sticker(value) -> bool:
+    number = _sticker_number(value)
+    return len(number) <= 128 and not XML_FORBIDDEN.search(number)
+
+
+def _check_common(protocol, fields):
     issues = []
     missing = []
-    for key in ("type_number", "method", "temperature", "pressure", "humidity"):
+    for key in ("type_number", "temperature", "pressure", "humidity"):
         if not fields.get(key, Datum("", "")).value:
             issues.append(f"Заполните поле «{LABELS[key]}».")
             missing.append(key)
-    if require_owner and not fields.get("owner", Datum("", "")).value:
+    if not fields.get("method", Datum("", "")).value:
+        issues.append("В протоколе нет методики поверки. Заполните строку «Методика поверки» на листе «Отчёт».")
+        missing.append("method")
+    if not fields.get("owner", Datum("", "")).value:
         issues.append("Укажите фактического владельца СИ.")
         missing.append("owner")
     if not iso_date(fields["verification_date"].value):
@@ -149,7 +157,7 @@ def _check_common(protocol, fields, require_owner):
 
 
 def check(protocols: list[Protocol], confirmations: dict, registry: list[RegistryEntry],
-          lookups: dict | None = None, *, laboratory=None, require_sticker=True, require_owner=False) -> list[Result]:
+          lookups: dict | None = None, *, laboratory=None) -> list[Result]:
     results = []
     lookups = lookups or {}
     for protocol in protocols:
@@ -203,12 +211,13 @@ def check(protocols: list[Protocol], confirmations: dict, registry: list[Registr
         ]
         if len(set(equipment_keys)) != len(equipment_keys):
             equipment_issues.append("В списке средств поверки обнаружено повторное соответствие одному идентификатору.")
-        common_issues, common_fields = _check_common(protocol, shared, require_owner)
+        common_issues, common_fields = _check_common(protocol, shared)
         issues.extend(common_issues)
         missing.extend(common_fields)
         evidence = [_individual_evidence(protocol, instrument) for instrument in protocol.instruments]
         auto = _report_agrees(protocol, evidence, shared)
         shared_issues = tuple(dict.fromkeys(issues + equipment_issues))
+        batch_start = len(results)
         for instrument, (statuses, complete) in zip(protocol.instruments, evidence):
             fields = shared.copy()
             individual = get_confirmation(confirmations, "instrument", protocol, instrument)
@@ -239,30 +248,46 @@ def check(protocols: list[Protocol], confirmations: dict, registry: list[Registr
                 result.issues.append("При положительном результате указана причина непригодности.")
                 result.repair_fields.update(("outcome", "reasons"))
             result.measurement_issues = tuple(result.issues)
-            _check_fields(result, require_sticker)
+            _check_fields(result)
             results.append(result)
+        batch_sticker = _sticker_number(shared.get("sticker", Datum("", "")).value)
+        if protocol.declared != 1 and batch_sticker:
+            batch = results[batch_start:]
+            applicable = [result for result in batch if result.value("outcome") == "pass"]
+            if applicable and not valid_sticker(batch_sticker):
+                for result in batch:
+                    result.issues.append("Проверьте номер наклейки на листе «Таблицы». " + INVALID_STICKER)
+            elif applicable and not any(_sticker_number(r.value("sticker")) == batch_sticker for r in applicable):
+                for result in batch:
+                    result.issues.append("В протоколе указан один номер наклейки на партию. "
+                                         "Уточните, какому прибору он принадлежит.")
+                    if result.value("outcome") == "pass":
+                        result.repair_fields.add("sticker")
     identities = Counter((r.identity[0], r.identity[1].upper(), r.identity[2]) for r in results if r.identity[1])
-    stickers = Counter(r.value("sticker") for r in results if r.value("outcome") == "pass" and r.value("sticker"))
+    stickers = Counter(number for r in results if r.value("outcome") == "pass"
+                       if (number := _sticker_number(r.value("sticker"))))
     for result in results:
         kind, serial_number, day = result.identity
         if identities[kind, serial_number.upper(), day] > 1:
             result.issues.append("Повтор результата для того же типа, заводского номера и даты поверки.")
-        if result.value("outcome") == "pass" and stickers[result.value("sticker")] > 1:
+        if result.value("outcome") == "pass" and stickers[_sticker_number(result.value("sticker"))] > 1:
             result.issues.append("Один номер наклейки указан у нескольких результатов.")
             result.repair_fields.add("sticker")
     return results
 
 
-def _check_fields(result: Result, require_sticker: bool) -> None:
+def _sticker_number(value) -> str:
+    return str(value or "").strip()
+
+
+def _check_fields(result: Result) -> None:
     value = result.value
     issues = result.issues
     if not result.instrument.serial:
         issues.append("Заводской номер нельзя подтвердить по сохранённой строке.")
     if value("outcome") == "pass":
-        sticker = str(value("sticker") or "")
-        if require_sticker and not re.fullmatch(r"[0-9]{11}", sticker):
-            result.schema_issues = (INVALID_STICKER if sticker else MISSING_STICKER,)
-            issues.extend(result.schema_issues)
+        if not valid_sticker(value("sticker")):
+            issues.append(INVALID_STICKER)
             result.repair_fields.add("sticker")
         if any(type(value(key)) is not bool for key in ("sign_pass", "sign_mi")):
             issues.append("Подтверждение: укажите знаки на приборе и в паспорте.")
@@ -300,6 +325,6 @@ def _check_fields(result: Result, require_sticker: bool) -> None:
         if len(text) > limit:
             issues.append(f"Поле «{LABELS[key]}» превышает {limit} символов по XSD.")
             result.repair_fields.add(key)
-        if re.search(r"[\x00-\x08\x0b\x0c\x0e-\x1f\ud800-\udfff\ufffe\uffff]", text):
+        if XML_FORBIDDEN.search(text):
             issues.append(f"Поле «{LABELS[key]}» содержит символы, недопустимые в XML.")
             result.repair_fields.add(key)

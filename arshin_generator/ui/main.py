@@ -11,10 +11,11 @@ from PySide6.QtWidgets import (
     QDialog, QFileDialog, QFrame, QHBoxLayout, QHeaderView, QMainWindow, QMenu, QToolButton, QVBoxLayout, QWidget,
 )
 
-from ..arshin import CHECK_NOTICE, Schema, export
+from ..arshin import export
+from ..public_registry import PublicDataError, official_type_title
 from ..readers import EXTENSIONS, read_protocol
 from ..registry import EquipmentLookup, iso_date, lookup_equipment, lookup_key, resolve_many
-from ..validation import MISSING_STICKER, check
+from ..validation import check
 from .common import button, fit_window, label, message, selected, table
 from .dialogs import HistoryDialog, RegistryDialog, XmlDialog
 from .workflow import ConnectionDialog, ExpiryRules, PreviewDialog, RepairDialog, laboratory_settings
@@ -34,9 +35,10 @@ class ImportThread(QThread):
 class RegistryCheckThread(QThread):
     assessed = Signal(object)
 
-    def __init__(self, requests, parent):
+    def __init__(self, requests, type_numbers, parent):
         super().__init__(parent)
         self.requests = requests
+        self.type_numbers = type_numbers
 
     def run(self):
         no_connection = EquipmentLookup("unavailable", "Не удалось подключиться к реестру. Повторите проверку")
@@ -52,8 +54,18 @@ class RegistryCheckThread(QThread):
                 return no_connection
             return result
 
+        def find_title(number):
+            if self.isInterruptionRequested():
+                return ""
+            try:
+                return official_type_title(number)
+            except PublicDataError:
+                return ""
+
         with ThreadPoolExecutor(max_workers=2) as executor:
-            self.assessed.emit(dict(zip(self.requests, executor.map(verify, self.requests.values()))))
+            types = {number: executor.submit(find_title, number) for number in self.type_numbers}
+            verified = dict(zip(self.requests, executor.map(verify, self.requests.values())))
+            self.assessed.emit((verified, {number: request.result() for number, request in types.items()}))
 
 
 class MainWindow(QMainWindow):
@@ -61,13 +73,13 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.storage = storage
         self.schema = schema
-        self.check_schema = Schema.for_check()
         self.online = online
         self.protocols = []
         self.results = []
         self.thread = None
         self.lookup_thread = None
         self.lookups = {}
+        self.type_titles = {}
         self.setWindowTitle("Аршин · Генератор XML")
         self.setMinimumSize(680, 440)
         fit_window(self, 940, 620)
@@ -95,7 +107,6 @@ class MainWindow(QMainWindow):
         menu.addAction("Справочник средств поверки", self.registry)
         menu.addAction("История выгрузок", self.history)
         menu.addAction("Открыть файл XML…", self.pick_xml)
-        self.check_export_action = menu.addAction("Проверочный XML без наклеек…", self.export_check_xml)
         menu.addAction("Диагностический журнал", self.open_log)
         menu.addAction("Папка данных", self.open_data)
         settings.setMenu(menu)
@@ -230,27 +241,32 @@ class MainWindow(QMainWindow):
         if self.busy:
             return
         requests = {}
+        type_numbers = set()
         for protocol in self.protocols:
             if protocol.error or not protocol.instruments:
                 continue
+            number = protocol.fields["type_number"].value
+            if isinstance(number, str) and number and number not in self.type_titles:
+                type_numbers.add(number)
             when = iso_date(protocol.fields["verification_date"].value)
             if when:
                 for item in protocol.equipment:
                     requests[lookup_key(item, when.isoformat())] = item, when
         self.lookups = {}
-        if not requests or not self.online:
+        if not self.online or not (requests or type_numbers):
             self.notice.clear()
             self.recheck()
             return
-        self.lookup_thread = RegistryCheckThread(requests, self)
+        self.lookup_thread = RegistryCheckThread(requests, type_numbers, self)
         self.lookup_thread.assessed.connect(self.accept_registry_checks)
         self.lookup_thread.finished.connect(self.registry_checks_finished)
-        self.notice.setText("Проверяем средства поверки в реестре…")
+        self.notice.setText("Проверяем сведения в реестре…")
         self.recheck()
         self.lookup_thread.start()
 
     def accept_registry_checks(self, result):
-        self.lookups = result
+        self.lookups, titles = result
+        self.type_titles.update({number: title for number, title in titles.items() if title})
 
     def registry_checks_finished(self):
         self.lookup_thread.deleteLater()
@@ -260,16 +276,12 @@ class MainWindow(QMainWindow):
 
     def recheck(self):
         self.entries = self.storage.entries()
-        self.results = self.assess(self.schema)
+        self.results = check(self.protocols, self.storage.confirmations(), self.entries, self.lookups,
+                             laboratory=self.storage.laboratory())
         self.group = defaultdict(list)
         for item in self.results:
             self.group[id(item.protocol)].append(item)
         self.render()
-
-    def assess(self, schema):
-        return check(self.protocols, self.storage.confirmations(), self.entries, self.lookups,
-                     laboratory=self.storage.laboratory(), require_sticker=schema.require_sticker,
-                     require_owner=schema.require_owner)
 
     def has_connection_issue(self, protocol):
         if protocol.error:
@@ -295,8 +307,6 @@ class MainWindow(QMainWindow):
             return "Готов к выгрузке"
         if self.has_connection_issue(protocol):
             return "Нет связи с реестром"
-        if all(not r.blockers or r.blockers == (MISSING_STICKER,) for r in records):
-            return "Для XML 2022 нужны наклейки"
         return f"Готово {ready} из {len(records)}" if ready else "Требуется уточнение"
 
     def render(self):
@@ -319,7 +329,6 @@ class MainWindow(QMainWindow):
         self.add_btn.setEnabled(not self.busy)
         self.preview_btn.setEnabled(bool(self.results) and not self.busy)
         self.export_btn.setEnabled(bool(ready) and not self.busy)
-        self.check_export_action.setEnabled(bool(rows) and not self.busy)
         self.export_btn.setToolTip("Куда сохранять: " + str(self.output_folder()) if ready else
                                    "Готовые записи появятся после устранения замечаний.")
         retry = any(self.has_connection_issue(p) for p in self.protocols)
@@ -327,9 +336,7 @@ class MainWindow(QMainWindow):
         if retry and not self.busy:
             self.notice.setText("Не удалось подключиться к реестру.")
         elif rows and not self.busy:
-            if not ready and all(row[1][2] == "Для XML 2022 нужны наклейки" for row in rows):
-                self.notice.setText("Для локальной проверки откройте «Настройки → Проверочный XML без наклеек…».")
-            elif not ready:
+            if not ready:
                 self.notice.setText("Откройте «Исправить», чтобы увидеть препятствия для выгрузки.")
             else:
                 self.notice.setText(f"В пакет войдёт записей: {ready}")
@@ -340,7 +347,7 @@ class MainWindow(QMainWindow):
 
     def show_results(self):
         if self.results and not self.busy:
-            PreviewDialog(self, self.results).exec()
+            PreviewDialog(self, self.results, type_titles=self.type_titles).exec()
 
     def connection(self):
         ConnectionDialog(self, self.open_log).exec()
@@ -397,30 +404,13 @@ class MainWindow(QMainWindow):
             for entry in self.storage.history():
                 if Path(entry["directory"]).resolve() in local:
                     context.update(self.storage.export_context(entry["id"]))
-            XmlDialog(self, paths, self.schema, context, check_schema=self.check_schema).exec()
+            XmlDialog(self, paths, self.schema, context).exec()
 
     def source_errors(self, records):
         present = {id(r.protocol) for r in records}
         return [{"protocol": p.number or p.path.name, "serial": "", "issues":
                  [p.error] if p.error else p.issues + [p.serial_issue or "Нет отдельных СИ."]}
                 for p in self.protocols if id(p) not in present]
-
-    def export_check_xml(self):
-        if self.busy or not self.protocols:
-            return
-        self.recheck()
-        records = self.assess(self.check_schema)
-        preview = PreviewDialog(self, records, check_only=True, sources=self.source_errors(records),
-                                repair=self.repair_check_protocol)
-        if preview.exec() and not self.busy and preview.records and not preview.sources and not any(
-            r.blockers for r in preview.records
-        ):
-            self.save_package(list(preview.records), self.check_schema, [], "Подтверждён предварительный просмотр")
-
-    def repair_check_protocol(self, protocol):
-        RepairDialog(self, protocol, check_only=True).exec()
-        records = self.assess(self.check_schema)
-        return records, self.source_errors(records)
 
     def export_xml(self):
         if self.busy:
@@ -437,38 +427,29 @@ class MainWindow(QMainWindow):
         if (excluded or repeated) and not self.confirm_export_scope(ready, excluded, repeated):
             return
         evidence = ("Подтверждён состав выгрузки" if excluded or repeated else "Все результаты проверены")
-        self.save_package(ready, self.schema, excluded, evidence)
-
-    def save_package(self, records, schema, excluded, evidence):
         confirmer = f"Сеанс Windows: {getuser()}"
         folder = self.output_folder()
-        if schema.check_only:
-            folder /= "Проверочные XML 2020"
         try:
             folder.mkdir(parents=True, exist_ok=True)
-            files = export(records, schema, folder, self.storage, excluded, f"{confirmer}: {evidence}")
+            files = export(ready, self.schema, folder, self.storage, excluded, f"{confirmer}: {evidence}")
         except (ValueError, OSError, sqlite3.Error) as exc:
             logging.exception("Ошибка формирования XML")
             message(self, "Выгрузка", str(exc) if isinstance(exc, ValueError) else
                     "Не удалось сохранить файл. Укажите доступную папку в меню «Настройки → Папка для XML».",
                     error=True)
             return
-        if schema.check_only:
-            self.show_saved(files, records, check_only=True)
-        else:
-            self.show_saved(files, records)
+        self.show_saved(files, ready)
 
-    def show_saved(self, files, records, *, check_only=False):
+    def show_saved(self, files, records):
         dialog = QDialog(self)
-        title = "Проверочный XML сохранён" if check_only else "Выгрузка готова"
+        title = "Выгрузка готова"
         dialog.setWindowTitle(title)
         fit_window(dialog, 700, 300)
         box = QVBoxLayout(dialog)
         box.setContentsMargins(20, 18, 20, 18)
         box.addWidget(label(title, "heading"))
-        if check_only:
-            box.addWidget(label(CHECK_NOTICE))
         box.addWidget(label(f"Записей {len(records)}    ·    Файлов {len(files)}"))
+        box.addWidget(label("При загрузке файла в «Аршин» записи автоматически включаются в заявку на публикацию."))
         names = label("\n".join(str(path) for path in files))
         names.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         box.addWidget(names, 1)
@@ -477,8 +458,7 @@ class MainWindow(QMainWindow):
             QUrl.fromLocalFile(str(files[0].parent))), primary=True))
         context = {(r.instrument.serial, r.value("verification_date"), r.value("type_number")): r.protocol.number
                    for r in records}
-        actions.addWidget(button("Просмотреть файл", lambda: XmlDialog(
-            dialog, files, self.schema, context, check_schema=self.check_schema).exec()))
+        actions.addWidget(button("Просмотреть файл", lambda: XmlDialog(dialog, files, self.schema, context).exec()))
         actions.addStretch()
         actions.addWidget(button("Закрыть", dialog.accept))
         box.addLayout(actions)

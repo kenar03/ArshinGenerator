@@ -109,7 +109,6 @@ class Result:
     missing_fields: tuple[str, ...] = ()
     repair_fields: set[str] = field(default_factory=set)
     measurement_issues: tuple[str, ...] = ()
-    schema_issues: tuple[str, ...] = ()
 
     def value(self, name: str) -> Scalar:
         return self.fields[name].value if name in self.fields else None

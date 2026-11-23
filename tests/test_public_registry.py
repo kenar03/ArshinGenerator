@@ -9,7 +9,7 @@ from urllib.error import HTTPError
 
 from arshin_generator.arshin import NS, Schema, format_packets
 from arshin_generator.domain import Equipment
-from arshin_generator.public_registry import PublicClient, PublicDataError
+from arshin_generator.public_registry import PublicClient, PublicDataError, official_type_title
 from arshin_generator.registry import lookup_equipment, lookup_key, resolve, resolve_many
 from arshin_generator.storage import Storage
 from arshin_generator.validation import check
@@ -76,6 +76,18 @@ class RegistryLookupTests(unittest.TestCase):
         self.second = mieta("100002", "32777.06.2Р.01000002", "ГПС 2")
         self.expired = mieta("100003", "32777.06.2Р.01000003", "ГПС 3", expiry="20.11.2026")
         self.client = FixtureClient((self.first, self.second, self.expired))
+
+    def test_display_title_requires_an_exact_mit_record(self):
+        client = FixtureClient()
+        observed = [
+            {"number": "56560-140", "mit_uuid": "different", "title": "Другая запись"},
+            {"number": "56560-14", "mit_uuid": "current", "title": "Термопреобразователи сопротивления"},
+        ]
+        with patch.object(client, "items", return_value=observed) as items:
+            self.assertEqual(official_type_title("56560-14", client), "Термопреобразователи сопротивления")
+            items.assert_called_once_with("mit", number="56560-14")
+        with patch.object(client, "items", return_value=observed[:1]):
+            self.assertEqual(official_type_title("56560-14", client), "")
 
     def test_multiple_etalon_cards_require_a_specific_saved_choice(self):
         item = etalon()

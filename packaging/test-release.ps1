@@ -5,7 +5,13 @@ $release = Join-Path $root 'release'
 $qa = Join-Path $root ('build\qa-' + [guid]::NewGuid().ToString('N').Substring(0,8))
 New-Item -ItemType Directory -Force -Path $qa | Out-Null
 $sample = (Get-Item -LiteralPath (Join-Path $root 'Файлы для задания\П-Т1-з2-1260-26.xlsm')).FullName
-$baseHash = (Get-FileHash -LiteralPath $sample).Hash
+function Get-WorkbookHash {
+    $stream = [IO.File]::Open($sample, [IO.FileMode]::Open, [IO.FileAccess]::Read,
+        ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
+    try { (Get-FileHash -InputStream $stream).Hash }
+    finally { $stream.Dispose() }
+}
+$baseHash = Get-WorkbookHash
 
 function Test-Executable($exe, $report, [switch] $ImportSample) {
     $args = @('--smoke-check', ('"' + $report + '"'))
@@ -24,11 +30,8 @@ function Test-Executable($exe, $report, [switch] $ImportSample) {
         if (-not (Test-Path -LiteralPath $report)) { throw "Missing application report, exit $($process.ExitCode)" }
         $check = Get-Content -Raw -Encoding utf8 -LiteralPath $report | ConvertFrom-Json
         if ($process.ExitCode -ne 0 -or $check.error) { throw "App failed: $($check.error)" }
-        if ($check.schema -ne '71843c9544546ce2a319f14f8fd645c6d18c080ad73007070815e2a33e2c5911') {
+        if ($check.schema -ne 'cc92b2a1f8670d230a405d42f9ad08a729a6a35cab94751d5bb1208cf493e361') {
             throw 'Unexpected XSD.'
-        }
-        if ($check.check_schema -ne 'cc92b2a1f8670d230a405d42f9ad08a729a6a35cab94751d5bb1208cf493e361') {
-            throw 'Unexpected diagnostic XSD.'
         }
         if ($ImportSample -and ($check.protocols -ne 1 -or $check.instruments -ne 25 -or
                 $check.equipment -ne 7 -or $check.ready -ne 0)) {
@@ -138,6 +141,6 @@ else {
                            settings_restored = $true; uninstall = $true; retained_data = $true; sample_results = 25 }
 }
 
-$result.excel_unchanged = $baseHash -eq (Get-FileHash -LiteralPath $sample).Hash
+$result.excel_unchanged = $baseHash -eq (Get-WorkbookHash)
 if (-not $result.excel_unchanged) { throw 'Source workbook changed.' }
 $result | ConvertTo-Json -Depth 4

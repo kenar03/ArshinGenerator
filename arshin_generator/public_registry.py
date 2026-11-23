@@ -131,6 +131,14 @@ def exact_type(client: PublicClient, number: str) -> dict | None:
     return matches[0] if len(matches) == 1 and matches[0].get("mit_uuid") else None
 
 
+def official_type_title(number: str, client: PublicClient | None = None) -> str:
+    if not TYPE_NUMBER.fullmatch(number):
+        return ""
+    record = exact_type(client or PublicClient(budget=12), number)
+    title = record.get("title") if record else None
+    return title.strip() if isinstance(title, str) else ""
+
+
 def check_connection():
     checks = [
         ("MIT", "mit", {"number": "32777-06"}, "number", "32777-06"),

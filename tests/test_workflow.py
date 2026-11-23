@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 from openpyxl import Workbook
 
-from arshin_generator.arshin import NS, Schema, export, format_packets, is_check_document, open_xml, signature
+from arshin_generator.arshin import NS, SCHEMA_HASH, Schema, export, format_packets, open_xml, signature
 from arshin_generator.confirmations import get_confirmation, legacy_key, with_guards
 from arshin_generator.domain import Datum, RegistryEntry
 from arshin_generator.laboratory import expiry_rule
@@ -18,7 +18,7 @@ from arshin_generator.public_registry import exact_records
 from arshin_generator.readers import read_protocol
 from arshin_generator.registry import iso_date, resolve
 from arshin_generator.storage import Storage
-from arshin_generator.validation import MISSING_STICKER, check, individual_key, modification_key, protocol_key
+from arshin_generator.validation import INVALID_STICKER, check, individual_key, modification_key, protocol_key
 
 ROOT = Path(__file__).resolve().parents[1]
 MATERIALS = ROOT / "Файлы для задания"
@@ -26,8 +26,8 @@ SAMPLE = MATERIALS / "П-Т1-з2-1260-26.xlsm"
 TEMPLATE = MATERIALS / "П-Т1-з2-!!!!!-26.xltm"
 JOURNAL = MATERIALS / "Журнал.xlsx"
 XML_EXAMPLE = MATERIALS / "arshin_export_example.xml"
-SCHEMA_HASH = "71843c9544546ce2a319f14f8fd645c6d18c080ad73007070815e2a33e2c5911"
-LEGACY_SCHEMA = MATERIALS / "import.2020-06-19.xsd"
+REFERENCE_SCHEMA = ROOT / "arshin_generator" / "schemas" / "import.2022-12-21.xsd"
+SAMPLE_METHOD = "ГОСТ 8.461-2009 Термопреобразователи сопротивления из платины, меди и никеля. Методика поверки"
 
 
 class NormalizationTests(unittest.TestCase):
@@ -105,11 +105,11 @@ class MaterialTests(unittest.TestCase):
             "modification": "ТСМ-0193-01", "sign_pass": True, "sign_mi": False,
             "owner": 'ООО "ЧТП"', "metrologist": "Еремеева А.В.", "verification_date": "2026-11-22",
             "temperature": "21,6 °C", "pressure": "99,83 кПа", "humidity": "30 %", "other": "220 В",
+            "type_number": "56560-14", "method": SAMPLE_METHOD,
         }.items():
             with self.subTest(field=key):
                 self.assertEqual([r.value(key) for r in results], [value] * 25)
-        self.assertTrue(results[0].value("method").startswith("ГОСТ 8.461-2009"))
-        self.assertTrue(all(r.schema_issues == (MISSING_STICKER,) for r in results))
+        self.assertTrue(all(not r.value("sticker") for r in results))
         self.assertFalse(any("учебн" in issue.casefold() for r in results for issue in r.issues))
         template = read_protocol(TEMPLATE)
         self.assertEqual(template.reader, sample.reader)
@@ -121,22 +121,20 @@ class MaterialTests(unittest.TestCase):
     def test_schema_and_supplied_xml(self):
         schema = Schema()
         self.assertEqual(schema.hash, SCHEMA_HASH)
+        self.assertEqual(schema.path.read_bytes(), (MATERIALS / "import.2020-06-19.xsd").read_bytes())
         _, messages, details = open_xml(XML_EXAMPLE, schema)
-        self.assertEqual(len(messages), 3)
-        self.assertEqual(sum("наклейки" in s for s in messages), 2)
-        self.assertEqual(sum("наличие средств" in s for s in messages), 1)
+        self.assertEqual(len(messages), 1)
+        self.assertIn("наличие средств", messages[0])
         self.assertTrue(details)
-        legacy = Schema(LEGACY_SCHEMA)
-        self.assertEqual(Schema.for_check().hash, legacy.hash)
-        self.assertTrue(legacy.check_only)
-        self.assertFalse(legacy.require_sticker)
-        self.assertTrue(legacy.require_owner)
-        self.assertTrue(schema.require_sticker)
-        self.assertFalse(schema.require_owner)
+        reference = Schema(REFERENCE_SCHEMA)
+        self.assertEqual(reference.hash, "71843c9544546ce2a319f14f8fd645c6d18c080ad73007070815e2a33e2c5911")
+        with self.assertRaisesRegex(ValueError, "19.06.2020"):
+            format_packets([], reference)
 
 
 def fixture(path, number, serial, *, dual=False, outcome="СООТВЕТСТВУЕТ", complete=True,
-            count=1, print_limit=None, sticker="01234567890", owner="", interval=None):
+            count=1, print_limit=None, sticker="01234567890", owner="Синтетический владелец", interval=None,
+            method="Методика для испытаний XML"):
     book = Workbook()
     t = book.active
     t.title = "Таблицы"
@@ -160,7 +158,7 @@ def fixture(path, number, serial, *, dual=False, outcome="СООТВЕТСТВУ
     r["A20"] = f"Протокол {number}"
     r["J24"] = owner
     r["A32"] = "Методика поверки:"
-    r["A33"] = "Методика для испытаний XML"
+    r["A33"] = method
     r["A45"] = "Заключение: СИ годны к применению."
     r["A61"] = "ТСП-0193-01-100"
     e["G1"] = "Поверен до"
@@ -206,41 +204,6 @@ def approve(storage, p, *, outcome="pass", sticker="01234567890", modification="
                                    "sign_pass": True, "sign_mi": False,
                                    "reasons": "Отказ второго элемента" if outcome == "fail" else ""},
                                   evidence, user)
-
-
-def generate_test_packets(protocol, destination):
-    protocol.fields["additional"] = Datum("СИНТЕТИЧЕСКАЯ ПАРТИЯ. Только для локальной проверки.", "Тест")
-    storage = Storage(destination / "synthetic.sqlite3")
-    storage.save_equipment(equipment())
-    storage.save_laboratory({"sign_cipher": "ТСТ", "calibration": False}, "Тест")
-    storage.save_confirmation("protocol", protocol_key(protocol), {"valid_date": "2027-01-14"},
-                              "Синтетический срок для локальной проверки", "Тест")
-    names = [instrument.serial for instrument in protocol.instruments]
-    paths = []
-    current = Schema()
-    for schema in (Schema(LEGACY_SCHEMA), current):
-        codes = [f"{i:011d}" for i in range(1, len(names) + 1)] if schema.require_sticker else []
-        for instrument, code in zip(protocol.instruments, codes):
-            storage.save_confirmation("instrument", individual_key(protocol, instrument.serial), {"sticker": code},
-                                      "Синтетическая наклейка для локальной проверки", "Тест")
-        results = check([protocol], storage.confirmations(), storage.entries(), laboratory=storage.laboratory(),
-                        require_sticker=schema.require_sticker, require_owner=schema.require_owner)
-        assert all(not result.blockers for result in results)
-        [file] = export(results, schema, destination, storage, [], "Тест")
-        root, issues, _ = open_xml(file, schema)
-        ns = {"g": NS}
-        assert not issues and len(root) == len(names)
-        assert is_check_document(root) == schema.check_only
-        assert root.xpath("g:result/g:miInfo/g:singleMI/g:manufactureNum/text()", namespaces=ns) == names
-        assert root.xpath("g:result/g:applicable/g:stickerNum/text()", namespaces=ns) == codes
-        assert root.xpath("g:result/g:applicable/g:signPass/text()", namespaces=ns) == ["true"] * len(names)
-        assert root.xpath("g:result/g:applicable/g:signMi/text()", namespaces=ns) == ["false"] * len(names)
-        assert root.xpath("g:result/g:means/g:mis/g:mi/g:typeNum/text()", namespaces=ns) == ["10000-10"] * len(names)
-        if not codes:
-            _, rejected, _ = open_xml(file, current)
-            assert len(rejected) == len(names) and all("наклейки" in issue for issue in rejected)
-        paths.append(file)
-    return paths
 
 
 class WorkflowTests(unittest.TestCase):
@@ -307,11 +270,53 @@ class WorkflowTests(unittest.TestCase):
         p.modification_parts = ("ТСП-0193", "18M", "Ex")
         self.assertIsNone(self.checked(p)[0].value("modification") or None)
 
-    def test_full_batch_roundtrip_for_both_original_schemas(self):
+    def test_full_batch_without_stickers_roundtrips_with_method_and_equipment_identity(self):
         protocol = fixture(self.root / "batch.xlsx", "ТЕСТ-ПАКЕТ", "001B6", count=25, sticker="",
-                           owner="Синтетический владелец")
-        for file in generate_test_packets(protocol, self.root):
-            self.assertTrue(file.is_file())
+                           method="  ГОСТ 8.461-2009\n Термопреобразователи   СИ  ")
+        self.storage.save_equipment(replace(equipment(), identity_kind="inventoryNum"))
+        self.storage.save_confirmation("protocol", protocol_key(protocol), {
+            "sign_cipher": "ТСТ", "calibration": False, "valid_date": "2027-01-14",
+        }, "Синтетический срок для проверки", "Тест")
+        results = self.checked(protocol)
+        self.assertTrue(all(not result.blockers for result in results))
+        [file] = export(results, self.schema, self.root, self.storage, [], "Тест")
+        root, issues, _ = open_xml(file, self.schema)
+        ns = {"g": NS}
+        self.assertFalse(issues)
+        self.assertEqual(len(root), 25)
+        self.assertEqual(root.xpath("g:result/g:docTitle/text()", namespaces=ns),
+                         ["ГОСТ 8.461-2009 Термопреобразователи СИ"] * 25)
+        self.assertEqual(root.xpath("g:result/g:means/g:mis/g:mi/g:inventoryNum/text()", namespaces=ns), ["001"] * 25)
+        self.assertFalse(root.xpath("g:result/g:means/g:mis/g:mi/g:manufactureNum", namespaces=ns))
+        self.assertFalse(root.xpath("g:result/g:applicable/g:stickerNum", namespaces=ns))
+
+    def test_optional_sticker_uses_original_schema_format(self):
+        p = fixture(self.root / "one.xlsx", "ТЕСТ-НАКЛЕЙКА", "034C6", sticker="00А-12")
+        self.storage.save_equipment(equipment())
+        self.storage.save_confirmation("protocol", protocol_key(p), {
+            "sign_cipher": "ТСТ", "calibration": False, "valid_date": "2027-01-14",
+        }, "Тест", "Тест")
+        payload, _ = format_packets(self.checked(p), self.schema)[0]
+        root, issues, _ = self.schema.inspect(payload)
+        self.assertFalse(issues)
+        self.assertEqual(root.findtext(f".//{{{NS}}}stickerNum"), "00А-12")
+        p.fields["sticker"] = Datum("A" * 129, "Таблицы!B20")
+        self.assertIn(INVALID_STICKER, self.checked(p)[0].blockers)
+
+    def test_batch_sticker_requires_a_specific_instrument(self):
+        p = fixture(self.root / "batch.xlsx", "ТЕСТ-НАКЛЕЙКА", "001B6", sticker="00А-12", count=2)
+        self.storage.save_equipment(equipment())
+        self.storage.save_confirmation("protocol", protocol_key(p), {
+            "sign_cipher": "ТСТ", "calibration": False, "valid_date": "2027-01-14",
+        }, "Тест", "Тест")
+        self.assertTrue(all("sticker" in r.repair_fields for r in self.checked(p)))
+        self.storage.save_confirmation("instrument", individual_key(p, p.instruments[1].serial),
+                                       {"sticker": "00А-12"}, "Документ", "Тест")
+        payload, _ = format_packets(self.checked(p), self.schema)[0]
+        root, issues, _ = self.schema.inspect(payload)
+        self.assertFalse(issues)
+        self.assertIsNone(root[0].find(f".//{{{NS}}}stickerNum"))
+        self.assertEqual(root[1].findtext(f".//{{{NS}}}stickerNum"), "00А-12")
 
     def test_dual_group_and_negative(self):
         p = fixture(self.root / "two.xlsm", "ТЕСТ-ДВА", "019B6", dual=True, outcome="НЕ СООТВЕТСТВУЕТ")
@@ -392,7 +397,7 @@ class WorkflowTests(unittest.TestCase):
         p.fields["metrologist"] = Datum("Тестова Анна", "Таблицы!B23")
         results = self.checked(p)
         issues = " ".join(results[0].blockers)
-        self.assertIn(MISSING_STICKER, issues)
+        self.assertNotIn("наклейки", issues)
         self.assertIn("ФИФ ОЕИ", issues)
         self.assertIn("поверителя", issues)
         with self.assertRaises(ValueError):
