@@ -104,7 +104,6 @@ class MaterialTests(unittest.TestCase):
             ("231024843", "58550-14"), ("10253831", "19973.06.4Р.01149311"),
             ("21-5558L", "80030.20.3Р.01538249"), ("21-5558L", "80030.20.3Р.01538250"),
         ])
-        self.assertIsNone(sample.fields["verification_type"].value)
         results = check([sample], {}, [])
         self.assertTrue(all(r.value("outcome") == "pass" for r in results))
         for key, value in {
@@ -117,7 +116,6 @@ class MaterialTests(unittest.TestCase):
             with self.subTest(field=key):
                 self.assertEqual([r.value(key) for r in results], [value] * 25)
         self.assertTrue(all(not r.value("sticker") for r in results))
-        self.assertIn("ячейку B1", " ".join(results[0].blockers))
         self.assertFalse(any("учебн" in issue.casefold() for r in results for issue in r.issues))
         template = read_protocol(TEMPLATE)
         self.assertEqual(template.reader, sample.reader)

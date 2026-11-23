@@ -6,10 +6,10 @@ from pathlib import Path
 import sqlite3
 
 from lxml import etree
-from PySide6.QtCore import Signal
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QFontDatabase, QTextCursor
 from PySide6.QtWidgets import (
-    QAbstractItemView, QComboBox, QDialog, QFileDialog, QHBoxLayout, QLineEdit, QPlainTextEdit, QTabWidget,
+    QAbstractItemView, QComboBox, QDialog, QFileDialog, QHBoxLayout, QHeaderView, QLineEdit, QPlainTextEdit, QTabWidget,
     QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
@@ -207,21 +207,22 @@ class EquipmentReviewPanel(QWidget):
         self.summary = label("")
         box.addWidget(self.summary)
         self.items, self.item_model = table(
-            ("Средство поверки", "Заводской №", "Номер ФИФ ОЕИ", "Состояние"), (265, 100, 235)
+            ("Средство поверки", "Заводской №", "Номер ФИФ ОЕИ", "Состояние"), ()
         )
-        height = self.items.horizontalHeader().sizeHint().height()
-        rows = min(max(len(protocol.equipment), 1), 9)
-        self.items.setFixedHeight(height + rows * self.items.verticalHeader().defaultSectionSize() + 6)
         box.addWidget(self.items)
         self.note = label("")
         box.addWidget(self.note)
         self.candidates, self.candidate_model = table(
-            ("Номер записи", "Модель", "Зав. №", "Поверена", "Действует до", "Схема / состояние"),
-            (165, 132, 75, 90, 106)
+            ("Номер записи", "Модель", "Зав. №", "Поверена", "Действует до", "Схема / состояние"), ()
         )
-        self.candidates.setFixedHeight(135)
-        self.candidates.horizontalHeader().setStretchLastSection(True)
-        box.addWidget(self.candidates, 2)
+        box.addWidget(self.candidates)
+        for view in (self.items, self.candidates):
+            view.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            view.verticalHeader().setDefaultSectionSize(view.fontMetrics().height() + 10)
+            view.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+            view.horizontalScrollBar().rangeChanged.connect(lambda *_args, view=view: self.fit_table(view))
+        self.items.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+        self.items.verticalHeader().setMinimumSectionSize(self.items.verticalHeader().defaultSectionSize())
         actions = QHBoxLayout()
         self.select_btn = button("Выбрать запись", self.choose, primary=True)
         actions.addWidget(self.select_btn)
@@ -230,6 +231,15 @@ class EquipmentReviewPanel(QWidget):
         self.items.selectionModel().currentChanged.connect(self.refresh_candidates)
         self.candidates.selectionModel().selectionChanged.connect(self.refresh_button)
         self.refresh_items()
+
+    @staticmethod
+    def fit_table(view):
+        height = view.horizontalHeader().sizeHint().height() + 2 * view.frameWidth()
+        height += sum(view.rowHeight(row) for row in range(view.model().rowCount()))
+        scrollbar = view.horizontalScrollBar()
+        if scrollbar.maximum():
+            height += scrollbar.sizeHint().height()
+        view.setFixedHeight(height)
 
     def lookup(self, item):
         return self.lookups.get(lookup_key(item, self.day.isoformat())) if item and self.day else None
@@ -246,9 +256,13 @@ class EquipmentReviewPanel(QWidget):
             rows.append((item, (item.name or item.description, item.serial, numbers, "Проверено" if resolved else issue)))
         self.pending = [item for item, (ready, _) in self.assessments.items() if not ready]
         self.checked = sum(self.assessments[item][0] for item, _ in rows)
-        suffix = f" · проверено {self.checked} из {len(rows)}" if self.checked_inputs else ""
+        suffix = f": проверено {self.checked} из {len(rows)}" if self.checked_inputs else ""
         self.summary.setText("Средства поверки" + suffix)
         self.item_model.update(rows)
+        name_width = max(self.items.horizontalHeader().sectionSizeHint(0), self.items.sizeHintForColumn(0))
+        self.items.setColumnWidth(0, min(390, name_width))
+        self.items.resizeRowsToContents()
+        self.fit_table(self.items)
         if rows:
             focus = current or (self.pending[0] if self.pending else None)
             index = next((i for i, row in enumerate(rows) if row[0] == focus), 0)
@@ -276,10 +290,11 @@ class EquipmentReviewPanel(QWidget):
         self.note.setVisible(bool(self.note.text()))
         eligible = [candidate for candidate in candidates if candidate.eligible]
         self.candidate_model.update([
-            (c, (c.entry.identifier or c.entry.public_id, c.entry.model, c.entry.registry_serial, c.entry.valid_from,
+            (c, (c.entry.identifier or c.entry.type_number, c.entry.model, c.entry.registry_serial, c.entry.valid_from,
                  c.entry.valid_until, " · ".join(filter(None, (c.status, c.entry.scheme)))))
             for c in eligible
         ])
+        self.fit_table(self.candidates)
         self.candidates.setVisible(bool(not resolved and live and live.state in {"found", "choice"} and eligible))
         self.refresh_button()
 

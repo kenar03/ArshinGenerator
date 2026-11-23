@@ -1,11 +1,13 @@
 import json
 import os
+from dataclasses import replace
 from datetime import date
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
 
+from openpyxl import load_workbook
 from PySide6.QtCore import QEventLoop, QItemSelectionModel, QTimer, Qt
 from PySide6.QtGui import QColor, QPalette
 from PySide6.QtTest import QTest
@@ -22,7 +24,7 @@ from arshin_generator.registry import EquipmentCandidate, EquipmentLookup, looku
 from arshin_generator.ui.dialogs import EquipmentReviewPanel, XmlDialog
 from arshin_generator.ui.main import MainWindow
 from arshin_generator.ui.style import apply_theme
-from arshin_generator.ui.protocols import ProtocolDialog
+from arshin_generator.ui.protocols import ProtocolDialog, serial_summary
 from arshin_generator.verification import RegistrySession
 from tests.test_workflow import INCOMPLETE, SAMPLE, SAMPLE_METHOD, equipment, fixture, sample_copy_with_kind, seed_lab
 from tests.test_public_registry import FixtureClient, etalon, mieta, registry_http
@@ -120,6 +122,25 @@ class InterfaceTests(unittest.TestCase):
             texts = "\n".join(label.text() for label in overview.findChildren(QLabel))
             self.assertIn("56560-14 · Термопреобразователи сопротивления", texts)
             self.assertIn("Готов к выгрузке", texts)
+            self.assertIn('ООО "ЧТП"', texts)
+            self.assertIn("Еремеева А.В.", texts)
+            self.assertIn(SAMPLE_METHOD, texts)
+            self.assertIn("22.11.2026", texts)
+            self.assertIn("21.11.2030", texts)
+            self.assertIn("Приборов: 25 · Пригодны: 25 · Непригодны: 0", texts)
+            self.assertIn("009W6–033W6 (25 приборов)", texts)
+            self.assertNotIn("Непригодные приборы", texts)
+            self.assertIn("Средства поверки: проверено 7 из 7", texts)
+            self.assertEqual(len([v for v in overview.findChildren(QTableView) if not v.isHidden()]), 1)
+            overview.serial_toggle.click()
+            self.assertEqual(overview.serial_toggle.text(), "Свернуть")
+            full = next(label for label in overview.findChildren(QLabel) if label.text().startswith("009W6, "))
+            self.assertFalse(full.isHidden())
+            preview_serials = full.text().split(", ")
+            overview.serial_toggle.click()
+            self.assertTrue(full.isHidden())
+            reviewed_equipment = [row[1][2] for row in overview.equipment_panel.item_model.rows]
+            self.assertIn("32777.06.2Р.01504903", reviewed_equipment)
             overview.close()
 
             with patch.object(main, "choose_xml_path", return_value=file) as dialog, \
@@ -133,6 +154,11 @@ class InterfaceTests(unittest.TestCase):
             self.assertEqual([signature(r) for r in root], [signature(result_element(r)) for r in main.results])
             self.assertFalse(root.findall(f".//{{{NS}}}stickerNum"))
             self.assertEqual(root.findtext(f".//{{{NS}}}docTitle"), SAMPLE_METHOD)
+            self.assertEqual(root.xpath("g:result/g:miInfo/g:singleMI/g:manufactureNum/text()", namespaces={"g": NS}),
+                             preview_serials)
+            exported_equipment = root[0].xpath("g:means/g:mieta/g:number/text() | g:means/g:mis/g:mi/g:typeNum/text()",
+                                               namespaces={"g": NS})
+            self.assertCountEqual(exported_equipment, reviewed_equipment)
             self.assertEqual([r.instrument.serial for r in main.results], [f"{i:03d}W6" for i in range(9, 34)])
             for record in main.results:
                 self.assertEqual(len(record.equipment), 7)
@@ -156,6 +182,85 @@ class InterfaceTests(unittest.TestCase):
                 dialog.assert_not_called()
             self.assertEqual(len(main.storage.history()), 1)
             main.close()
+
+    def test_preview_identifies_only_failed_instruments_in_a_separate_section(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory)
+            file = path / "mixed.xlsx"
+            fixture(file, "ТЕСТ-СМЕШАННЫЙ", "unused", count=2, sticker="")
+            workbook = load_workbook(file)
+            workbook["Таблицы"]["C19"] = "не годны к применению"
+            workbook["Таблицы"]["F20"] = "Отклонение за пределами допуска"
+            workbook["Таблицы"]["H37"] = 101
+            workbook["Данные"]["I3"] = "НЕ СООТВЕТСТВУЕТ"
+            workbook["Отчёт"]["A45"] = "Заключение: СИ не годны к применению."
+            workbook.save(file)
+            workbook.close()
+            protocol = read_protocol(file)
+            main = self.window(path)
+            seed_lab(main.storage)
+            main.protocols = [protocol]
+            self.verify_protocols(main)
+            self.assertTrue(main.can_export)
+            dialog = ProtocolDialog(main, protocol)
+            texts = [label.text() for label in dialog.findChildren(QLabel)]
+            self.assertIn("Приборов: 2 · Пригодны: 1 · Непригодны: 1", texts)
+            index = texts.index("Непригодные приборы")
+            self.assertEqual(texts[index + 1], "002B6")
+            self.assertIn("001B6, 002B6", texts)
+            self.assertIsNone(dialog.serial_toggle)
+            payload, _ = format_packets(main.results, main.schema)[0]
+            root, issues, _ = main.schema.inspect(payload)
+            self.assertFalse(issues)
+            self.assertEqual(root.xpath("g:result[g:inapplicable]/g:miInfo/g:singleMI/g:manufactureNum/text()",
+                                        namespaces={"g": NS}), ["002B6"])
+            self.assertIsNone(root[1].find(f"{{{NS}}}validDate"))
+            dialog.close()
+
+    def test_large_batch_keeps_exact_numbers_in_one_scroll_area(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory)
+            protocol = fixture(path / "large.xlsx", "ТЕСТ-ПАРТИЯ", "unused", count=500, sticker="")
+            irregular = (("003412", "003412"), ("005412", "005412"), ("1548-3-1", "1548-3-1"), ("900В6", "900B6"))
+            for index, (original, normalized) in enumerate(irregular):
+                protocol.instruments[index] = replace(protocol.instruments[index], raw=original, serial=normalized)
+            main = self.window(path)
+            seed_lab(main.storage)
+            main.protocols = [protocol]
+            self.verify_protocols(main)
+            dialog = ProtocolDialog(main, protocol)
+            dialog.resize(510, 420)
+            dialog.show()
+            self.app.processEvents()
+            labels = dialog.findChildren(QLabel)
+            self.assertLess(len(labels), 40)
+            self.assertIn("003412, 005412, 1548-3-1 и ещё 497", [label.text() for label in labels])
+            dialog.serial_toggle.click()
+            self.app.processEvents()
+            full = next(label for label in labels if label.text().startswith("003412, 005412, 1548-3-1, "))
+            self.assertTrue(full.isVisible())
+            numbers = full.text().split(", ")
+            self.assertEqual(len(numbers), 500)
+            self.assertEqual(numbers[3], "900В6 (в XML: 900B6)")
+            self.assertEqual(numbers[-1], "500B6")
+            self.assertGreater(dialog.scroll.verticalScrollBar().maximum(), 0)
+            self.assertEqual(dialog.scroll.horizontalScrollBar().maximum(), 0)
+            self.assertTrue(all(view.verticalScrollBarPolicy() == Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+                                for view in dialog.findChildren(QTableView)))
+            dialog.close()
+
+    def test_range_requires_uninterrupted_sequence_and_exact_format(self):
+        for numbers in (
+            ["009W6", "010W6", "012W6", "013W6"],
+            ["001", "002", "003", "0004"],
+            ["9W6", "10W6", "11W6", "12W6"],
+            ["1A6", "2A6", "3A7", "4A6"],
+            ["001-1-2", "002-1-2", "003-1-2", "004-1-2"],
+            ["013W6", "012W6", "011W6", "010W6"],
+        ):
+            with self.subTest(numbers=numbers):
+                self.assertEqual(serial_summary(numbers), ", ".join(numbers[:3]) + " и ещё 1")
+        self.assertEqual(serial_summary(["009W6", "010W6", "011W6", "012W6"]), "009W6–012W6 (4 прибора)")
 
     def test_missing_fields_prevent_registry_search_and_corrected_book_replaces_row(self):
         with TemporaryDirectory() as directory:
@@ -260,7 +365,7 @@ class InterfaceTests(unittest.TestCase):
             main = self.window(path, online=True)
             seed_lab(main.storage)
             with patch("arshin_generator.ui.main.RegistryCheckThread") as search:
-                main.import_paths([INCOMPLETE, SAMPLE])
+                main.import_paths([INCOMPLETE])
                 self.wait_for_import(main)
                 search.assert_not_called()
             self.assertFalse(main.can_export)
@@ -268,6 +373,10 @@ class InterfaceTests(unittest.TestCase):
             dialog = ProtocolDialog(main, main.protocols[0])
             detail = "\n".join(label.text() for label in dialog.findChildren(QLabel))
             self.assertEqual(detail.count("Приборов с незавершёнными измерениями: 25"), 1)
+            self.assertIn("Приборов: 25 · Пригодны: 0 · Непригодны: 0 · Проблемных: 25", detail)
+            self.assertIn("Что нужно исправить", detail)
+            self.assertNotIn("Готов к выгрузке", detail)
+            self.assertNotIn("Средства поверки: проверено", detail)
             self.assertIn("и ещё 21", detail)
             self.assertFalse(dialog.findChildren(QLineEdit))
             dialog.close()
@@ -297,7 +406,12 @@ class InterfaceTests(unittest.TestCase):
             with patch.object(ProtocolDialog, "exec", return_value=0):
                 main.show_results()
             dialog = ProtocolDialog(main)
+            self.assertIn("001B6", [label.text() for label in dialog.scroll.widget().findChildren(QLabel)])
             dialog.selector.setCurrentIndex(1)
+            texts = [label.text() for label in dialog.scroll.widget().findChildren(QLabel)]
+            self.assertIn("002B6", texts)
+            self.assertIn("Протокол ТЕСТ-ВТОРОЙ", texts)
+            self.assertNotIn("001B6", texts)
             dialog.close()
             apply_theme(self.app)
             with patch("arshin_generator.ui.main.laboratory_settings", return_value=False):
