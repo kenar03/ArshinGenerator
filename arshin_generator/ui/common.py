@@ -1,0 +1,202 @@
+from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt
+from PySide6.QtGui import QColor
+from PySide6.QtWidgets import (
+    QComboBox, QDialog, QFormLayout, QHBoxLayout, QLabel, QLineEdit, QMessageBox,
+    QPlainTextEdit, QPushButton, QScrollArea, QTableView, QVBoxLayout, QWidget,
+    QAbstractItemView, QHeaderView,
+)
+
+from .style import SUCCESS, WARNING
+
+
+def button(label, slot=None, primary=False):
+    widget = QPushButton(label)
+    if slot:
+        widget.clicked.connect(slot)
+    if primary:
+        widget.setObjectName("primary")
+    return widget
+
+
+def label(text, style="muted"):
+    widget = QLabel(text)
+    widget.setTextFormat(Qt.TextFormat.PlainText)
+    widget.setObjectName(style)
+    widget.setWordWrap(True)
+    return widget
+
+
+def message(parent, title, detail, *, ask=False, error=False):
+    dialog = QMessageBox(parent)
+    dialog.setWindowTitle(title)
+    dialog.setTextFormat(Qt.TextFormat.PlainText)
+    dialog.setText(detail)
+    icon = QMessageBox.Icon.Question if ask else QMessageBox.Icon.Warning if error else QMessageBox.Icon.Information
+    dialog.setIcon(icon)
+    if ask:
+        yes = dialog.addButton("Продолжить", QMessageBox.ButtonRole.AcceptRole)
+        no = dialog.addButton("Отмена", QMessageBox.ButtonRole.RejectRole)
+        dialog.setDefaultButton(no)
+    else:
+        yes = dialog.addButton("Закрыть", QMessageBox.ButtonRole.AcceptRole)
+    dialog.exec()
+    return dialog.clickedButton() is yes
+
+
+def display(value):
+    if value is True:
+        return "Да"
+    if value is False:
+        return "Нет"
+    return str(value) if value not in (None, "") else "—"
+
+
+class TableModel(QAbstractTableModel):
+    def __init__(self, headers, parent=None):
+        super().__init__(parent)
+        self.headers = headers
+        self.rows = []
+
+    def update(self, rows):
+        self.beginResetModel()
+        self.rows = rows
+        self.endResetModel()
+
+    def rowCount(self, parent=QModelIndex()):
+        return 0 if parent.isValid() else len(self.rows)
+
+    def columnCount(self, parent=QModelIndex()):
+        return 0 if parent.isValid() else len(self.headers)
+
+    def headerData(self, section, orientation, role):
+        if orientation == Qt.Orientation.Horizontal and role == Qt.ItemDataRole.DisplayRole:
+            return self.headers[section]
+        return super().headerData(section, orientation, role)
+
+    def data(self, index, role):
+        if not index.isValid():
+            return None
+        value = self.rows[index.row()][1][index.column()]
+        if role in (Qt.ItemDataRole.DisplayRole, Qt.ItemDataRole.ToolTipRole):
+            return display(value)
+        if role == Qt.ItemDataRole.ForegroundRole:
+            if value == "Готов":
+                return QColor(SUCCESS)
+            if value in ("Требует проверки", "Ошибка", "Формат не поддерживается"):
+                return QColor(WARNING)
+        return None
+
+
+def table(headers, widths):
+    view = QTableView()
+    model = TableModel(headers, view)
+    view.setModel(model)
+    view.setAlternatingRowColors(True)
+    view.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+    view.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+    view.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+    view.verticalHeader().hide()
+    view.verticalHeader().setDefaultSectionSize(32)
+    view.horizontalHeader().setStretchLastSection(True)
+    view.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+    for column, width in enumerate(widths):
+        view.setColumnWidth(column, width)
+    return view, model
+
+
+def selected(view):
+    index = view.currentIndex()
+    model = view.model()
+    return model.rows[index.row()][0] if index.isValid() and index.row() < len(model.rows) else None
+
+
+class Form(QDialog):
+    def __init__(self, parent, title, guidance="", *, size=(610, 700), save="Подтвердить"):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.resize(*size)
+        self.controls = {}
+        self.width_types = {}
+        self.validate = None
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(18, 16, 18, 16)
+        outer.addWidget(label(title, "heading"))
+        if guidance:
+            outer.addWidget(label(guidance))
+        scroll = QScrollArea()
+        content = QWidget()
+        self.form = QFormLayout(content)
+        self.form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
+        self.form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        self.form.setVerticalSpacing(9)
+        scroll.setWidget(content)
+        scroll.setWidgetResizable(True)
+        outer.addWidget(scroll, 1)
+        actions = QHBoxLayout()
+        actions.addStretch()
+        actions.addWidget(button("Отмена", self.reject))
+        confirm = button(save, self._accept, primary=True)
+        confirm.setDefault(True)
+        actions.addWidget(confirm)
+        outer.addLayout(actions)
+
+    def field(self, key, title, kind="text", value=None, choices=None, readonly=False):
+        if choices is not None or kind in ("bool", "choice", "outcome"):
+            choices = choices or {
+                "bool": [("Не указано", None), ("Да", True), ("Нет", False)],
+                "choice": [("Не указано", ""), ("Первичная", "1"), ("Периодическая", "2")],
+                "outcome": [("Не подтверждён", ""), ("Пригоден", "pass"), ("Непригоден", "fail")],
+            }[kind]
+            control = QComboBox()
+            for name, data in choices:
+                control.addItem(name, data)
+            index = control.findData(value)
+            if index >= 0:
+                control.setCurrentIndex(index)
+            control.setEnabled(not readonly)
+        elif kind == "list":
+            control = QPlainTextEdit(str(value or ""))
+            control.setMaximumHeight(100)
+            control.setReadOnly(readonly)
+            control.setPlaceholderText("Каждый номер с новой строки или через запятую")
+        else:
+            control = QLineEdit(str(value or ""))
+            control.setMaxLength(2048)
+            control.setReadOnly(readonly)
+            if kind == "date":
+                control.setPlaceholderText("ГГГГ-ММ-ДД")
+        self.controls[key] = control
+        self.form.addRow(title, control)
+        return control
+
+    def confirmation(self, confirmer="", evidence=""):
+        self.field("_evidence", "Основание подтверждения", value=evidence)
+        self.field("_confirmer", "Кто подтвердил", value=confirmer)
+
+    def values(self):
+        answer = {}
+        for key, control in self.controls.items():
+            if isinstance(control, QComboBox):
+                answer[key] = control.currentData()
+            elif isinstance(control, QPlainTextEdit):
+                answer[key] = control.toPlainText().strip()
+            else:
+                answer[key] = control.text().strip()
+        return answer
+
+    def _accept(self):
+        try:
+            if self.validate:
+                self.validate(self.values())
+        except ValueError as exc:
+            message(self, "Проверьте введённые данные", str(exc), error=True)
+            return
+        self.accept()
+
+
+def confirmation_values(form, data):
+    evidence = data.pop("_evidence", "").strip()
+    confirmer = data.pop("_confirmer", "").strip()
+    if not evidence or not confirmer:
+        raise ValueError("Укажите основание и имя сотрудника, который проверил сведения.")
+    return evidence, confirmer

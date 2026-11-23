@@ -1,0 +1,11 @@
+Сторонние компоненты программы
+
+PySide6 Essentials, Qt 6.8.3 и shiboken6 распространяются как отдельные динамические библиотеки.
+Для использования этого дистрибутива применяются соответствующие условия LGPL v3 и лицензии
+сторонних модулей Qt. Библиотеки можно заменить совместимыми версиями.
+Исходный код Qt: https://download.qt.io/official_releases/qt/6.8/6.8.3/single/
+Исходный код PySide6: https://download.qt.io/official_releases/QtForPython/pyside6/
+Уведомления Qt и его сторонних компонентов: https://doc.qt.io/qt-6.8/licenses-used-in-qt.html
+
+Python, openpyxl, et_xmlfile и lxml распространяются на условиях своих лицензий.
+См. файлы в этой папке.

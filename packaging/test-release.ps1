@@ -1,0 +1,120 @@
+﻿param([switch] $TestInstaller)
+$ErrorActionPreference = 'Stop'
+$root = Split-Path $PSScriptRoot
+$release = Join-Path $root 'release'
+$qa = Join-Path $root ('build\qa-' + [guid]::NewGuid().ToString('N').Substring(0,8))
+New-Item -ItemType Directory -Force -Path $qa | Out-Null
+$sample = (Get-ChildItem (Join-Path $root 'Файлы для задания') -Filter '*.xlsm' -File).FullName
+$baseHash = (Get-FileHash -LiteralPath $sample).Hash
+
+function Test-Executable($exe, $report, [switch] $ImportSample) {
+    $args = @('--smoke-check', ('"' + $report + '"'))
+    if ($ImportSample) { $args += ('"' + $sample + '"') }
+    $oldPath = $env:PATH
+    $oldPythonPath = $env:PYTHONPATH
+    $oldPythonHome = $env:PYTHONHOME
+    $oldQt = $env:QT_QPA_PLATFORM
+    try {
+        $env:PATH = "$env:SystemRoot\System32;$env:SystemRoot"
+        $env:PYTHONHOME = Join-Path $qa 'absent-python'
+        $env:PYTHONPATH = Join-Path $qa 'absent-python'
+        $env:QT_QPA_PLATFORM = 'windows'
+        $process = Start-Process -FilePath $exe -ArgumentList $args -WindowStyle Hidden -PassThru
+        if (-not $process.WaitForExit(30000)) { throw "Timeout for $exe" }
+        if (-not (Test-Path -LiteralPath $report)) { throw "Missing application report, exit $($process.ExitCode)" }
+        $check = Get-Content -Raw -Encoding utf8 -LiteralPath $report | ConvertFrom-Json
+        if ($process.ExitCode -ne 0 -or $check.error) { throw "App failed: $($check.error)" }
+        if ($check.schema -ne '71843c9544546ce2a319f14f8fd645c6d18c080ad73007070815e2a33e2c5911') {
+            throw 'Unexpected XSD.'
+        }
+        if ($ImportSample -and ($check.protocols -ne 1 -or $check.instruments -ne 25 -or $check.ready -ne 0)) {
+            throw 'Synthetic workbook check failed.'
+        }
+        $check
+    }
+    finally {
+        $env:PATH = $oldPath
+        $env:PYTHONHOME = $oldPythonHome
+        $env:PYTHONPATH = $oldPythonPath
+        $env:QT_QPA_PLATFORM = $oldQt
+    }
+}
+
+$result = [ordered]@{ test_path = $qa; excel_unchanged = $false }
+if (-not $TestInstaller) {
+    Expand-Archive -LiteralPath (Join-Path $release 'ArshinGenerator-Portable-x64.zip') -DestinationPath $qa
+    $portable = Join-Path $qa 'ArshinGenerator'
+    $relocated = Join-Path $qa 'Перенесённая папка Аршин'
+    $before = Test-Executable (Join-Path $portable 'ArshinGenerator.exe') (Join-Path $qa 'portable-1.json') -ImportSample
+    if ($before.data -ne (Join-Path $portable 'data')) { throw 'Incorrect portable data directory.' }
+    Move-Item -LiteralPath $portable -Destination $relocated
+    $after = Test-Executable (Join-Path $relocated 'ArshinGenerator.exe') (Join-Path $qa 'portable-2.json')
+    if ($after.previous -ne '1' -or $after.data -ne (Join-Path $relocated 'data') -or
+            $after.input_folder -ne $before.input_folder) { throw 'Portable data did not survive the move.' }
+    $result.portable = @{ started = $true; relocated = $true; restored_last_folder = $true; sample_results = 25 }
+}
+else {
+    $installTarget = Join-Path $qa 'Тест установки'
+    $installer = Join-Path $release 'ArshinGenerator-Setup-x64.exe'
+    $appDataRoot = Join-Path $qa 'UserProfileData'
+    $key = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\{6462E024-6818-4B52-AA51-9ED6CCB87EC2}_is1'
+    $menu = Join-Path ([Environment]::GetFolderPath('Programs')) 'Аршин · Генератор XML.lnk'
+    $desktop = Join-Path ([Environment]::GetFolderPath('DesktopDirectory')) 'Аршин · Генератор XML.lnk'
+    if ((Test-Path -LiteralPath $key) -or (Test-Path -LiteralPath $menu) -or (Test-Path -LiteralPath $desktop)) {
+        throw 'An existing installation or shortcut is present. The test leaves it untouched.'
+    }
+    $installed = $false
+    $uninstaller = Join-Path $installTarget 'unins000.exe'
+    try {
+        $setup = Start-Process -FilePath $installer -WindowStyle Hidden -PassThru -Wait -ArgumentList @(
+            '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/TASKS=desktopicon',
+            ('/DIR="' + $installTarget + '"'), ('/LOG="' + (Join-Path $qa 'install.log') + '"')
+        )
+        $installed = Test-Path -LiteralPath $uninstaller
+        if ($setup.ExitCode -ne 0 -or -not $installed) { throw "Installation failed ($($setup.ExitCode))." }
+        if (-not (Test-Path -LiteralPath $key)) { throw 'No per-user uninstall registration.' }
+        if (-not (Test-Path -LiteralPath $menu) -or -not (Test-Path -LiteralPath $desktop)) {
+            throw 'Expected Start or opted-in Desktop shortcut not created.'
+        }
+        if (Test-Path -LiteralPath (Join-Path $installTarget 'portable.flag')) { throw 'Installed build has portable mode flag.' }
+        $oldLocal = $env:LOCALAPPDATA
+        try {
+            $env:LOCALAPPDATA = $appDataRoot
+            $exe = Join-Path $installTarget 'ArshinGenerator.exe'
+            $before = Test-Executable $exe (Join-Path $qa 'installed-1.json') -ImportSample
+            $after = Test-Executable $exe (Join-Path $qa 'installed-2.json')
+        }
+        finally {
+            $env:LOCALAPPDATA = $oldLocal
+        }
+        if ($after.previous -ne '1' -or $after.input_folder -ne $before.input_folder -or
+                $after.data -ne (Join-Path $appDataRoot 'ArshinGenerator')) {
+            throw 'Installed app settings or per-user data path verification failed.'
+        }
+    }
+    finally {
+        if ($installed -and (Test-Path -LiteralPath $uninstaller)) {
+            $rootCheck = [IO.Path]::GetFullPath($uninstaller)
+            if (-not $rootCheck.StartsWith($qa + '\', [StringComparison]::OrdinalIgnoreCase)) {
+                throw 'Uninstaller is outside the isolated QA directory.'
+            }
+            $uninstall = Start-Process -FilePath $rootCheck -WindowStyle Hidden -PassThru -Wait -ArgumentList @(
+                '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART',('/LOG="' + (Join-Path $qa 'uninstall.log') + '"')
+            )
+            if ($uninstall.ExitCode -ne 0) { throw "Uninstall failed ($($uninstall.ExitCode))." }
+        }
+    }
+    if ((Test-Path -LiteralPath $key) -or (Test-Path -LiteralPath $menu) -or
+            (Test-Path -LiteralPath $desktop) -or (Test-Path -LiteralPath (Join-Path $installTarget 'ArshinGenerator.exe'))) {
+        throw 'Uninstall left the application or its shortcuts behind.'
+    }
+    if (-not (Test-Path -LiteralPath (Join-Path $appDataRoot 'ArshinGenerator\arshin.sqlite3'))) {
+        throw 'Uninstall removed application data.'
+    }
+    $result.installer = @{ started = $true; per_user = $true; start_menu = $true; desktop_opt_in = $true;
+                           settings_restored = $true; uninstall = $true; retained_data = $true; sample_results = 25 }
+}
+
+$result.excel_unchanged = $baseHash -eq (Get-FileHash -LiteralPath $sample).Hash
+if (-not $result.excel_unchanged) { throw 'Source workbook changed.' }
+$result | ConvertTo-Json -Depth 4

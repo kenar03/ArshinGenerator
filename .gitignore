@@ -1,0 +1,8 @@
+.research/
+.venv/
+__pycache__/
+*.pyc
+build/
+release/
+data/
+Файлы для задания/
