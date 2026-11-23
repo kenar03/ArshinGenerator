@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 from openpyxl import Workbook
 
-from arshin_generator.arshin import NS, Schema, export, format_packets, open_xml, signature
+from arshin_generator.arshin import NS, Schema, export, format_packets, is_check_document, open_xml, signature
 from arshin_generator.confirmations import get_confirmation, legacy_key, with_guards
 from arshin_generator.domain import Datum, RegistryEntry
 from arshin_generator.laboratory import expiry_rule
@@ -18,7 +18,7 @@ from arshin_generator.public_registry import exact_records
 from arshin_generator.readers import read_protocol
 from arshin_generator.registry import iso_date, resolve
 from arshin_generator.storage import Storage
-from arshin_generator.validation import check, individual_key, modification_key, protocol_key
+from arshin_generator.validation import MISSING_STICKER, check, individual_key, modification_key, protocol_key
 
 ROOT = Path(__file__).resolve().parents[1]
 MATERIALS = ROOT / "Файлы для задания"
@@ -93,9 +93,11 @@ class MaterialTests(unittest.TestCase):
         self.assertTrue(all(i.elements[0].complete and i.elements[0].status == "СООТВЕТСТВУЕТ"
                             for i in sample.instruments))
         self.assertEqual(sample.proposed_modification, "ТСМ-0193-01")
-        self.assertEqual(len(sample.equipment), 8)
-        self.assertEqual(sample.equipment[5].serial, "10253831")
-        self.assertEqual(sample.equipment[5].registration, "19973.06.4Р.01149311")
+        self.assertEqual([(e.serial, e.registration or e.type_number) for e in sample.equipment], [
+            ("83046", "4542-74"), ("3342", "32777.06.2Р.01504903"), ("3342", "32777.06.2Р.01504902"),
+            ("231024843", "58550-14"), ("10253831", "19973.06.4Р.01149311"),
+            ("21-5558L", "80030.20.3Р.01538249"), ("21-5558L", "80030.20.3Р.01538250"),
+        ])
         self.assertIsNone(sample.fields["verification_type"].value)
         results = check([sample], {}, [])
         self.assertTrue(all(r.value("outcome") == "pass" for r in results))
@@ -107,7 +109,7 @@ class MaterialTests(unittest.TestCase):
             with self.subTest(field=key):
                 self.assertEqual([r.value(key) for r in results], [value] * 25)
         self.assertTrue(results[0].value("method").startswith("ГОСТ 8.461-2009"))
-        self.assertTrue(all(any("Наклейка" in issue for issue in r.issues) for r in results))
+        self.assertTrue(all(r.schema_issues == (MISSING_STICKER,) for r in results))
         self.assertFalse(any("учебн" in issue.casefold() for r in results for issue in r.issues))
         template = read_protocol(TEMPLATE)
         self.assertEqual(template.reader, sample.reader)
@@ -125,6 +127,8 @@ class MaterialTests(unittest.TestCase):
         self.assertEqual(sum("наличие средств" in s for s in messages), 1)
         self.assertTrue(details)
         legacy = Schema(LEGACY_SCHEMA)
+        self.assertEqual(Schema.for_check().hash, legacy.hash)
+        self.assertTrue(legacy.check_only)
         self.assertFalse(legacy.require_sticker)
         self.assertTrue(legacy.require_owner)
         self.assertTrue(schema.require_sticker)
@@ -226,6 +230,7 @@ def generate_test_packets(protocol, destination):
         root, issues, _ = open_xml(file, schema)
         ns = {"g": NS}
         assert not issues and len(root) == len(names)
+        assert is_check_document(root) == schema.check_only
         assert root.xpath("g:result/g:miInfo/g:singleMI/g:manufactureNum/text()", namespaces=ns) == names
         assert root.xpath("g:result/g:applicable/g:stickerNum/text()", namespaces=ns) == codes
         assert root.xpath("g:result/g:applicable/g:signPass/text()", namespaces=ns) == ["true"] * len(names)
@@ -387,7 +392,7 @@ class WorkflowTests(unittest.TestCase):
         p.fields["metrologist"] = Datum("Тестова Анна", "Таблицы!B23")
         results = self.checked(p)
         issues = " ".join(results[0].blockers)
-        self.assertIn("Наклейка", issues)
+        self.assertIn(MISSING_STICKER, issues)
         self.assertIn("ФИФ ОЕИ", issues)
         self.assertIn("поверителя", issues)
         with self.assertRaises(ValueError):

@@ -15,10 +15,17 @@ from .validation import RULES
 NS = "urn://fgis-arshin.gost.ru/module-verifications/import/2020-06-19"
 SCHEMA_NAME = "import.2022-12-21.xsd"
 SCHEMA_FILE = Path(__file__).parent / "schemas" / SCHEMA_NAME
+CHECK_SCHEMA_FILE = SCHEMA_FILE.with_name("import.2020-06-19.xsd")
+CHECK_SCHEMA_HASH = "cc92b2a1f8670d230a405d42f9ad08a729a6a35cab94751d5bb1208cf493e361"
+CHECK_NOTICE = "Проверочный XML. Совместимость с импортом действующего кабинета «Аршин» не подтверждена."
 PORTAL_BYTES = 5_000_000
 TARGET_BYTES = 4_900_000
 NS_ATTR = f' xmlns:gost="{NS}"'.encode()
-HEADER = b"<?xml version='1.0' encoding='UTF-8'?>\n<gost:application" + NS_ATTR + b">\n"
+XML_DECLARATION = b"<?xml version='1.0' encoding='UTF-8'?>\n"
+CHECK_MARKER = f"<!-- {CHECK_NOTICE} -->\n".encode()
+APPLICATION = b"<gost:application" + NS_ATTR + b">\n"
+HEADER = XML_DECLARATION + APPLICATION
+CHECK_HEADER = XML_DECLARATION + CHECK_MARKER + APPLICATION
 FOOTER = b"</gost:application>\n"
 
 
@@ -106,6 +113,11 @@ def signature(element):
     )
 
 
+def is_check_document(root) -> bool:
+    comment = root.getprevious()
+    return isinstance(comment, etree._Comment) and (comment.text or "").strip() == CHECK_NOTICE
+
+
 def friendly(entries) -> list[str]:
     messages = []
     for error in entries:
@@ -130,29 +142,39 @@ class Schema:
         data = path.read_bytes()
         self.path = path
         self.hash = sha256(data).hexdigest()
+        self.check_only = self.hash == CHECK_SCHEMA_HASH
         declaration = _parse(data)
         xsd = {"xs": "http://www.w3.org/2001/XMLSchema"}
         self.require_sticker = declaration.find(".//xs:element[@name='stickerNum']", xsd).get("minOccurs", "1") != "0"
         self.require_owner = declaration.find(".//xs:element[@name='miOwner']", xsd).get("minOccurs", "1") != "0"
         self.schema = etree.XMLSchema(declaration)
 
-    def inspect(self, data: bytes):
+    @classmethod
+    def for_check(cls):
+        schema = cls(CHECK_SCHEMA_FILE)
+        if not schema.check_only:
+            raise ValueError("Контрольная сумма схемы 2020 года не совпадает с оригиналом.")
+        return schema
+
+    def inspect(self, data: bytes, *, check_schema=None):
         root = _parse(data)
-        if self.schema.validate(root):
+        xsd = check_schema.schema if check_schema and is_check_document(root) else self.schema
+        if xsd.validate(root):
             return root, [], []
-        errors = self.schema.error_log
+        errors = xsd.error_log
         return root, friendly(errors), [str(error) for error in errors]
 
 
 def format_packets(results: list[Result], schema: Schema, limit: int = TARGET_BYTES):
     if not results or any(r.blockers for r in results):
-        raise ValueError("В пакет можно включить только проверенные рабочие результаты.")
+        raise ValueError("В пакет можно включить только записи без блокирующих замечаний.")
     if len({(r.identity[0], r.identity[1].upper(), r.identity[2]) for r in results}) != len(results):
         raise ValueError("В пакете обнаружены одинаковые результаты.")
     packets = []
     fragments = []
     expected = []
-    overhead = len(HEADER) + len(FOOTER)
+    header = CHECK_HEADER if schema.check_only else HEADER
+    overhead = len(header) + len(FOOTER)
     size = overhead
     for result in results:
         identifier = f"{result.protocol.number} / {result.instrument.serial}"
@@ -168,12 +190,12 @@ def format_packets(results: list[Result], schema: Schema, limit: int = TARGET_BY
         if len(xml) + overhead > limit:
             raise ValueError(f"Запись {result.instrument.serial} превышает размер пакета.")
         if size + len(xml) > limit:
-            packets.append((HEADER + b"".join(fragments) + FOOTER, expected))
+            packets.append((header + b"".join(fragments) + FOOTER, expected))
             fragments, expected, size = [], [], overhead
         fragments.append(xml)
         expected.append((result, signature(record)))
         size += len(xml)
-    packets.append((HEADER + b"".join(fragments) + FOOTER, expected))
+    packets.append((header + b"".join(fragments) + FOOTER, expected))
     for payload, items in packets:
         verify_disk_content(payload, items, schema)
     return packets
@@ -187,6 +209,8 @@ def verify_disk_content(payload, items, schema):
         import logging
         logging.error("Проверка XSD: %s", "\n".join(details))
         raise ValueError("XML не прошёл проверку:\n" + "\n".join(messages[:12]))
+    if schema.check_only != is_check_document(root):
+        raise ValueError("Маркировка XML не соответствует режиму формирования.")
     if [signature(child) for child in root] != [item[1] for item in items]:
         raise ValueError("Содержимое XML не совпадает с предварительным просмотром.")
 
@@ -195,7 +219,8 @@ def export(results, schema, destination: Path, storage, excluded, confirmer):
     packets = format_packets(results, schema)
     token = uuid4().hex[:12]
     stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    final = destination / f"Аршин_{stamp}_{token}"
+    prefix = "Аршин_ПРОВЕРОЧНЫЙ_2020" if schema.check_only else "Аршин"
+    final = destination / f"{prefix}_{stamp}_{token}"
     stage = destination / f".arshin-{token}.tmp"
     stage.mkdir()
     files = []
@@ -203,10 +228,12 @@ def export(results, schema, destination: Path, storage, excluded, confirmer):
     try:
         audit_items = []
         for index, (payload, expected) in enumerate(packets, 1):
-            name = f"Аршин_{index:03d}.xml"
+            name = f"{prefix}_{index:03d}.xml"
             files.append(name)
             (stage / name).write_bytes(payload)
             verify_disk_content((stage / name).read_bytes(), expected, schema)
+            if schema.check_only:
+                continue
             for result, record in expected:
                 audit_items.append((result.identity, sha256(repr(record).encode()).hexdigest(), {
                     "protocol": result.protocol.number, "reader": result.protocol.reader,
@@ -219,20 +246,27 @@ def export(results, schema, destination: Path, storage, excluded, confirmer):
         moved = True
         for name, (_, expected) in zip(files, packets):
             verify_disk_content((final / name).read_bytes(), expected, schema)
-        storage.record_export(token, final, files, schema.hash, RULES, excluded, confirmer, audit_items)
+        if schema.check_only:
+            storage.audit("Сформирован проверочный XML 2020", {
+                "id": token, "directory": str(final), "files": files, "schema_hash": schema.hash,
+                "rules": RULES, "records": len(results), "confirmer": confirmer,
+                "protocols": sorted({r.protocol.number for r in results}),
+            })
+        else:
+            storage.record_export(token, final, files, schema.hash, RULES, excluded, confirmer, audit_items)
         return [final / name for name in files]
     except Exception:
         shutil.rmtree(final if moved else stage)
         raise
 
 
-def open_xml(path: Path, schema: Schema):
+def open_xml(path: Path, schema: Schema, *, check_schema: Schema | None = None):
     with path.open("rb") as file:
         data = file.read(20_000_001)
     if len(data) > 20_000_000:
         raise ValueError("Просмотр поддерживает файлы до 20 МБ.")
     try:
-        root, issues, details = schema.inspect(data)
+        root, issues, details = schema.inspect(data, check_schema=check_schema)
         if len(data) > PORTAL_BYTES:
             issues.append("Размер файла превышает 5 МБ.")
     except etree.XMLSyntaxError as exc:

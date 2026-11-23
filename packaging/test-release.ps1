@@ -27,8 +27,12 @@ function Test-Executable($exe, $report, [switch] $ImportSample) {
         if ($check.schema -ne '71843c9544546ce2a319f14f8fd645c6d18c080ad73007070815e2a33e2c5911') {
             throw 'Unexpected XSD.'
         }
-        if ($ImportSample -and ($check.protocols -ne 1 -or $check.instruments -ne 25 -or $check.ready -ne 0)) {
-            throw 'Synthetic workbook check failed.'
+        if ($check.check_schema -ne 'cc92b2a1f8670d230a405d42f9ad08a729a6a35cab94751d5bb1208cf493e361') {
+            throw 'Unexpected diagnostic XSD.'
+        }
+        if ($ImportSample -and ($check.protocols -ne 1 -or $check.instruments -ne 25 -or
+                $check.equipment -ne 7 -or $check.ready -ne 0)) {
+            throw 'Workbook check failed.'
         }
         $check
     }

@@ -8,9 +8,11 @@ from .laboratory import apply_defaults
 from .normalization import CANONICAL_NAME, metrologist, serial_list
 from .registry import iso_date, lookup_key, resolve_many
 
-RULES = "1.3.0"
+RULES = "1.3.1"
 PASS = "СООТВЕТСТВУЕТ"
 FAIL = "НЕ СООТВЕТСТВУЕТ"
+MISSING_STICKER = "Для рабочего XML 2022 у пригодного прибора требуется номер наклейки из 11 цифр."
+INVALID_STICKER = "Номер наклейки в рабочем XML 2022 должен состоять из 11 цифр."
 SHARED_FIELDS = (
     ("verification_type", "Вид поверки", "choice"),
     ("sign_cipher", "Шифр знака", "text"),
@@ -236,6 +238,7 @@ def check(protocols: list[Protocol], confirmations: dict, registry: list[Registr
             if result.value("outcome") == "pass" and result.value("reasons"):
                 result.issues.append("При положительном результате указана причина непригодности.")
                 result.repair_fields.update(("outcome", "reasons"))
+            result.measurement_issues = tuple(result.issues)
             _check_fields(result, require_sticker)
             results.append(result)
     identities = Counter((r.identity[0], r.identity[1].upper(), r.identity[2]) for r in results if r.identity[1])
@@ -258,7 +261,8 @@ def _check_fields(result: Result, require_sticker: bool) -> None:
     if value("outcome") == "pass":
         sticker = str(value("sticker") or "")
         if require_sticker and not re.fullmatch(r"[0-9]{11}", sticker):
-            issues.append("Наклейка: для пригодного прибора нужен фактический номер из 11 цифр.")
+            result.schema_issues = (INVALID_STICKER if sticker else MISSING_STICKER,)
+            issues.extend(result.schema_issues)
             result.repair_fields.add("sticker")
         if any(type(value(key)) is not bool for key in ("sign_pass", "sign_mi")):
             issues.append("Подтверждение: укажите знаки на приборе и в паспорте.")

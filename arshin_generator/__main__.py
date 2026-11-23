@@ -74,8 +74,10 @@ def main(argv=None):
             previous = storage.setting("smoke_check_count")
             storage.set_setting("smoke_check_count", str(int(previous or "0") + 1))
             report = {"version": VERSION, "data": str(data), "schema": schema.hash,
+                      "check_schema": window.check_schema.hash,
                       "previous": previous, "input_folder": storage.setting("input_folder"),
                       "protocols": len(window.protocols),
+                      "equipment": sum(len(protocol.equipment) for protocol in window.protocols),
                       "instruments": len(window.results), "ready": sum(not r.blockers for r in window.results)}
             arguments.smoke_check.write_text(json.dumps(report, ensure_ascii=False), encoding="utf-8")
             app.quit()

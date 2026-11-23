@@ -31,6 +31,7 @@ try {
         --icon "$root/arshin_generator/assets/app.ico" `
         --add-data "$root/arshin_generator/assets/app.ico:arshin_generator/assets" `
         --add-data "$root/arshin_generator/schemas/import.2022-12-21.xsd:arshin_generator/schemas" `
+        --add-data "$root/arshin_generator/schemas/import.2020-06-19.xsd:arshin_generator/schemas" `
         --exclude-module numpy --exclude-module pandas --exclude-module matplotlib `
         'arshin_generator/__main__.py'
     if ($LASTEXITCODE -ne 0) { throw 'PyInstaller failed.' }
