@@ -1,3 +1,5 @@
+from datetime import date, datetime
+
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
@@ -123,6 +125,7 @@ class Fields(QWidget):
         self.form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
         self.form.setVerticalSpacing(9)
         self.controls = {}
+        self.date_fields = set()
 
     def field(self, key, title, kind="text", value=None, choices=None, readonly=False):
         if choices is not None or kind in ("bool", "choice", "outcome"):
@@ -144,12 +147,15 @@ class Fields(QWidget):
             control.setReadOnly(readonly)
             control.setPlaceholderText("Каждый номер с новой строки или через запятую")
         else:
-            control = QLineEdit(str(value or ""))
+            control = QLineEdit()
             control.setMaxLength(2048)
             control.setReadOnly(readonly)
             if kind == "date":
-                control.setPlaceholderText("ГГГГ-ММ-ДД")
+                self.date_fields.add(key)
+                control.setPlaceholderText("ДД.ММ.ГГГГ")
         self.controls[key] = control
+        if isinstance(control, QLineEdit):
+            self.set_value(key, value)
         self.form.addRow(title, control)
         return control
 
@@ -161,8 +167,29 @@ class Fields(QWidget):
             elif isinstance(control, QPlainTextEdit):
                 answer[key] = control.toPlainText().strip()
             else:
-                answer[key] = control.text().strip()
+                content = control.text().strip()
+                if key in self.date_fields and "." in content:
+                    try:
+                        content = datetime.strptime(content, "%d.%m.%Y").date().isoformat()
+                    except ValueError:
+                        pass
+                answer[key] = content
         return answer
+
+    def set_value(self, key, value):
+        control = self.controls[key]
+        if isinstance(control, QComboBox):
+            control.setCurrentIndex(max(0, control.findData(value)))
+        elif isinstance(control, QPlainTextEdit):
+            control.setPlainText(str(value or ""))
+        else:
+            content = str(value or "")
+            if key in self.date_fields and content:
+                try:
+                    content = date.fromisoformat(content).strftime("%d.%m.%Y")
+                except ValueError:
+                    pass
+            control.setText(content)
 
 
 class Form(QDialog):

@@ -4,7 +4,7 @@ from math import isfinite
 import re
 
 from ..domain import Datum, ElementReading, Equipment, Instrument, Protocol
-from ..normalization import serial, serial_list, structured_candidate
+from ..normalization import confirmed_rtd_modification, serial, serial_list, structured_candidate
 
 VERSION = "rtd-v1"
 PASS = "СООТВЕТСТВУЕТ"
@@ -60,24 +60,37 @@ def _condition(value, unit: str) -> str:
 
 
 def _sign(value) -> bool | None:
-    if _text(value) in {"V", "✓", "Да"}:
+    if type(value) is bool:
+        return value
+    sign = _text(value).casefold()
+    if sign in {"v", "✓", "да"}:
         return True
-    if _text(value) in {"-", "Нет"}:
+    if sign in {"-", "–", "—", "нет"}:
         return False
     return None
 
 
+def _catalog_label(text: str) -> str:
+    # Old saved dropdown text can retain Latin P after the catalog has been corrected.
+    # This key is only used to join labels. API requests use the untouched column A.
+    return re.sub(r"^([0-9]+\.[0-9]+\.[0-9]+)[PР](\.[0-9]+)(?=\s|$)", r"\1Р\2", text)
+
+
 def _equipment(t, catalog, etalons) -> list[Equipment]:
     lookup = defaultdict(set)
+    labels = defaultdict(set)
     for r, row in enumerate(catalog[2:], 2):
         if _present(row[4]):
-            lookup[_text(row[4])].add((_text(row[0]), _text(row[2]), _text(row[1]), _text(row[3]), r))
+            label = _text(row[4])
+            entry = (_text(row[0]), _text(row[2]), _text(row[1]), _text(row[3]), r)
+            lookup[label].add(entry)
+            labels[_catalog_label(label)].add(entry)
     result = []
     for r in range(10, 19):
         text = _present(t[r][0])
         if not text:
             continue
-        matches = lookup[text]
+        matches = lookup.get(text) or labels.get(_catalog_label(text), set())
         identities = {entry[:4] for entry in matches}
         source = f"Таблицы!A{r}"
         category, type_number, registration = "", "", ""
@@ -170,7 +183,10 @@ def read(book, protocol: Protocol) -> None:
     put("serial_list", _present(t[19][1]), "Таблицы!B19 / D2:G4")
     put("aggregate", _present(t[19][2]), "Таблицы!C19 / Отчёт!A45")
     put("selected_standard", _present(t[30][7]), "Таблицы!H30:J30")
+    protocol.modification_parts = (model, execution, ex)
     protocol.proposed_modification = structured_candidate(model, execution, ex)
+    modification = confirmed_rtd_modification(protocol.fields["type_number"].value, model, execution, ex)
+    put("modification", modification, "Таблицы!A27:C27 · правило обозначений типа 56560-14", full)
     protocol.equipment = _equipment(t, _matrix(book["Оборудование"], 301, 5), _matrix(book["Эталоны"], 301, 7))
     for row in range(10, 19):
         if _text(t[row][0]).startswith("#"):
@@ -181,6 +197,26 @@ def read(book, protocol: Protocol) -> None:
                             model_text.strip().casefold() in item.description.casefold() for item in protocol.equipment):
         protocol.issues.append("Выбранный эталон из Таблицы!H30 не идентифицирован среди средств поверки A10:A18.")
     _instruments(protocol, t, data)
+
+
+def _source_ranges(t):
+    zero = _text(t[2][8]).casefold()
+    if zero not in {"да", "нет"}:
+        return None
+    names, ranges = [], []
+    for row in t[2:5]:
+        start, end, suffix = row[3], row[5], _text(row[6])
+        if start is None and end is None and not suffix:
+            continue
+        if type(start) is not int or type(end) is not int or not 0 <= start <= end:
+            raise ValueError("Уточните границы диапазонов заводских номеров в протоколе.")
+        if len(names) + end - start + 1 > DATA_LAST_ROW - 1:
+            raise ValueError("Диапазоны заводских номеров превышают вместимость протокола.")
+        width = 3 if zero == "да" else 0
+        formatted = [f"{number:0{width}d}{suffix}" for number in range(start, end + 1)]
+        ranges.append(formatted[0] if start == end else f"{formatted[0]}-{formatted[-1]}")
+        names.extend(serial(number) for number in formatted)
+    return (names, ", ".join(ranges)) if names else None
 
 
 def _instruments(protocol: Protocol, t: list, data: list) -> None:
@@ -228,7 +264,14 @@ def _instruments(protocol: Protocol, t: list, data: list) -> None:
         protocol.instruments.append(Instrument(number, parts[0][1], source,
                                               tuple(item[2] for item in parts), problem))
     try:
-        batch = serial_list(_text(t[19][1]))
+        source = _source_ranges(t)
+        raw_list = _text(t[19][1])
+        if source and re.sub(r"\s+", "", raw_list.lstrip("№")) == re.sub(r"\s+", "", source[1]):
+            batch = source[0]
+        else:
+            batch = serial_list(raw_list)
+            if source and batch != source[0]:
+                raise ValueError("Диапазоны и итоговый список заводских номеров в Excel различаются.")
         if protocol.declared and len(batch) != protocol.declared:
             raise ValueError(f"Указано {protocol.declared} СИ, в строке партии найдено {len(batch)} номеров.")
         if batch != [item.serial for item in protocol.instruments]:

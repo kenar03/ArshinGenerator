@@ -1,12 +1,16 @@
+from collections import Counter
 from getpass import getuser
+import logging
 import re
+import sqlite3
 
 from PySide6.QtCore import QThread, Signal
-from PySide6.QtWidgets import QDialog, QHBoxLayout, QScrollArea, QTabWidget, QTreeWidget, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QCheckBox, QComboBox, QDialog, QHBoxLayout, QScrollArea, QTreeWidget, QVBoxLayout, QWidget
 
 from ..arshin import result_element
 from ..confirmations import get_confirmation, individual_key, protocol_key, with_guards
 from ..domain import OUTCOMES
+from ..laboratory import DEFAULT_FIELDS, expiry_rule, validate_defaults
 from ..normalization import metrologist, serial_list
 from ..public_registry import check_connection
 from ..registry import iso_date
@@ -15,7 +19,12 @@ from .common import Fields, Form, button, fit_window, label, message, selected, 
 from .dialogs import EquipmentReviewPanel, tree_items
 
 PARTY_FIELDS = {"valid_date", "valid_date_absent", "sign_pass", "sign_mi"}
-COMMON_FIELDS = (*SHARED_FIELDS, ("modification", "Подтверждённая модификация", "text"))
+SIGN_FIELDS = {"sign_pass", "sign_mi"}
+COMMON_FIELDS = (*SHARED_FIELDS, ("modification", "Модификация по описанию типа", "text"))
+PARTY_ISSUES = (
+    "Укажите дату окончания", "Дата окончания должна", "Подтверждение отсутствия срока",
+    "Пропуск даты окончания", "Подтверждение: укажите знаки",
+)
 
 
 def readable(issue: str) -> str:
@@ -30,21 +39,20 @@ def display_day(value) -> str:
     return day.strftime("%d.%m.%Y") if day else ""
 
 
-def save_corrections(storage, protocol, values, instrument=None):
-    who = getuser()
+def correction_rows(confirmations, protocol, values, instrument=None):
     scope = "instrument" if instrument else "protocol"
     key = individual_key(protocol, instrument.serial) if instrument else protocol_key(protocol)
-    prior = get_confirmation(storage.confirmations(), scope, protocol, instrument)
+    prior = get_confirmation(confirmations, scope, protocol, instrument)
     fields = dict(prior[0]) if prior else {}
     values = dict(values)
     modification = values.pop("modification", "")
     fields.update(values)
     if values:
-        storage.save_confirmation(scope, key, with_guards(protocol, fields, instrument),
-                                  "Уточнено пользователем по документам поверки", who)
+        yield (scope, key, with_guards(protocol, fields, instrument),
+               "Уточнено пользователем по документам поверки", getuser())
     if modification:
-        storage.save_confirmation("modification", modification_key(protocol), {"modification": modification},
-                                  "Модификация подтверждена пользователем", who)
+        yield ("modification", modification_key(protocol), {"modification": modification},
+               "Модификация подтверждена пользователем", getuser())
 
 
 class RepairDialog(QDialog):
@@ -52,195 +60,323 @@ class RepairDialog(QDialog):
         super().__init__(window)
         self.window = window
         self.protocol = protocol
+        self.party_draft = {}
+        self.individual_drafts = {}
+        self.sign_exceptions = False
         self.setWindowTitle("Уточнение протокола")
-        fit_window(self, 930, 635)
+        fit_window(self, 1000, 715)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(18, 16, 18, 16)
         layout.addWidget(label(protocol.number or protocol.path.name, "heading"))
         self.status = label("")
         layout.addWidget(self.status)
-        self.tabs = QTabWidget()
-        layout.addWidget(self.tabs, 1)
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        layout.addWidget(self.scroll, 1)
         actions = QHBoxLayout()
         remove = button("Убрать из списка", self.remove_protocol)
         remove.setAutoDefault(False)
         actions.addWidget(remove)
         actions.addStretch()
-        close = button("Закрыть", self.accept)
-        close.setDefault(True)
-        actions.addWidget(close)
+        self.save_btn = button("Сохранить изменения", self.save, primary=True)
+        actions.addWidget(self.save_btn)
+        self.close_btn = button("Закрыть", self.accept)
+        actions.addWidget(self.close_btn)
         layout.addLayout(actions)
         self.refresh()
 
     def refresh(self):
-        old = self.tabs.tabText(self.tabs.currentIndex())
-        while self.tabs.count():
-            item = self.tabs.widget(0)
-            self.tabs.removeTab(0)
-            item.deleteLater()
         p = self.protocol
         records = self.window.group[id(p)]
-        good = sum(not r.blockers for r in records)
-        self.status.setText(f"Приборов {len(records)}    ·    Готово к выгрузке {good}")
+        good = sum(not record.blockers for record in records)
+        status = f"Найдено приборов: {len(records)}    ·    Готово к выгрузке: {good}"
+        page = QWidget()
+        body = QVBoxLayout(page)
+        body.setContentsMargins(12, 12, 12, 12)
+        body.setSpacing(12)
+        self.party_editor = None
+        self.item_editor = None
+        self.active_record = None
+        self.equipment_panel = None
         common = set(records[0].missing_fields) if records else set()
-        common.update(key for r in records for key in r.repair_fields & PARTY_FIELDS)
+        common.update(key for record in records for key in record.repair_fields & PARTY_FIELDS)
         equipment = records[0].equipment_issues if records else ()
-        if equipment:
-            panel = EquipmentReviewPanel(self, self.window.storage, p, self.window.lookups)
-            if not panel.item_model.rows and p.equipment:
-                panel.note.setText(" ".join(equipment))
-            panel.changed.connect(self.saved)
-            panel.retry.connect(self.retry)
-            self.tabs.addTab(panel, "Средства поверки")
         shared = [issue for issue in records[0].shared_issues if issue not in equipment] if records else p.issues
-        if p.error or shared or common:
-            self.tabs.addTab(self.party_page(records, common, [p.error] if p.error else shared), "Недостающие сведения")
-        individual = [r for r in records if r.issues and
-                      (r.repair_fields - PARTY_FIELDS or not r.repair_fields)]
-        # A recorded negative/contradictory measuring result can be present without an editable field.
-        individual.extend(r for r in records if r not in individual and r.instrument.problem)
-        if individual:
-            self.tabs.addTab(self.results_page(individual), "Результаты приборов")
-        if p.notices:
-            page = QWidget()
-            column = QVBoxLayout(page)
-            for notice in p.notices:
-                column.addWidget(label(readable(notice)))
-            column.addStretch()
-            self.tabs.addTab(page, "Предупреждения")
-        if not self.tabs.count():
-            page = QWidget()
-            box = QVBoxLayout(page)
-            box.addWidget(label("Протокол готов к выгрузке.", "heading"))
-            if records:
-                box.addWidget(button("Просмотреть результаты", lambda: PreviewDialog(self, records).exec()))
-            box.addStretch()
-            self.tabs.addTab(page, "Итог")
-        for index in range(self.tabs.count()):
-            if self.tabs.tabText(index) == old:
-                self.tabs.setCurrentIndex(index)
-                break
+        shared.extend(dict.fromkeys(issue for record in records for issue in record.issues
+                                    if issue.startswith(PARTY_ISSUES)))
+        if p.error:
+            shared = [p.error]
+        self.add_party_fields(body, records, common, shared)
+        if p.equipment or equipment:
+            self.equipment_panel = EquipmentReviewPanel(self, self.window.storage, p, self.window.lookups)
+            self.equipment_panel.changed.connect(self.changed_equipment)
+            self.equipment_panel.retry.connect(self.retry)
+            self.equipment_panel.summary.hide()
+            body.addWidget(label("Средства поверки", "heading"))
+            body.addWidget(self.equipment_panel)
+            status += f"    ·    Средства поверки: {self.equipment_panel.checked} из {len(p.equipment)} проверено"
+            for issue in equipment:
+                if not self.equipment_panel.pending or not p.equipment:
+                    body.addWidget(label(readable(issue)))
+        if records:
+            self.add_instrument_fields(body, records)
+        for notice in p.notices:
+            body.addWidget(label(readable(notice)))
+        body.addStretch()
+        self.scroll.setWidget(page)
+        self.status.setText(status)
+        editing = bool(self.party_editor or self.item_editor)
+        self.save_btn.setVisible(editing)
+        (self.save_btn if editing else self.close_btn).setDefault(True)
 
-    def party_page(self, records, common, issues):
-        p = self.protocol
+    def add_party_fields(self, box, records, common, issues):
         editable = [(key, title, kind) for key, title, kind in COMMON_FIELDS if key in common]
-        page = QWidget()
-        box = QVBoxLayout(page)
-        if issues:
-            line = "\n".join(f"• {readable(issue)}" for issue in dict.fromkeys(issues))
-            summary = QScrollArea()
-            summary.setWidgetResizable(True)
-            summary.setMaximumHeight(150 if editable else 390)
-            summary.setWidget(label(line))
-            box.addWidget(summary, 1)
-        if not editable:
-            box.addStretch()
-            return page
-        editor = Fields()
-        current = records[0]
-        previous = get_confirmation(self.window.storage.confirmations(), "protocol", p)
-        previous = previous[0] if previous else {}
-        for key, title, kind in editable:
-            value = current.value(key)
-            if key in {"sign_pass", "sign_mi"} and len(records) > 1:
-                value = previous.get(key)
-            control = editor.field(key, title, kind, value)
-            if key == "modification" and p.proposed_modification:
-                control.setPlaceholderText(f"В протоколе · {p.proposed_modification}")
-        initial = editor.values()
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setWidget(editor)
-        box.addWidget(scroll, 2)
-
-        def save():
-            values = {key: value for key, value in editor.values().items() if value != initial[key]}
-            if not values:
-                return
-            try:
-                if values.get("sign_cipher") and not re.fullmatch(r"[А-Я]{1,3}", values["sign_cipher"]):
-                    raise ValueError("Шифр знака должен содержать от одной до трёх заглавных русских букв.")
-                if values.get("metrologist"):
-                    metrologist(values["metrologist"])
-                if values.get("valid_date") and not iso_date(values["valid_date"]):
-                    raise ValueError("Введите дату в формате ГГГГ-ММ-ДД.")
-                if values.get("modification") and not valid_modification(p, values["modification"]):
-                    raise ValueError("Уточните написание модификации по описанию типа.")
-                if values.get("explicit_serials") and serial_list(values["explicit_serials"], explicit=True) != [
-                    i.serial for i in p.instruments
-                ]:
-                    raise ValueError("Подтверждённый список должен совпасть с измеренными приборами.")
-                save_corrections(self.window.storage, p, values)
-            except ValueError as exc:
-                message(self, "Уточнение сведений", str(exc), error=True)
-                return
-            self.saved()
-
-        box.addWidget(button("Сохранить для партии", save, primary=True))
-        return page
-
-    def results_page(self, records):
-        page = QWidget()
-        box = QVBoxLayout(page)
-        view, model = table(("Заводской номер", "Результат", "Что уточнить"), (135, 125))
-        model.update([(r, (r.instrument.serial, OUTCOMES[r.value("outcome") or ""],
-                           "; ".join(readable(issue) for issue in r.issues))) for r in records])
-        box.addWidget(view, 1)
-        notes = label("")
-        notes.setMaximumHeight(105)
-        box.addWidget(notes)
-        edit = button("Уточнить прибор", lambda: self.edit_result(selected(view)), primary=True)
-        box.addWidget(edit)
-
-        def update(*_):
-            item = selected(view)
-            notes.setText("\n".join(readable(issue) for issue in item.issues) if item else "")
-            edit.setEnabled(bool(item and any(key in item.repair_fields for key, _, _ in INDIVIDUAL_FIELDS)))
-
-        view.selectionModel().currentChanged.connect(update)
-        view.doubleClicked.connect(lambda *_: self.edit_result(selected(view)) if edit.isEnabled() else None)
-        view.selectRow(0)
-        update()
-        return page
-
-    def edit_result(self, result):
-        if not result:
+        if not (editable or issues):
             return
-        form = Form(self, f"Прибор {result.instrument.serial}", "Уточните сведения по документам поверки.",
-                    size=(590, 445), save="Сохранить")
-        keys = set(result.repair_fields)
-        if "outcome" in keys:
-            keys.add("reasons")
-        for key, title, kind in INDIVIDUAL_FIELDS:
-            if key in keys:
-                form.field(key, title, kind, result.value(key))
-        initial = form.values()
+        count = len(editable) - int({"valid_date", "valid_date_absent"} <= common)
+        title = f"Уточните сведения партии · полей: {count}" if editable else "Замечания к протоколу"
+        box.addWidget(label(title, "heading"))
+        listed = [readable(issue) for issue in dict.fromkeys(issues)
+                  if not editable or not issue.startswith("Подтверждение:")]
+        if listed:
+            box.addWidget(label("\n".join(f"• {issue}" for issue in listed)))
+        if not editable:
+            return
+        self.party_editor = Fields()
+        current = records[0]
+        for key, title, kind in editable:
+            self.party_editor.field(key, title, kind, current.value(key)).setToolTip(
+                self.protocol.proposed_modification if key == "modification" else "")
+        self.party_initial = self.party_editor.values()
+        for key, value in self.party_draft.items():
+            if key in self.party_editor.controls:
+                self.party_editor.set_value(key, value)
+        box.addWidget(self.party_editor)
 
-        def validate(values):
-            if values.get("sticker") and not re.fullmatch(r"[0-9]{11}", values["sticker"]):
-                raise ValueError("Введите фактический номер наклейки из 11 цифр.")
-            if values.get("outcome") == "pass" and result.candidate == "fail":
-                raise ValueError("Пригодность противоречит результатам измерений.")
+    def add_instrument_fields(self, box, records):
+        issues = Counter(readable(issue) for record in records for issue in record.issues
+                         if not issue.startswith(PARTY_ISSUES))
+        if issues:
+            box.addWidget(label("Замечания по приборам", "heading"))
+            box.addWidget(label("\n".join(f"• {issue} · приборов: {count}" for issue, count in issues.items())))
+        exceptions = QCheckBox("Указать исключения по знакам отдельных приборов")
+        exceptions.setChecked(self.sign_exceptions)
+        exceptions.toggled.connect(self.toggle_sign_exceptions)
+        box.addWidget(exceptions)
+        individual_keys = {key for key, _, _ in INDIVIDUAL_FIELDS} - PARTY_FIELDS
+        if self.sign_exceptions:
+            individual_keys |= SIGN_FIELDS
+        editable = [record for record in records if record.repair_fields & individual_keys or
+                    (self.sign_exceptions and record.value("outcome") == "pass")]
+        if not editable:
+            return
+        select = QComboBox()
+        for record in editable:
+            select.addItem(f"Прибор {record.instrument.serial}", record)
+        row = QHBoxLayout()
+        row.addWidget(select, 1)
+        row.addWidget(button("Следующий прибор", lambda: select.setCurrentIndex((select.currentIndex() + 1) % select.count())))
+        box.addLayout(row)
+        area = QVBoxLayout()
+        box.addLayout(area)
 
-        form.validate = validate
-        if form.exec():
-            values = {key: value for key, value in form.values().items() if value != initial[key]}
-            if values:
-                save_corrections(self.window.storage, self.protocol, values, result.instrument)
-                self.saved()
+        def display():
+            self.collect_instrument()
+            if self.item_editor:
+                area.removeWidget(self.item_editor)
+                self.item_editor.deleteLater()
+            record = select.currentData()
+            keys = record.repair_fields & individual_keys
+            if self.sign_exceptions and record.value("outcome") == "pass":
+                keys |= SIGN_FIELDS
+            if "outcome" in keys:
+                keys.add("reasons")
+            self.item_editor = Fields()
+            for key, title, kind in INDIVIDUAL_FIELDS:
+                if key in keys:
+                    self.item_editor.field(key, title, kind, record.value(key))
+            self.item_initial = self.item_editor.values()
+            self.active_record = record
+            for key, value in self.individual_drafts.get(record.instrument.serial, {}).items():
+                if key in self.item_editor.controls:
+                    self.item_editor.set_value(key, value)
+            area.addWidget(self.item_editor)
 
-    def saved(self):
+        select.currentIndexChanged.connect(display)
+        display()
+
+    def collect_instrument(self):
+        if self.item_editor and self.active_record:
+            key = self.active_record.instrument.serial
+            draft = self.individual_drafts.setdefault(key, {})
+            for field, value in self.item_editor.values().items():
+                if value != self.item_initial[field]:
+                    draft[field] = value
+                else:
+                    draft.pop(field, None)
+
+    def collect(self):
+        self.collect_instrument()
+        if self.party_editor:
+            self.party_draft = {key: value for key, value in self.party_editor.values().items()
+                                if value != self.party_initial[key]}
+
+    def toggle_sign_exceptions(self, checked):
+        self.collect()
+        self.sign_exceptions = checked
+        self.refresh()
+
+    def changed_equipment(self):
+        self.collect()
+        self.window.recheck()
+        self.refresh()
+
+    def save(self):
+        self.collect()
+        p = self.protocol
+        values = self.party_draft
+        try:
+            validate_defaults(values)
+            if values.get("metrologist"):
+                metrologist(values["metrologist"])
+            if values.get("valid_date") and not iso_date(values["valid_date"]):
+                raise ValueError("Введите дату в формате ДД.ММ.ГГГГ.")
+            if values.get("modification") and not valid_modification(p, values["modification"]):
+                raise ValueError("Уточните написание модификации по описанию типа.")
+            if values.get("explicit_serials") and serial_list(values["explicit_serials"], explicit=True) != [
+                i.serial for i in p.instruments
+            ]:
+                raise ValueError("Точный список должен совпасть с измеренными приборами.")
+            records = {record.instrument.serial: record for record in self.window.group[id(p)]}
+            for serial, changes in self.individual_drafts.items():
+                if changes.get("sticker") and not re.fullmatch(r"[0-9]{11}", changes["sticker"]):
+                    raise ValueError(f"Прибор {serial}. Введите фактический номер наклейки из 11 цифр.")
+                if changes.get("outcome") == "pass" and records[serial].candidate == "fail":
+                    raise ValueError(f"Прибор {serial}. Пригодность противоречит измерениям.")
+        except ValueError as exc:
+            self.status.setText(str(exc))
+            return
+        storage = self.window.storage
+        confirmations = storage.confirmations()
+        rows = list(correction_rows(confirmations, p, values))
+        for serial, changes in self.individual_drafts.items():
+            rows.extend(correction_rows(confirmations, p, changes, records[serial].instrument))
+        try:
+            if rows:
+                storage.save_confirmations(rows)
+        except sqlite3.Error:
+            logging.exception("Ошибка сохранения уточнений")
+            self.status.setText("Не удалось сохранить изменения. Повторите попытку.")
+            return
+        self.party_draft.clear()
+        self.individual_drafts.clear()
         self.window.recheck()
         self.refresh()
 
     def retry(self):
-        self.accept()
+        self.collect()
         self.window.start_registry_checks()
+        thread = self.window.lookup_thread
+        if thread:
+            self.equipment_panel.retry_btn.setEnabled(False)
+            self.status.setText("Повторная проверка средств поверки…")
+            thread.finished.connect(self.changed_equipment)
 
     def remove_protocol(self):
         self.window.protocols.remove(self.protocol)
+        self.window.notice.clear()
         self.accept()
         self.window.recheck()
+
+
+def laboratory_settings(parent, storage):
+    settings = storage.laboratory()
+    form = Form(parent, "Реквизиты лаборатории",
+                "Указывайте постоянные сведения. Программа использует их, когда соответствующее поле в Excel пустое.",
+                size=(665, 370), save="Сохранить настройки")
+    for key, title, kind in DEFAULT_FIELDS:
+        control = form.field(key, title, kind, settings.get(key))
+        if key == "sign_cipher":
+            control.setPlaceholderText("Например, ВЦЯ")
+    form.validate = validate_defaults
+    if form.exec():
+        storage.save_laboratory({**settings, **form.values()}, getuser())
+
+
+class ExpiryRules(QDialog):
+    def __init__(self, parent, storage):
+        super().__init__(parent)
+        self.storage = storage
+        self.setWindowTitle("Правила срока поверки")
+        fit_window(self, 870, 440)
+        box = QVBoxLayout(self)
+        box.addWidget(label("Правила срока поверки", "heading"))
+        box.addWidget(label("Добавьте правило по документам. Оно действует для указанного типа и дат поверки, "
+                            "если межповерочный интервал в Excel совпадает и калибровка не использовалась."))
+        self.view, self.model = table(("Тип СИ", "С даты", "По дату", "Лет", "Основание"), (120, 115, 115, 65))
+        box.addWidget(self.view, 1)
+        actions = QHBoxLayout()
+        actions.addWidget(button("Добавить", lambda: self.edit({}), primary=True))
+        self.change = button("Изменить", lambda: self.edit(selected(self.view)))
+        self.remove = button("Удалить правило", self.remove_rule)
+        actions.addWidget(self.change)
+        actions.addWidget(self.remove)
+        actions.addStretch()
+        actions.addWidget(button("Закрыть", self.accept))
+        box.addLayout(actions)
+        self.view.selectionModel().currentChanged.connect(self.update_buttons)
+        self.refresh()
+
+    def update_buttons(self, *_):
+        active = selected(self.view) is not None
+        self.change.setEnabled(active)
+        self.remove.setEnabled(active)
+
+    def refresh(self):
+        rules = self.storage.laboratory().get("expiry_rules", {}).values()
+        self.model.update([(rule, (rule["type_number"], display_day(rule["from_date"]),
+                                  display_day(rule["until_date"]), rule["years"], rule["document"])) for rule in rules])
+        self.update_buttons()
+
+    def edit(self, existing):
+        if existing is None:
+            return
+        form = Form(self, "Подтверждённое правило срока",
+                    "Программа ставит последний день перед годовщиной. Используйте правило только "
+                    "если именно этот способ расчёта установлен для указанного типа.",
+                    size=(650, 435), save="Сохранить правило")
+        for key, title, kind in (
+            ("type_number", "Регистрационный номер типа СИ", "text"),
+            ("from_date", "Действует для поверок с", "date"),
+            ("until_date", "Действует для поверок по (при наличии)", "date"),
+            ("years", "Межповерочный интервал, полных лет", "text"),
+            ("document", "Документ и пункт, устанавливающий правило", "text"),
+        ):
+            form.field(key, title, kind, existing.get(key))
+        if existing:
+            form.editor.controls["type_number"].setReadOnly(True)
+        settings = self.storage.laboratory()
+        rules = settings.setdefault("expiry_rules", {})
+
+        def validate(values):
+            rule = expiry_rule(values)
+            if not existing and rule["type_number"] in rules:
+                raise ValueError("Для этого типа уже есть правило. Выберите его и нажмите «Изменить».")
+
+        form.validate = validate
+        if form.exec():
+            rule = expiry_rule(form.values())
+            rules[rule["type_number"]] = rule
+            self.storage.save_laboratory(settings, getuser())
+            self.refresh()
+
+    def remove_rule(self):
+        rule = selected(self.view)
+        if rule and message(self, "Удалить правило срока", "Сохранённое правило перестанет применяться.", ask=True):
+            settings = self.storage.laboratory()
+            settings["expiry_rules"].pop(rule["type_number"], None)
+            self.storage.save_laboratory(settings, getuser())
+            self.refresh()
 
 
 class PreviewDialog(QDialog):

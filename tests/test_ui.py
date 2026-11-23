@@ -16,7 +16,7 @@ from arshin_generator.registry import EquipmentLookup, lookup_equipment, lookup_
 from arshin_generator.ui.dialogs import EquipmentReviewPanel, XmlDialog
 from arshin_generator.ui.main import MainWindow
 from arshin_generator.ui.style import apply_theme
-from arshin_generator.ui.workflow import PreviewDialog, RepairDialog, save_corrections
+from arshin_generator.ui.workflow import PreviewDialog, RepairDialog, correction_rows
 from tests.test_workflow import SAMPLE, approve, equipment, fixture
 from tests.test_public_registry import FixtureClient, etalon, mieta
 
@@ -93,10 +93,17 @@ class InterfaceTests(unittest.TestCase):
             main.recheck()
             self.assertEqual(main.source_model.rows[0][1][2], "Нет связи с реестром")
             repair = RepairDialog(main, protocol)
-            self.assertEqual(repair.tabs.tabText(0), "Средства поверки")
-            equipment_panel = repair.tabs.widget(0)
+            equipment_panel = repair.equipment_panel
             self.assertEqual(equipment_panel.item_model.rowCount(), 8)
             self.assertNotIn("не найдено", " ".join(row[1][-1] for row in equipment_panel.item_model.rows))
+            self.assertFalse({"modification", "sign_pass", "sign_mi"} & repair.party_editor.controls.keys())
+            repair.toggle_sign_exceptions(True)
+            repair.party_editor.controls["valid_date"].setText("14.01.2027")
+            repair.item_editor.set_value("sign_pass", False)
+            repair.save()
+            self.assertIs(main.results[0].value("sign_pass"), False)
+            self.assertTrue(all(result.value("sign_pass") is True for result in main.results[1:]))
+            self.assertTrue(all(result.value("valid_date") == "2027-01-14" for result in main.results))
             repair.close()
             preview = PreviewDialog(main, main.results)
             self.assertEqual(preview.model.rowCount(), 25)
@@ -106,10 +113,11 @@ class InterfaceTests(unittest.TestCase):
                 preview.open_card()
                 opened.assert_called_once()
             preview.close()
-            save_corrections(storage, protocol, {"sign_pass": True, "sign_mi": False})
+            storage.save_confirmations(correction_rows(storage.confirmations(), protocol,
+                                                       {"sign_pass": True, "sign_mi": False}))
             main.recheck()
-            self.assertTrue(all(result.value("sign_pass") is True and result.value("sign_mi") is False
-                                for result in main.results))
+            self.assertFalse(main.results[0].value("sign_pass"))
+            self.assertTrue(all(result.value("sign_mi") is False for result in main.results))
             p = fixture(path / "ui-test.xlsx", "ТЕСТ-ИНТЕРФЕЙС", "001B6")
             storage.save_equipment(equipment())
             approve(storage, p)
@@ -118,10 +126,12 @@ class InterfaceTests(unittest.TestCase):
             main.recheck()
             self.assertTrue(main.export_btn.isEnabled())
             self.assertEqual(main.source_model.rows[0][1][2], "Готов к выгрузке")
-            with patch("arshin_generator.ui.main.QFileDialog.getExistingDirectory", return_value=str(path)), \
+            storage.set_setting("output_folder", str(path))
+            with patch("arshin_generator.ui.main.QFileDialog.getExistingDirectory") as dialog, \
                     patch.object(main, "show_saved") as saved:
                 QTest.mouseClick(main.export_btn, Qt.MouseButton.LeftButton)
                 saved.assert_called_once()
+                dialog.assert_not_called()
             files, records = saved.call_args.args
             self.assertEqual(len(records), 1)
             self.assertTrue(files[0].is_file())

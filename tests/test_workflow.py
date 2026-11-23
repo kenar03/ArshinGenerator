@@ -5,13 +5,15 @@ from pathlib import Path
 import sqlite3
 from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import patch
 
 from openpyxl import Workbook
 
 from arshin_generator.arshin import NS, Schema, export, format_packets, open_xml, signature
 from arshin_generator.confirmations import get_confirmation, legacy_key, with_guards
 from arshin_generator.domain import Datum, RegistryEntry
-from arshin_generator.normalization import modification_candidate, metrologist, serial_list
+from arshin_generator.laboratory import expiry_rule
+from arshin_generator.normalization import confirmed_rtd_modification, modification_candidate, metrologist, serial_list
 from arshin_generator.public_registry import exact_records
 from arshin_generator.readers import read_protocol
 from arshin_generator.registry import iso_date, resolve
@@ -25,6 +27,7 @@ TEMPLATE = MATERIALS / "П-Т1-з2-!!!!!-26.xltm"
 JOURNAL = MATERIALS / "Журнал.xlsx"
 XML_EXAMPLE = MATERIALS / "arshin_export_example.xml"
 SCHEMA_HASH = "71843c9544546ce2a319f14f8fd645c6d18c080ad73007070815e2a33e2c5911"
+LEGACY_SCHEMA = MATERIALS / "import.2020-06-19.xsd"
 
 
 class NormalizationTests(unittest.TestCase):
@@ -67,6 +70,8 @@ class NormalizationTests(unittest.TestCase):
         for value, expected in examples.items():
             with self.subTest(value=value):
                 self.assertEqual(modification_candidate(value), expected)
+        self.assertEqual(confirmed_rtd_modification("56560-14", "ТСП-0193", "17М/РЭД", "Ex"), "ТСП-0193-17М-Ex")
+        self.assertFalse(confirmed_rtd_modification("56560-14", "ТСП-0193", "17M/РЭД", "Ex"))
 
     def test_metrologist(self):
         for value in ("Еремеева Анна Викторовна", "А.В. Еремеева", "Еремеева А. В."):
@@ -89,9 +94,19 @@ class MaterialTests(unittest.TestCase):
                             for i in sample.instruments))
         self.assertEqual(sample.proposed_modification, "ТСМ-0193-01")
         self.assertEqual(len(sample.equipment), 8)
+        self.assertEqual(sample.equipment[5].serial, "10253831")
+        self.assertEqual(sample.equipment[5].registration, "19973.06.4Р.01149311")
         self.assertIsNone(sample.fields["verification_type"].value)
         results = check([sample], {}, [])
         self.assertTrue(all(r.value("outcome") == "pass" for r in results))
+        for key, value in {
+            "modification": "ТСМ-0193-01", "sign_pass": True, "sign_mi": False,
+            "owner": 'ООО "ЧТП"', "metrologist": "Еремеева А.В.", "verification_date": "2026-11-22",
+            "temperature": "21,6 °C", "pressure": "99,83 кПа", "humidity": "30 %", "other": "220 В",
+        }.items():
+            with self.subTest(field=key):
+                self.assertEqual([r.value(key) for r in results], [value] * 25)
+        self.assertTrue(results[0].value("method").startswith("ГОСТ 8.461-2009"))
         self.assertTrue(all(any("Наклейка" in issue for issue in r.issues) for r in results))
         self.assertFalse(any("учебн" in issue.casefold() for r in results for issue in r.issues))
         template = read_protocol(TEMPLATE)
@@ -109,10 +124,15 @@ class MaterialTests(unittest.TestCase):
         self.assertEqual(sum("наклейки" in s for s in messages), 2)
         self.assertEqual(sum("наличие средств" in s for s in messages), 1)
         self.assertTrue(details)
+        legacy = Schema(LEGACY_SCHEMA)
+        self.assertFalse(legacy.require_sticker)
+        self.assertTrue(legacy.require_owner)
+        self.assertTrue(schema.require_sticker)
+        self.assertFalse(schema.require_owner)
 
 
 def fixture(path, number, serial, *, dual=False, outcome="СООТВЕТСТВУЕТ", complete=True,
-            count=1, print_limit=None):
+            count=1, print_limit=None, sticker="01234567890", owner="", interval=None):
     book = Workbook()
     t = book.active
     t.title = "Таблицы"
@@ -126,14 +146,15 @@ def fixture(path, number, serial, *, dual=False, outcome="СООТВЕТСТВУ
         "B1": "первичной", "D1": number, "A2": "Заводские номера", "B5": 21.3, "B6": 99.3,
         "B7": 30, "B8": 220, "A10": "г/р № 10000-10 Учебное средство № 001",
         "B19": f"№{serial}", "C19": "годны к применению, соответствуют",
-        "B20": "01234567890", "B21": "-", "B22": "V", "B23": "Тестова Анна Викторовна",
+        "B20": sticker, "B21": "-", "B22": "V", "B23": "Тестова Анна Викторовна",
         "B24": date(2026, 1, 15), "H26": "Схема соединения", "J26": "Кол-во",
         "A27": "ТСП-0193", "B27": "01", "L27": "56560-14", "H27": "2х4" if dual else "4",
-        "J27": count, "A34": "Серийный №",
+        "J27": count, "K27": interval, "A34": "Серийный №",
     }
     for cell, value in cells.items():
         t[cell] = value
     r["A20"] = f"Протокол {number}"
+    r["J24"] = owner
     r["A32"] = "Методика поверки:"
     r["A33"] = "Методика для испытаний XML"
     r["A45"] = "Заключение: СИ годны к применению."
@@ -183,6 +204,40 @@ def approve(storage, p, *, outcome="pass", sticker="01234567890", modification="
                                   evidence, user)
 
 
+def generate_test_packets(protocol, destination):
+    protocol.fields["additional"] = Datum("СИНТЕТИЧЕСКАЯ ПАРТИЯ. Только для локальной проверки.", "Тест")
+    storage = Storage(destination / "synthetic.sqlite3")
+    storage.save_equipment(equipment())
+    storage.save_laboratory({"sign_cipher": "ТСТ", "calibration": False}, "Тест")
+    storage.save_confirmation("protocol", protocol_key(protocol), {"valid_date": "2027-01-14"},
+                              "Синтетический срок для локальной проверки", "Тест")
+    names = [instrument.serial for instrument in protocol.instruments]
+    paths = []
+    current = Schema()
+    for schema in (Schema(LEGACY_SCHEMA), current):
+        codes = [f"{i:011d}" for i in range(1, len(names) + 1)] if schema.require_sticker else []
+        for instrument, code in zip(protocol.instruments, codes):
+            storage.save_confirmation("instrument", individual_key(protocol, instrument.serial), {"sticker": code},
+                                      "Синтетическая наклейка для локальной проверки", "Тест")
+        results = check([protocol], storage.confirmations(), storage.entries(), laboratory=storage.laboratory(),
+                        require_sticker=schema.require_sticker, require_owner=schema.require_owner)
+        assert all(not result.blockers for result in results)
+        [file] = export(results, schema, destination, storage, [], "Тест")
+        root, issues, _ = open_xml(file, schema)
+        ns = {"g": NS}
+        assert not issues and len(root) == len(names)
+        assert root.xpath("g:result/g:miInfo/g:singleMI/g:manufactureNum/text()", namespaces=ns) == names
+        assert root.xpath("g:result/g:applicable/g:stickerNum/text()", namespaces=ns) == codes
+        assert root.xpath("g:result/g:applicable/g:signPass/text()", namespaces=ns) == ["true"] * len(names)
+        assert root.xpath("g:result/g:applicable/g:signMi/text()", namespaces=ns) == ["false"] * len(names)
+        assert root.xpath("g:result/g:means/g:mis/g:mi/g:typeNum/text()", namespaces=ns) == ["10000-10"] * len(names)
+        if not codes:
+            _, rejected, _ = open_xml(file, current)
+            assert len(rejected) == len(names) and all("наклейки" in issue for issue in rejected)
+        paths.append(file)
+    return paths
+
+
 class WorkflowTests(unittest.TestCase):
     def setUp(self):
         self.tmp = TemporaryDirectory()
@@ -195,6 +250,63 @@ class WorkflowTests(unittest.TestCase):
 
     def checked(self, *protocols):
         return check(protocols, self.storage.confirmations(), self.storage.entries())
+
+    def test_batch_corrections_are_atomic(self):
+        rows = [("protocol", "A", {"sign_cipher": "ТСТ"}, "Тест", "Тест"),
+                ("instrument", "B", {"sign_mi": False}, "Тест", "Тест")]
+        with patch.object(self.storage, "_audit", side_effect=[None, sqlite3.OperationalError("disk")]):
+            with self.assertRaises(sqlite3.OperationalError):
+                self.storage.save_confirmations(rows)
+        self.assertEqual(self.storage.confirmations(), {})
+        self.storage.save_confirmations(rows)
+        self.assertEqual(len(self.storage.confirmations()), 2)
+
+    def test_lab_defaults_precedence_and_type_scoped_expiry(self):
+        protocol = fixture(self.root / "source.xlsx", "ТЕСТ-ПРАВИЛО", "001B6", interval=4)
+        self.storage.save_equipment(equipment())
+        rule = expiry_rule({"type_number": "56560-14", "from_date": "2026-01-01",
+                            "until_date": "2026-12-31", "years": "4", "document": "Тестовое правило"})
+        settings = {"sign_cipher": "ТСТ", "calibration": False, "verification_type": "2",
+                    "expiry_rules": {"56560-14": rule}}
+        self.storage.save_laboratory(settings, "Тест")
+        saved = Storage(self.storage.path).laboratory()
+        self.assertEqual(saved, settings)
+
+        def result():
+            return check([protocol], {}, self.storage.entries(), laboratory=saved)[0]
+
+        actual = result()
+        self.assertEqual(actual.value("verification_type"), "1")
+        self.assertIs(actual.value("calibration"), False)
+        self.assertEqual(actual.value("valid_date"), "2030-01-14")
+        self.assertIn("Тестовое правило", actual.fields["valid_date"].source)
+        protocol.fields["verification_type"] = Datum(None, "Таблицы!B1", "неизвестное значение")
+        self.assertIsNone(result().value("verification_type"))
+        protocol.fields["verification_type"] = Datum(None, "Таблицы!B1")
+        self.assertEqual(result().value("verification_type"), "2")
+        protocol.fields["interval"] = Datum("3", "Таблицы!K27")
+        self.assertIsNone(result().value("valid_date"))
+        protocol.fields["interval"] = Datum("4", "Таблицы!K27")
+        protocol.fields["calibration"] = Datum(True, "Протокол")
+        self.assertIs(result().value("calibration"), True)
+        self.assertIsNone(result().value("valid_date"))
+
+    def test_modification_confirmation_uses_code_and_execution_without_length(self):
+        p = fixture(self.root / "source.xlsx", "ТЕСТ-МОДИФИКАЦИЯ", "011B6")
+        p.modification_parts = ("ТСП-0193", "17M", "Ex")
+        p.fields["modification"] = Datum("", "")
+        self.storage.save_confirmation("modification", modification_key(p), {"modification": "ТСП-0193-17M-Ex"},
+                                       "Подтверждённое исполнение", "Тест")
+        p.fields["marking"] = Datum("ТСП-0193-17M-Ex-225", "Отчёт!A61")
+        self.assertEqual(self.checked(p)[0].value("modification"), "ТСП-0193-17M-Ex")
+        p.modification_parts = ("ТСП-0193", "18M", "Ex")
+        self.assertIsNone(self.checked(p)[0].value("modification") or None)
+
+    def test_full_batch_roundtrip_for_both_original_schemas(self):
+        protocol = fixture(self.root / "batch.xlsx", "ТЕСТ-ПАКЕТ", "001B6", count=25, sticker="",
+                           owner="Синтетический владелец")
+        for file in generate_test_packets(protocol, self.root):
+            self.assertTrue(file.is_file())
 
     def test_dual_group_and_negative(self):
         p = fixture(self.root / "two.xlsm", "ТЕСТ-ДВА", "019B6", dual=True, outcome="НЕ СООТВЕТСТВУЕТ")

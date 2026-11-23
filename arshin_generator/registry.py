@@ -305,7 +305,8 @@ def lookup_equipment(item: Equipment, when: date, client: PublicClient | None = 
     if len(available) == 1 and not corrected:
         return EquipmentLookup("found", "", tuple(candidates))
     if available:
-        reason = ("Проверьте написание номера записи" if corrected
+        reason = ("В номере эталона из Excel латинская P. Сверьте карточку с кириллической Р"
+                  if corrected
                   else "Найдено несколько подходящих записей. Требуется выбор")
         return EquipmentLookup("choice", reason, tuple(candidates))
     if all(c.entry.valid_until and iso_date(c.entry.valid_until) < when for c in candidates):

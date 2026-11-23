@@ -204,19 +204,24 @@ class EquipmentReviewPanel(QWidget):
         self.storage = storage
         self.protocol = protocol
         self.lookups = lookups
-        self.day = iso_date(protocol.fields["verification_date"].value)
+        day = protocol.fields.get("verification_date")
+        self.day = iso_date(day.value if day else None)
         box = QVBoxLayout(self)
-        box.setContentsMargins(8, 12, 8, 0)
+        box.setContentsMargins(0, 0, 0, 0)
+        self.summary = label("")
+        box.addWidget(self.summary)
         self.items, self.item_model = table(("Средство поверки", "Заводской №", "Состояние"), (300, 105))
-        self.items.setMinimumHeight(96)
-        box.addWidget(self.items, 2)
+        height = self.items.horizontalHeader().sizeHint().height()
+        rows = min(max(len(protocol.equipment), 1), 9)
+        self.items.setFixedHeight(height + rows * self.items.verticalHeader().defaultSectionSize() + 6)
+        box.addWidget(self.items)
         self.note = label("")
         box.addWidget(self.note)
         self.candidates, self.candidate_model = table(
             ("Номер записи", "Модель", "Зав. №", "Поверена", "Действует до", "Схема / состояние"),
             (165, 132, 75, 90, 106)
         )
-        self.candidates.setMinimumHeight(100)
+        self.candidates.setFixedHeight(135)
         self.candidates.horizontalHeader().setStretchLastSection(True)
         box.addWidget(self.candidates, 2)
         actions = QHBoxLayout()
@@ -236,45 +241,59 @@ class EquipmentReviewPanel(QWidget):
     def refresh_items(self, current=None):
         entries = self.storage.entries()
         rows = []
+        self.assessments = {}
         for item in self.protocol.equipment:
             live = self.lookup(item)
             resolved, issue = resolve_many(item, entries, self.day, live)
-            if not resolved:
-                rows.append((item, (item.name or item.description, item.serial, issue)))
+            self.assessments[item] = bool(resolved), issue
+            state = ("Проверено" if live and live.state in {"found", "choice"} else
+                     "Подтверждено по справочнику") if resolved else issue
+            rows.append((item, (item.name or item.description, item.serial, state)))
+        self.pending = [item for item, (ready, _) in self.assessments.items() if not ready]
+        self.checked = sum(self.assessments[item][0] for item, _ in rows)
+        self.summary.setText(f"Средства поверки · проверено {self.checked} из {len(rows)} · "
+                             f"требуют внимания {len(rows) - self.checked}")
         self.item_model.update(rows)
         if rows:
-            index = next((i for i, row in enumerate(rows) if row[0] == current), 0)
+            focus = current or (self.pending[0] if self.pending else None)
+            index = next((i for i, row in enumerate(rows) if row[0] == focus), 0)
             self.items.selectRow(index)
         self.refresh_candidates()
 
     def refresh_candidates(self, *_):
         item = selected(self.items)
         live = self.lookup(item)
+        resolved, issue = self.assessments.get(item, (False, ""))
         candidates = live.candidates if live else ()
         several = bool(item and item.category == "mieta" and sum(c.eligible for c in candidates) > 1)
         self.candidates.setSelectionMode(QAbstractItemView.SelectionMode.MultiSelection if several else
                                          QAbstractItemView.SelectionMode.SingleSelection)
-        note = live.message if live and live.message else "Проверьте реквизиты оборудования в протоколе."
-        if several:
+        note = issue
+        if several and not resolved:
             note += ". Нажмите на каждую запись, которая действительно использовалась."
-        if item:
-            name = item.name or item.description
-            number = item.registration or item.type_number
-            note = f"{name}{' · ' + number if number else ''}\n{note}"
+        if live and live.state == "expired" and len(candidates) == 1 and candidates[0].entry.valid_until:
+            end = iso_date(candidates[0].entry.valid_until)
+            if end:
+                note += f". Поверка действовала до {end:%d.%m.%Y}."
+            if candidates[0].status.startswith(("Модель", "Заводской номер")):
+                note += f" {candidates[0].status}."
         self.note.setText(note if item else "В протоколе нужно указать средства поверки.")
+        self.note.setVisible(bool(self.note.text()))
         self.candidate_model.update([
             (c, (c.entry.identifier or c.entry.public_id, c.entry.model, c.entry.registry_serial, c.entry.valid_from,
                  c.entry.valid_until, " · ".join(filter(None, (c.status, c.entry.scheme)))))
             for c in candidates
         ])
-        self.candidates.setVisible(bool(candidates))
-        self.retry_btn.setVisible(bool(live and live.state in {"unavailable", "response"}))
+        self.candidates.setVisible(bool(not resolved and live and live.state in {"found", "choice"} and candidates))
+        self.retry_btn.setVisible(bool(not resolved and live and live.state in {"unavailable", "response"}))
         self.refresh_button()
 
     def refresh_button(self, *_):
         candidates = self.selected_candidates()
-        live = self.lookup(selected(self.items))
-        choosing = bool(live and live.state in {"found", "choice"})
+        item = selected(self.items)
+        live = self.lookup(item)
+        resolved, _ = self.assessments.get(item, (False, ""))
+        choosing = bool(not resolved and live and live.state in {"found", "choice"})
         self.select_btn.setVisible(choosing)
         self.select_btn.setEnabled(bool(choosing and candidates and all(c.eligible for c in candidates)))
 

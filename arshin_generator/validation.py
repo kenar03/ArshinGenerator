@@ -4,10 +4,11 @@ import re
 
 from .confirmations import get_confirmation, individual_key, protocol_key
 from .domain import Datum, Protocol, Result, RegistryEntry
+from .laboratory import apply_defaults
 from .normalization import CANONICAL_NAME, metrologist, serial_list
 from .registry import iso_date, lookup_key, resolve_many
 
-RULES = "1.2.0"
+RULES = "1.3.0"
 PASS = "СООТВЕТСТВУЕТ"
 FAIL = "НЕ СООТВЕТСТВУЕТ"
 SHARED_FIELDS = (
@@ -55,6 +56,12 @@ LABELS = {
 
 
 def modification_key(protocol: Protocol) -> str:
+    if protocol.modification_parts and all(protocol.modification_parts[:2]):
+        return json.dumps([protocol.fields["type_number"].value, *protocol.modification_parts], ensure_ascii=False)
+    return legacy_modification_key(protocol)
+
+
+def legacy_modification_key(protocol: Protocol) -> str:
     return json.dumps([protocol.fields["type_number"].value, protocol.fields["marking"].value], ensure_ascii=False)
 
 
@@ -65,10 +72,12 @@ def valid_modification(protocol: Protocol, value: str) -> bool:
     return not prefixes or any(value.startswith(prefix) and value[len(prefix):].strip() for prefix in prefixes)
 
 
-def _merge(fields: dict, confirmation) -> None:
+def _merge(fields: dict, confirmation, *, preserve=()) -> None:
     if confirmation:
         data, evidence, confirmer, timestamp = confirmation
         for key, value in data.items():
+            if key in preserve:
+                continue
             raw = fields[key].raw if key in fields else ""
             fields[key] = Datum(value, f"Подтверждено: {confirmer}, {timestamp}. {evidence}", raw)
 
@@ -101,13 +110,16 @@ def _report_agrees(protocol, evidence, shared):
     return protocol.declared == 1 and all(failing) and bool(reasons)
 
 
-def _check_common(protocol, fields):
+def _check_common(protocol, fields, require_owner):
     issues = []
     missing = []
     for key in ("type_number", "method", "temperature", "pressure", "humidity"):
         if not fields.get(key, Datum("", "")).value:
             issues.append(f"Заполните поле «{LABELS[key]}».")
             missing.append(key)
+    if require_owner and not fields.get("owner", Datum("", "")).value:
+        issues.append("Укажите фактического владельца СИ.")
+        missing.append("owner")
     if not iso_date(fields["verification_date"].value):
         issues.append("Ошибка: укажите фактическую дату поверки в Таблицы!B24 и сохраните книгу в Excel.")
     if fields.get("verification_type", Datum("", "")).value not in {"1", "2"}:
@@ -135,20 +147,26 @@ def _check_common(protocol, fields):
 
 
 def check(protocols: list[Protocol], confirmations: dict, registry: list[RegistryEntry],
-          lookups: dict | None = None) -> list[Result]:
+          lookups: dict | None = None, *, laboratory=None, require_sticker=True, require_owner=False) -> list[Result]:
     results = []
     lookups = lookups or {}
     for protocol in protocols:
         if protocol.error or not protocol.instruments:
             continue
         shared = protocol.fields.copy()
-        _merge(shared, confirmations.get(("modification", modification_key(protocol))))
+        if not shared.get("modification", Datum("", "")).value:
+            _merge(shared, confirmations.get(("modification", modification_key(protocol))) or
+                   confirmations.get(("modification", legacy_modification_key(protocol))))
         common = get_confirmation(confirmations, "protocol", protocol)
-        if protocol.declared != 1:
-            for key in ("sign_pass", "sign_mi"):
-                item = shared.get(key, Datum(None, ""))
-                shared[key] = Datum(None, item.source + " (применение ко всей партии уточняется)", item.raw)
-        _merge(shared, common)
+        known = {key for key, datum in shared.items() if datum.value is not None and datum.value != ""}
+        # A supplied but unusable field can still be corrected against the underlying documents.
+        if "metrologist" in known:
+            try:
+                metrologist(str(shared["metrologist"].value))
+            except ValueError:
+                known.remove("metrologist")
+        _merge(shared, common, preserve=known)
+        apply_defaults(shared, laboratory or {})
         issues = protocol.issues.copy()
         missing = []
         if protocol.serial_issue:
@@ -183,7 +201,7 @@ def check(protocols: list[Protocol], confirmations: dict, registry: list[Registr
         ]
         if len(set(equipment_keys)) != len(equipment_keys):
             equipment_issues.append("В списке средств поверки обнаружено повторное соответствие одному идентификатору.")
-        common_issues, common_fields = _check_common(protocol, shared)
+        common_issues, common_fields = _check_common(protocol, shared, require_owner)
         issues.extend(common_issues)
         missing.extend(common_fields)
         evidence = [_individual_evidence(protocol, instrument) for instrument in protocol.instruments]
@@ -199,7 +217,7 @@ def check(protocols: list[Protocol], confirmations: dict, registry: list[Registr
             if auto:
                 evidence_source = "Согласованы заключение отчёта Excel и сохранённые результаты всех ЧЭ"
                 fields["outcome"] = Datum(protocol.report_outcome, evidence_source, protocol.evidence)
-            _merge(fields, individual)
+            _merge(fields, individual, preserve={"outcome", "reasons"} if auto else ())
             candidate = _candidate(protocol, statuses, complete)
             result = Result(protocol, instrument, fields, equipment, candidate=candidate, shared_issues=shared_issues,
                             equipment_issues=tuple(equipment_issues), missing_fields=tuple(missing))
@@ -218,7 +236,7 @@ def check(protocols: list[Protocol], confirmations: dict, registry: list[Registr
             if result.value("outcome") == "pass" and result.value("reasons"):
                 result.issues.append("При положительном результате указана причина непригодности.")
                 result.repair_fields.update(("outcome", "reasons"))
-            _check_fields(result)
+            _check_fields(result, require_sticker)
             results.append(result)
     identities = Counter((r.identity[0], r.identity[1].upper(), r.identity[2]) for r in results if r.identity[1])
     stickers = Counter(r.value("sticker") for r in results if r.value("outcome") == "pass" and r.value("sticker"))
@@ -232,15 +250,15 @@ def check(protocols: list[Protocol], confirmations: dict, registry: list[Registr
     return results
 
 
-def _check_fields(result: Result) -> None:
+def _check_fields(result: Result, require_sticker: bool) -> None:
     value = result.value
     issues = result.issues
     if not result.instrument.serial:
         issues.append("Заводской номер нельзя подтвердить по сохранённой строке.")
     if value("outcome") == "pass":
         sticker = str(value("sticker") or "")
-        if not re.fullmatch(r"[0-9]{11}", sticker):
-            issues.append("Наклейка: пакетная XSD требует фактический номер из 11 цифр для пригодного СИ.")
+        if require_sticker and not re.fullmatch(r"[0-9]{11}", sticker):
+            issues.append("Наклейка: для пригодного прибора нужен фактический номер из 11 цифр.")
             result.repair_fields.add("sticker")
         if any(type(value(key)) is not bool for key in ("sign_pass", "sign_mi")):
             issues.append("Подтверждение: укажите знаки на приборе и в паспорте.")

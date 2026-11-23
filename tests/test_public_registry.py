@@ -102,6 +102,8 @@ class RegistryLookupTests(unittest.TestCase):
         exact = lookup_equipment(item, DAY, self.client)
         self.assertEqual(exact.state, "found")
         self.assertEqual(exact.candidates[0].entry.identifier, number)
+        self.assertEqual([query for resource, query in self.client.requests if
+                          resource == "mieta" and isinstance(query, dict)], [{"number": number}])
         changed = number.replace("Р", "P")
         variant = lookup_equipment(replace(item, source_id=changed, registration=changed), DAY, self.client)
         self.assertEqual(variant.state, "choice")

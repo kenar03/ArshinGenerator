@@ -5,7 +5,7 @@ import logging
 from pathlib import Path
 import sqlite3
 
-from PySide6.QtCore import QThread, QUrl, Qt, Signal
+from PySide6.QtCore import QStandardPaths, QThread, QUrl, Qt, Signal
 from PySide6.QtGui import QDesktopServices, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QDialog, QFileDialog, QFrame, QHBoxLayout, QHeaderView, QMainWindow, QMenu, QToolButton, QVBoxLayout, QWidget,
@@ -15,9 +15,9 @@ from ..arshin import export
 from ..readers import EXTENSIONS, read_protocol
 from ..registry import EquipmentLookup, iso_date, lookup_equipment, lookup_key, resolve_many
 from ..validation import check
-from .common import Form, button, confirmation_values, fit_window, label, message, selected, table
+from .common import button, fit_window, label, message, selected, table
 from .dialogs import HistoryDialog, RegistryDialog, XmlDialog
-from .workflow import ConnectionDialog, PreviewDialog, RepairDialog, readable
+from .workflow import ConnectionDialog, ExpiryRules, PreviewDialog, RepairDialog, laboratory_settings
 
 
 class ImportThread(QThread):
@@ -86,6 +86,10 @@ class MainWindow(QMainWindow):
         header.addLayout(title, 1)
         settings = button("Настройки")
         menu = QMenu(settings)
+        menu.addAction("Реквизиты лаборатории", self.laboratory_settings)
+        menu.addAction("Правила срока поверки", self.expiry_rules)
+        menu.addAction("Папка для XML…", self.pick_output_folder)
+        menu.addSeparator()
         menu.addAction("Проверить подключение", self.connection)
         menu.addAction("Справочник средств поверки", self.registry)
         menu.addAction("История выгрузок", self.history)
@@ -106,7 +110,7 @@ class MainWindow(QMainWindow):
         self.add_btn.setMenu(add)
         actions.addWidget(self.add_btn)
         actions.addStretch()
-        self.preview_btn = button("Просмотреть результаты", self.show_results)
+        self.preview_btn = button("Просмотреть", self.show_results)
         self.export_btn = button("Сформировать XML", self.export_xml, primary=True)
         actions.addWidget(self.preview_btn)
         actions.addWidget(self.export_btn)
@@ -254,7 +258,9 @@ class MainWindow(QMainWindow):
 
     def recheck(self):
         self.entries = self.storage.entries()
-        self.results = check(self.protocols, self.storage.confirmations(), self.entries, self.lookups)
+        self.results = check(self.protocols, self.storage.confirmations(), self.entries, self.lookups,
+                             laboratory=self.storage.laboratory(), require_sticker=self.schema.require_sticker,
+                             require_owner=self.schema.require_owner)
         self.group = defaultdict(list)
         for item in self.results:
             self.group[id(item.protocol)].append(item)
@@ -306,10 +312,17 @@ class MainWindow(QMainWindow):
         self.add_btn.setEnabled(not self.busy)
         self.preview_btn.setEnabled(bool(self.results) and not self.busy)
         self.export_btn.setEnabled(bool(ready) and not self.busy)
+        self.export_btn.setToolTip("Куда сохранять: " + str(self.output_folder()) if ready else
+                                   "Готовые записи появятся после устранения замечаний.")
         retry = any(self.has_connection_issue(p) for p in self.protocols)
         self.retry_btn.setVisible(not self.busy and retry)
         if retry and not self.busy:
             self.notice.setText("Не удалось подключиться к реестру.")
+        elif rows and not self.busy:
+            if not ready:
+                self.notice.setText("Откройте «Исправить», чтобы увидеть препятствия для выгрузки.")
+            else:
+                self.notice.setText(f"В пакет войдёт записей: {ready}")
 
     def open_protocol(self, protocol):
         if not self.busy:
@@ -321,6 +334,28 @@ class MainWindow(QMainWindow):
 
     def connection(self):
         ConnectionDialog(self, self.open_log).exec()
+
+    def laboratory_settings(self):
+        laboratory_settings(self, self.storage)
+        self.recheck()
+
+    def expiry_rules(self):
+        ExpiryRules(self, self.storage).exec()
+        self.recheck()
+
+    def output_folder(self):
+        saved = self.storage.setting("output_folder")
+        if saved:
+            return Path(saved)
+        documents = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DocumentsLocation)
+        return (Path(documents) if documents else Path.home()) / "Аршин"
+
+    def pick_output_folder(self):
+        current = self.output_folder()
+        folder = QFileDialog.getExistingDirectory(self, "Папка для XML", str(current if current.is_dir() else current.parent))
+        if folder:
+            self.storage.set_setting("output_folder", folder)
+            self.render()
 
     def registry(self):
         protocol = selected(self.source)
@@ -344,7 +379,7 @@ class MainWindow(QMainWindow):
 
     def pick_xml(self):
         files, _ = QFileDialog.getOpenFileNames(self, "Открыть сформированный XML",
-                                                self.storage.setting("output_folder"), "Файлы XML (*.xml)")
+                                                str(self.output_folder()), "Файлы XML (*.xml)")
         if files:
             paths = [Path(file) for file in files]
             local = {path.resolve().parent for path in paths}
@@ -368,27 +403,20 @@ class MainWindow(QMainWindow):
                         for p in self.protocols if not self.group[id(p)])
         previous = self.storage.seen([r.identity for r in ready])
         repeated = [f"{r.protocol.number} / {r.instrument.serial}" for r in ready if r.identity in previous]
-        if excluded or repeated:
-            decision = self.confirm_export_scope(ready, excluded, repeated)
-            if decision is None:
-                return
-            evidence, confirmer = decision
-        else:
-            evidence, confirmer = "Все результаты проверены", f"Сеанс Windows: {getuser()}"
-        folder = QFileDialog.getExistingDirectory(self, "Папка для сохранения пакета",
-                                                   self.storage.setting("output_folder"))
-        if not folder:
+        if (excluded or repeated) and not self.confirm_export_scope(ready, excluded, repeated):
             return
+        confirmer = f"Сеанс Windows: {getuser()}"
+        evidence = ("Подтверждён состав выгрузки" if excluded or repeated else "Все результаты проверены")
+        folder = self.output_folder()
         try:
-            files = export(ready, self.schema, Path(folder), self.storage, excluded, f"{confirmer}: {evidence}")
+            folder.mkdir(parents=True, exist_ok=True)
+            files = export(ready, self.schema, folder, self.storage, excluded, f"{confirmer}: {evidence}")
         except (ValueError, OSError, sqlite3.Error) as exc:
             logging.exception("Ошибка формирования XML")
             message(self, "Выгрузка", str(exc) if isinstance(exc, ValueError) else
-                    "Не удалось сохранить файл. Проверьте доступ к выбранной папке.", error=True)
+                    "Не удалось сохранить файл. Укажите доступную папку в меню «Настройки → Папка для XML».",
+                    error=True)
             return
-        self.storage.set_setting("output_folder", folder)
-        if excluded or repeated:
-            self.storage.set_setting("confirmer", confirmer)
         self.show_saved(files, ready)
 
     def show_saved(self, files, records):
@@ -414,32 +442,14 @@ class MainWindow(QMainWindow):
         dialog.exec()
 
     def confirm_export_scope(self, ready, excluded, repeated):
-        form = Form(self, "Состав выгрузки",
-                    f"Войдут {len(ready)} проверенных результатов. "
-                    f"Исключено {len(excluded)}. Повторно включается {len(repeated)}.",
-                    size=(770, 570), save="Выбрать папку")
+        detail = [f"В пакет войдёт записей: {len(ready)}."]
         if excluded:
-            grouped = defaultdict(lambda: defaultdict(int))
+            grouped = defaultdict(list)
             for entry in excluded:
-                for issue in entry["issues"]:
-                    grouped[entry["protocol"]][readable(issue)] += 1
-            text = "\n\n".join(
-                f"{protocol}\n" + "\n".join(f"• {issue} · {count}" for issue, count in problems.items())
-                for protocol, problems in grouped.items()
-            )
-            form.field("_excluded", "Исключённые записи", "list", text, readonly=True)
-            form.field("_partial", "Подтверждаю выгрузку без этих записей", "bool")
+                grouped[entry["protocol"]].append(entry["serial"])
+            detail.append("Записи с замечаниями останутся в списке протоколов:")
+            detail.extend(f"• {protocol} — {len(serials)}" if all(serials) else f"• {protocol}"
+                          for protocol, serials in grouped.items())
         if repeated:
-            form.field("_repeated", "Ранее выгружены", "list", "\n".join(repeated), readonly=True)
-            form.field("_repeat", "Подтверждаю повторное формирование", "bool")
-        form.confirmation(self.storage.setting("confirmer"))
-
-        def validate(data):
-            confirmation_values(form, data)
-            if excluded and data["_partial"] is not True:
-                raise ValueError("Подтвердите исключение записей из пакета.")
-            if repeated and data["_repeat"] is not True:
-                raise ValueError("Подтвердите повторное включение записей.")
-
-        form.validate = validate
-        return confirmation_values(form, form.values()) if form.exec() else None
+            detail.append(f"Ранее выгружено записей: {len(repeated)}. Они войдут в новый пакет.")
+        return message(self, "Состав выгрузки", "\n".join(detail), ask=True)

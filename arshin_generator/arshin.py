@@ -61,7 +61,8 @@ def result_element(result: Result) -> etree._Element:
     if v("outcome") == "pass":
         outcome = _add(result_tag, "applicable")
         for tag, key in (("stickerNum", "sticker"), ("signPass", "sign_pass"), ("signMi", "sign_mi")):
-            _add(outcome, tag, v(key))
+            if key != "sticker" or v(key):
+                _add(outcome, tag, v(key))
     elif v("outcome") == "fail":
         _add(_add(result_tag, "inapplicable"), "reasons", v("reasons"))
     _add(result_tag, "docTitle", v("method"))
@@ -129,7 +130,11 @@ class Schema:
         data = path.read_bytes()
         self.path = path
         self.hash = sha256(data).hexdigest()
-        self.schema = etree.XMLSchema(_parse(data))
+        declaration = _parse(data)
+        xsd = {"xs": "http://www.w3.org/2001/XMLSchema"}
+        self.require_sticker = declaration.find(".//xs:element[@name='stickerNum']", xsd).get("minOccurs", "1") != "0"
+        self.require_owner = declaration.find(".//xs:element[@name='miOwner']", xsd).get("minOccurs", "1") != "0"
+        self.schema = etree.XMLSchema(declaration)
 
     def inspect(self, data: bytes):
         root = _parse(data)

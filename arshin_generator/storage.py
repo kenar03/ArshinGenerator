@@ -9,6 +9,7 @@ import sqlite3
 import sys
 
 from .domain import RegistryEntry
+from .laboratory import SETTING as LABORATORY_SETTING
 from .confirmations import GUARDS, individual_key, legacy_key, protocol_key, with_guards
 
 PORTABLE_FLAG = "portable.flag"
@@ -87,6 +88,14 @@ class Storage:
         with self.session() as db:
             db.execute("insert or replace into settings values (?,?)", (key, value))
 
+    def laboratory(self) -> dict:
+        return json.loads(self.setting(LABORATORY_SETTING) or "{}")
+
+    def save_laboratory(self, values: dict, confirmer: str) -> None:
+        with self.session() as db:
+            db.execute("insert or replace into settings values (?,?)", (LABORATORY_SETTING, encode(values)))
+            self._audit(db, "Настройки лаборатории", [values, confirmer])
+
     def confirmations(self) -> dict:
         with self.session() as db:
             return {
@@ -97,13 +106,18 @@ class Storage:
             }
 
     def save_confirmation(self, scope: str, subject: str, fields: dict, evidence: str, confirmer: str) -> None:
-        if not evidence.strip() or not confirmer.strip():
+        self.save_confirmations([(scope, subject, fields, evidence, confirmer)])
+
+    def save_confirmations(self, rows) -> None:
+        rows = list(rows)
+        if any(not evidence.strip() or not confirmer.strip() for _, _, _, evidence, confirmer in rows):
             raise ValueError("Укажите основание и имя сотрудника, который проверил сведения.")
         changed = now()
         with self.session() as db:
-            db.execute("insert or replace into confirmations values (?,?,?,?,?,?)",
-                       (scope, subject, encode(fields), evidence, confirmer, changed))
-            self._audit(db, "Подтверждение", [scope, subject, fields, evidence, confirmer])
+            for scope, subject, fields, evidence, confirmer in rows:
+                db.execute("insert or replace into confirmations values (?,?,?,?,?,?)",
+                           (scope, subject, encode(fields), evidence, confirmer, changed))
+                self._audit(db, "Подтверждение", [scope, subject, fields, evidence, confirmer])
 
     def migrate_confirmation(self, protocol) -> None:
         """Recover older confirmation records only from their original workbook snapshot."""

@@ -65,6 +65,7 @@ class Protocol:
     elements: int = 0
     conclusion: str = ""
     proposed_modification: str = ""
+    modification_parts: tuple[str, ...] = ()
     modification_prefixes: tuple[str, ...] = ()
     evidence: str = ""
     report_outcome: str = ""
