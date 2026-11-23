@@ -193,7 +193,7 @@ class Fields(QWidget):
 
 
 class Form(QDialog):
-    def __init__(self, parent, title, guidance="", *, size=(610, 700), save="Подтвердить"):
+    def __init__(self, parent, title, guidance="", *, size=(610, 700), save="Сохранить"):
         super().__init__(parent)
         self.setWindowTitle(title)
         fit_window(self, *size)
@@ -219,10 +219,6 @@ class Form(QDialog):
     def field(self, key, title, kind="text", value=None, choices=None, readonly=False):
         return self.editor.field(key, title, kind, value, choices, readonly)
 
-    def confirmation(self, confirmer="", evidence=""):
-        self.field("_evidence", "Основание подтверждения", value=evidence)
-        self.field("_confirmer", "Кто подтвердил", value=confirmer)
-
     def values(self):
         return self.editor.values()
 
@@ -234,11 +230,3 @@ class Form(QDialog):
             message(self, "Проверьте введённые данные", str(exc), error=True)
             return
         self.accept()
-
-
-def confirmation_values(form, data):
-    evidence = data.pop("_evidence", "").strip()
-    confirmer = data.pop("_confirmer", "").strip()
-    if not evidence or not confirmer:
-        raise ValueError("Укажите основание и имя сотрудника, который проверил сведения.")
-    return evidence, confirmer

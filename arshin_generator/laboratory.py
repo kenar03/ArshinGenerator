@@ -35,7 +35,7 @@ def expiry_rule(values):
     return {**values, "years": int(years)}
 
 
-def apply_defaults(fields, settings):
+def apply_defaults(fields, settings, *, workbook_date=None, expiry_exception=None):
     def value(key):
         return fields.get(key, Datum(None, ""))
 
@@ -47,19 +47,33 @@ def apply_defaults(fields, settings):
         setting = settings.get(key)
         if vacant(key) and setting not in (None, ""):
             fields[key] = Datum(setting, "Подтверждённая настройка лаборатории")
-    if not vacant("valid_date") or value("valid_date_absent").value is True or value("calibration").value is not False:
-        return
     day = iso_date(value("verification_date").value)
+    if expiry_exception and day:
+        exception_fields, basis, _, _ = expiry_exception
+        end = iso_date(exception_fields.get("valid_date"))
+        if end and end >= day and basis.strip():
+            fields["valid_date"] = Datum(end.isoformat(), f"Исключение по документу · {basis}")
+            fields["valid_date_absent"] = Datum(False, fields["valid_date"].source)
+            return (), (f"Особый срок до {end:%d.%m.%Y}. Основание · {basis}",)
     rule = settings.get("expiry_rules", {}).get(value("type_number").value)
-    if not day or not rule:
-        return
+    if not day or not rule or value("calibration").value is not False:
+        return (), ()
     first, last = iso_date(rule["from_date"]), iso_date(rule["until_date"])
     years = rule["years"]
     if not first or day < first or (last and day > last) or value("interval").value != str(years):
-        return
+        return (), ()
     try:
         expiry = day.replace(year=day.year + years) - timedelta(days=1)
     except ValueError:
         # A leap-day anniversary needs the laboratory's explicit date.
-        return
+        return ("Для этой даты нельзя однозначно определить годовщину. Укажите срок по документу.",), ()
+    if workbook_date and workbook_date != expiry.isoformat():
+        return (f"Дата окончания в Excel расходится с расчётом ({expiry:%d.%m.%Y}). "
+                "Исправьте протокол или укажите документ для исключения.",), ()
+    previous = value("valid_date").value
+    had_absence = value("valid_date_absent").value is True
     fields["valid_date"] = Datum(expiry.isoformat(), f"Правило лаборатории · {rule['document']}")
+    fields["valid_date_absent"] = Datum(False, fields["valid_date"].source)
+    if (previous and previous != expiry.isoformat()) or had_absence:
+        return (), (f"Дата окончания пересчитана по подтверждённому МПИ: {expiry:%d.%m.%Y}.",)
+    return (), ()

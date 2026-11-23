@@ -167,7 +167,7 @@ class Storage:
             self._audit(db, "Подтверждение средства поверки", item)
 
     def save_equipment_choice(self, entry: RegistryEntry) -> None:
-        item = asdict(replace(entry, confirmed_at=now()))
+        item = asdict(replace(entry, confirmed_at=now(), automatic=False))
         item.pop("id")
         with self.session() as db:
             for row in db.execute("select id,data from equipment where active=1").fetchall():
@@ -206,10 +206,29 @@ class Storage:
                 ):
                     db.executemany("update equipment set active=0 where id=?", [(i,) for i, _ in group])
             for entry in entries:
-                data = asdict(replace(entry, confirmed_at=changed, choice_ids=ids))
+                data = asdict(replace(entry, confirmed_at=changed, choice_ids=ids, automatic=False))
                 data.pop("id")
                 db.execute("insert into equipment(data) values (?)", (encode(data),))
                 self._audit(db, "Выбор публичной карточки", data)
+
+    def save_registry_checks(self, entries) -> None:
+        with self.session() as db:
+            versions = {}
+            for row in db.execute("select id,data from equipment where active=1"):
+                item = json.loads(row["data"])
+                if item.get("automatic"):
+                    versions[(item["local_id"], item["serial"], item["version_hash"])] = row["id"]
+            for entry in entries:
+                if not entry.automatic or not entry.version_hash:
+                    continue
+                data = asdict(entry)
+                data.pop("id")
+                key = entry.local_id, entry.serial, entry.version_hash
+                if key in versions:
+                    db.execute("update equipment set data=? where id=?", (encode(data), versions[key]))
+                else:
+                    cursor = db.execute("insert into equipment(data) values (?)", (encode(data),))
+                    versions[key] = cursor.lastrowid
 
     def archive_equipment(self, entry: RegistryEntry, reason: str) -> None:
         with self.session() as db:

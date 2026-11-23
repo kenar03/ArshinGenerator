@@ -1,4 +1,3 @@
-from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QPalette
 
 INK = "#172f3e"
@@ -102,7 +101,6 @@ QMenu::item:disabled {{ color: {DISABLED_INK}; }}
 
 def apply_theme(app):
     app.setStyle("Fusion")
-    app.setAttribute(Qt.ApplicationAttribute.AA_DontUseNativeDialogs)
     palette = QPalette()
     role = QPalette.ColorRole
     for key, color in {

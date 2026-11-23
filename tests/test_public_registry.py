@@ -206,13 +206,17 @@ class RegistryLookupTests(unittest.TestCase):
         self.assertEqual(good.state, "found")
         self.assertIn(("vri", {"mit_number": "32777-06", "mi_number": "003342",
                                "verification_date_end": "2026-11-23"}), client.requests)
-        saved = good.candidates[0].entry
+        observed = good.candidates[0].entry
+        saved = replace(observed, automatic=False)
         negative = {**row, "vri_id": "1-222", "verification_date": "21.11.2026", "applicability": False}
         conflict = lookup_equipment(item, DAY, FixtureClient(verifications=[row, negative]))
         self.assertEqual(conflict.state, "conflict")
         self.assertIsNone(resolve(item, [saved], DAY, conflict)[0])
         offline = lookup_equipment(item, DAY, FixtureClient(unavailable=True))
         self.assertIs(resolve(item, [saved], DAY, offline)[0], saved)
+        self.assertFalse(resolve_many(item, [saved, observed], DAY, offline, require_public=True)[0])
+        self.assertTrue(observed.automatic)
+        self.assertEqual(len(observed.version_hash), 64)
 
     def test_pagination_requires_complete_pages(self):
         class Pages(PublicClient):

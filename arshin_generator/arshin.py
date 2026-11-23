@@ -1,9 +1,10 @@
 from dataclasses import asdict
-from datetime import datetime
 from hashlib import sha256
+import os
 from pathlib import Path
 import re
 import shutil
+from tempfile import TemporaryDirectory
 from uuid import uuid4
 
 from lxml import etree
@@ -198,39 +199,78 @@ def verify_disk_content(payload, items, schema):
         raise ValueError("Содержимое XML не совпадает с предварительным просмотром.")
 
 
-def export(results, schema, destination: Path, storage, excluded, confirmer):
-    packets = format_packets(results, schema)
-    token = uuid4().hex[:12]
-    stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    final = destination / f"Аршин_{stamp}_{token}"
-    stage = destination / f".arshin-{token}.tmp"
-    stage.mkdir()
-    files = []
-    moved = False
-    try:
+def split_paths(directory: Path, stem: str, count: int):
+    base = stem
+    revision = 2
+    while True:
+        paths = [directory / f"{base}_{index:03d}.xml" for index in range(1, count + 1)]
+        if not any(path.exists() for path in paths):
+            return paths
+        base = f"{stem}_{revision}"
+        revision += 1
+
+
+def _file_identity(stat):
+    return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns
+
+
+def export(packets, schema, paths, storage, confirmer, *, overwrite=None):
+    if schema.hash != SCHEMA_HASH or not paths or len(paths) != len(packets):
+        raise ValueError("Пути сохранения не соответствуют проверенному пакету.")
+    if len(set(paths)) != len(paths) or any(path.parent != paths[0].parent for path in paths):
+        raise ValueError("Для файлов пакета нужны разные имена в одной папке.")
+    if any(path.suffix.casefold() != ".xml" for path in paths):
+        raise ValueError("Имя файла должно заканчиваться на .xml.")
+    if overwrite is not None and len(paths) != 1:
+        raise ValueError("Составной пакет сохраняется с новыми именами.")
+
+    directory = paths[0].parent
+    files = [path.name for path in paths]
+    with TemporaryDirectory(prefix=".arshin-", dir=directory) as temporary:
+        stage = Path(temporary)
+        backup = stage / "original.bak"
         audit_items = []
-        for index, (payload, expected) in enumerate(packets, 1):
-            name = f"Аршин_{index:03d}.xml"
-            files.append(name)
-            (stage / name).write_bytes(payload)
-            verify_disk_content((stage / name).read_bytes(), expected, schema)
-            for result, record in expected:
-                audit_items.append((result.identity, sha256(repr(record).encode()).hexdigest(), {
-                    "protocol": result.protocol.number, "reader": result.protocol.reader,
-                    "file": name, "source": str(result.protocol.path), "digest": result.protocol.digest,
-                    "serial": asdict(result.instrument),
-                    "fields": {k: asdict(value) for k, value in result.fields.items()},
-                    "equipment": [asdict(item) for item in result.equipment],
-                }))
-        stage.rename(final)
-        moved = True
-        for name, (_, expected) in zip(files, packets):
-            verify_disk_content((final / name).read_bytes(), expected, schema)
-        storage.record_export(token, final, files, schema.hash, RULES, excluded, confirmer, audit_items)
-        return [final / name for name in files]
-    except Exception:
-        shutil.rmtree(final if moved else stage)
-        raise
+        written = []
+        try:
+            for name, (payload, expected) in zip(files, packets):
+                with (stage / name).open("wb") as stream:
+                    stream.write(payload)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                verify_disk_content((stage / name).read_bytes(), expected, schema)
+                for result, record in expected:
+                    audit_items.append((result.identity, sha256(repr(record).encode()).hexdigest(), {
+                        "protocol": result.protocol.number, "reader": result.protocol.reader,
+                        "file": name, "source": str(result.protocol.path), "digest": result.protocol.digest,
+                        "serial": asdict(result.instrument),
+                        "fields": {key: asdict(value) for key, value in result.fields.items()},
+                        "equipment": [asdict(item) for item in result.equipment],
+                    }))
+            for path in paths:
+                pending = stage / path.name
+                if overwrite is not None:
+                    if _file_identity(path.stat()) != _file_identity(overwrite):
+                        raise OSError("Выбранный файл изменился после подтверждения замены.")
+                    shutil.copy2(path, backup)
+                    if _file_identity(path.stat()) != _file_identity(overwrite):
+                        raise OSError("Выбранный файл изменился после подтверждения замены.")
+                    pending.replace(path)
+                elif os.name == "nt":
+                    pending.rename(path)  # On Windows rename fails if the destination exists.
+                else:
+                    os.link(pending, path)
+                written.append(path)
+            for path, (_, expected) in zip(paths, packets):
+                verify_disk_content(path.read_bytes(), expected, schema)
+            storage.record_export(uuid4().hex[:12], directory, files, schema.hash, RULES, [], confirmer, audit_items)
+        except Exception:
+            for path in reversed(written):
+                if overwrite is not None:
+                    backup.replace(path)
+                else:
+                    path.unlink(missing_ok=True)
+            raise
+    return paths
 
 
 def open_xml(path: Path, schema: Schema):

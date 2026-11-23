@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 from openpyxl import Workbook
 
-from arshin_generator.arshin import NS, SCHEMA_HASH, Schema, export, format_packets, open_xml, signature
+from arshin_generator.arshin import NS, SCHEMA_HASH, Schema, export, format_packets, open_xml, signature, split_paths
 from arshin_generator.confirmations import get_confirmation, legacy_key, with_guards
 from arshin_generator.domain import Datum, RegistryEntry
 from arshin_generator.laboratory import expiry_rule
@@ -279,7 +279,8 @@ class WorkflowTests(unittest.TestCase):
         }, "Синтетический срок для проверки", "Тест")
         results = self.checked(protocol)
         self.assertTrue(all(not result.blockers for result in results))
-        [file] = export(results, self.schema, self.root, self.storage, [], "Тест")
+        [file] = export(format_packets(results, self.schema), self.schema, [self.root / "Контрольный.xml"],
+                        self.storage, "Тест")
         root, issues, _ = open_xml(file, self.schema)
         ns = {"g": NS}
         self.assertFalse(issues)
@@ -366,7 +367,7 @@ class WorkflowTests(unittest.TestCase):
         split = format_packets(results, self.schema, split_limit)
         self.assertEqual([len(items) for _, items in split], [1, 1])
         self.assertTrue(all(len(payload) <= split_limit for payload, _ in split))
-        paths = export(results, self.schema, self.root, self.storage, [], "Тест")
+        paths = export(big_packets, self.schema, [self.root / "Итоговый.xml"], self.storage, "Тест")
         self.assertEqual(len(paths), 1)
         root, issues, _ = open_xml(paths[0], self.schema)
         self.assertFalse(issues)
@@ -479,9 +480,68 @@ class WorkflowTests(unittest.TestCase):
                 raise OSError("disk")
 
         with self.assertRaises(OSError):
-            export(results, self.schema, self.root, NoAudit(), [], "Тест")
+            export(format_packets(results, self.schema), self.schema, [self.root / "Аршин_Тест.xml"], NoAudit(), "Тест")
         self.assertFalse(list(self.root.glob("Аршин_*")))
         self.assertFalse(list(self.root.glob(".arshin*")))
+
+    def test_existing_file_requires_permission_and_is_restored_on_audit_failure(self):
+        protocol = fixture(self.root / "one.xlsx", "ТЕСТ-ЗАМЕНА", "034C6")
+        self.storage.save_equipment(equipment())
+        approve(self.storage, protocol)
+        packets = format_packets(self.checked(protocol), self.schema)
+        path = self.root / "Выбранный файл.xml"
+        path.write_bytes(b"previous contents")
+        with self.assertRaises(FileExistsError):
+            export(packets, self.schema, [path], self.storage, "Тест")
+        self.assertEqual(path.read_bytes(), b"previous contents")
+        with patch.object(self.storage, "record_export", side_effect=sqlite3.OperationalError("disk")):
+            with self.assertRaises(sqlite3.OperationalError):
+                export(packets, self.schema, [path], self.storage, "Тест", overwrite=path.stat())
+        self.assertEqual(path.read_bytes(), b"previous contents")
+        self.assertFalse(list(self.root.glob(".arshin*")))
+        export(packets, self.schema, [path], self.storage, "Тест", overwrite=path.stat())
+        self.assertFalse(open_xml(path, self.schema)[1])
+
+    def test_split_collision_rolls_back_parts_already_written(self):
+        first = fixture(self.root / "first.xlsx", "ТЕСТ-1", "034C6")
+        second = fixture(self.root / "second.xlsx", "ТЕСТ-2", "035C6")
+        self.storage.save_equipment(equipment())
+        approve(self.storage, first)
+        approve(self.storage, second, sticker="01234567891")
+        results = self.checked(first, second)
+        packets = format_packets(results, self.schema, max(len(format_packets([r], self.schema)[0][0]) for r in results))
+        paths = split_paths(self.root, "Аршин", len(packets))
+        paths[1].write_bytes(b"new external file")
+        with self.assertRaises(FileExistsError):
+            export(packets, self.schema, paths, self.storage, "Тест")
+        self.assertFalse(paths[0].exists())
+        self.assertEqual(paths[1].read_bytes(), b"new external file")
+        self.assertEqual(self.storage.history(), [])
+        self.assertTrue(all(not path.exists() for path in split_paths(self.root, "Аршин", len(packets))))
+
+    def test_confirmed_interval_corrects_saved_date_but_documents_can_define_exception(self):
+        protocol = fixture(self.root / "expiry.xlsx", "ТЕСТ-СРОК", "001B6", interval=4)
+        protocol.fields["verification_date"] = Datum("2026-11-23", "Таблицы!B24")
+        approve(self.storage, protocol)
+        rule = expiry_rule({"type_number": "56560-14", "from_date": "2026-01-01",
+                            "until_date": "", "years": "4", "document": "Тест, пункт 1"})
+        settings = {"expiry_rules": {"56560-14": rule}}
+
+        def result():
+            return check([protocol], self.storage.confirmations(), [], laboratory=settings,
+                         check_registry=False, require_public=True)[0]
+
+        checked = result()
+        self.assertEqual(checked.value("valid_date"), "2030-11-22")
+        self.assertIn("пересчитана", " ".join(checked.warnings))
+        protocol.fields["valid_date"] = Datum("2030-11-23", "Сведения!B4")
+        self.assertIn("Дата окончания в Excel расходится", " ".join(result().blockers))
+        self.storage.save_confirmation("expiry_exception", protocol_key(protocol),
+            with_guards(protocol, {"valid_date": "2030-11-23"}), "Документ об исключении, пункт 3", "Тест")
+        checked = result()
+        self.assertEqual(checked.value("valid_date"), "2030-11-23")
+        self.assertIn("Документ об исключении", " ".join(checked.warnings))
+        self.assertFalse(checked.blockers)
 
 
 if __name__ == "__main__":

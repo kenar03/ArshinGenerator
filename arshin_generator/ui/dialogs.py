@@ -4,22 +4,18 @@ import json
 import logging
 from pathlib import Path
 import sqlite3
-from urllib.parse import quote
 
 from lxml import etree
-from PySide6.QtCore import QThread, QUrl, Signal
-from PySide6.QtGui import QDesktopServices, QFontDatabase, QTextCursor
+from PySide6.QtCore import Signal
+from PySide6.QtGui import QFontDatabase, QTextCursor
 from PySide6.QtWidgets import (
     QAbstractItemView, QComboBox, QDialog, QFileDialog, QHBoxLayout, QLineEdit, QPlainTextEdit, QTabWidget,
     QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
 from ..arshin import NS, open_xml
-from ..domain import RegistryEntry
-from ..public_registry import PUBLIC_CARD, find_public_verifications
-from ..registry import CATEGORIES, iso_date, lookup_key, registry_issues, resolve_many
-from ..storage import PORTAL_STATES
-from .common import Form, button, confirmation_values, fit_window, label, message, selected, table
+from ..registry import CATEGORIES, iso_date, lookup_key, resolve_many
+from .common import button, fit_window, label, message, selected, table
 
 TAGS = {
     "application": "Пакет поверок", "result": "Результат поверки", "miInfo": "Сведения о СИ",
@@ -210,7 +206,9 @@ class EquipmentReviewPanel(QWidget):
         box.setContentsMargins(0, 0, 0, 0)
         self.summary = label("")
         box.addWidget(self.summary)
-        self.items, self.item_model = table(("Средство поверки", "Заводской №", "Состояние"), (300, 105))
+        self.items, self.item_model = table(
+            ("Средство поверки", "Заводской №", "Номер ФИФ ОЕИ", "Состояние"), (265, 100, 235)
+        )
         height = self.items.horizontalHeader().sizeHint().height()
         rows = min(max(len(protocol.equipment), 1), 9)
         self.items.setFixedHeight(height + rows * self.items.verticalHeader().defaultSectionSize() + 6)
@@ -225,7 +223,7 @@ class EquipmentReviewPanel(QWidget):
         self.candidates.horizontalHeader().setStretchLastSection(True)
         box.addWidget(self.candidates, 2)
         actions = QHBoxLayout()
-        self.select_btn = button("Подтвердить", self.choose, primary=True)
+        self.select_btn = button("Выбрать запись", self.choose, primary=True)
         actions.addWidget(self.select_btn)
         self.retry_btn = button("Повторить поиск", self.retry.emit)
         actions.addWidget(self.retry_btn)
@@ -244,11 +242,10 @@ class EquipmentReviewPanel(QWidget):
         self.assessments = {}
         for item in self.protocol.equipment:
             live = self.lookup(item)
-            resolved, issue = resolve_many(item, entries, self.day, live)
+            resolved, issue = resolve_many(item, entries, self.day, live, require_public=True)
             self.assessments[item] = bool(resolved), issue
-            state = ("Проверено" if live and live.state in {"found", "choice"} else
-                     "Подтверждено по справочнику") if resolved else issue
-            rows.append((item, (item.name or item.description, item.serial, state)))
+            numbers = ", ".join(entry.identifier or entry.type_number for entry in resolved)
+            rows.append((item, (item.name or item.description, item.serial, numbers, "Проверено" if resolved else issue)))
         self.pending = [item for item, (ready, _) in self.assessments.items() if not ready]
         self.checked = sum(self.assessments[item][0] for item, _ in rows)
         self.summary.setText(f"Средства поверки · проверено {self.checked} из {len(rows)} · "
@@ -279,12 +276,13 @@ class EquipmentReviewPanel(QWidget):
                 note += f" {candidates[0].status}."
         self.note.setText(note if item else "В протоколе нужно указать средства поверки.")
         self.note.setVisible(bool(self.note.text()))
+        eligible = [candidate for candidate in candidates if candidate.eligible]
         self.candidate_model.update([
             (c, (c.entry.identifier or c.entry.public_id, c.entry.model, c.entry.registry_serial, c.entry.valid_from,
                  c.entry.valid_until, " · ".join(filter(None, (c.status, c.entry.scheme)))))
-            for c in candidates
+            for c in eligible
         ])
-        self.candidates.setVisible(bool(not resolved and live and live.state in {"found", "choice"} and candidates))
+        self.candidates.setVisible(bool(not resolved and live and live.state in {"found", "choice"} and eligible))
         self.retry_btn.setVisible(bool(not resolved and live and live.state in {"unavailable", "response"}))
         self.refresh_button()
 
@@ -293,7 +291,7 @@ class EquipmentReviewPanel(QWidget):
         item = selected(self.items)
         live = self.lookup(item)
         resolved, _ = self.assessments.get(item, (False, ""))
-        choosing = bool(not resolved and live and live.state in {"found", "choice"})
+        choosing = bool(not resolved and live and live.state in {"found", "choice"} and self.candidate_model.rows)
         self.select_btn.setVisible(choosing)
         self.select_btn.setEnabled(bool(choosing and candidates and all(c.eligible for c in candidates)))
 
@@ -305,249 +303,15 @@ class EquipmentReviewPanel(QWidget):
         candidates = self.selected_candidates()
         if not candidates or not all(candidate.eligible for candidate in candidates):
             return
-        self.storage.save_equipment_choices([
-            replace(c.entry, evidence="Подтверждено выбором публичной карточки", confirmer=getuser())
-            for c in candidates
-        ])
-        self.changed.emit()
-
-
-class RegistryDialog(QDialog):
-    def __init__(self, parent, storage, items=()):
-        super().__init__(parent)
-        self.setWindowTitle("Справочник средств поверки")
-        self.resize(1080, 630)
-        self.storage = storage
-        self.items = items
-        box = QVBoxLayout(self)
-        box.setContentsMargins(18, 16, 18, 16)
-        box.addWidget(label("Справочник средств поверки", "heading"))
-        box.addWidget(label("Локальная база подтверждений. Автоматические результаты доступны в карточке протокола. "
-                            "Сверьте конкретную единицу и даты поверки в официальной карточке."))
-        row = QHBoxLayout()
-        self.search = QLineEdit()
-        self.search.setPlaceholderText("Найти по названию, номеру или описанию")
-        row.addWidget(self.search, 1)
-        row.addWidget(button("Открыть ФИФ ОЕИ", self.portal))
-        row.addWidget(button("Поиск опубликованных поверок", self.public_search))
-        box.addLayout(row)
-        self.tabs = QTabWidget()
-        self.known, self.known_model = table(
-            ("Название", "Заводской №", "Категория", "Идентификатор / тип", "Действует до", "Основание"),
-            (210, 105, 235, 155, 110)
-        )
-        self.tabs.addTab(self.known, "Подтверждённые")
-        self.candidates, self.candidate_model = table(
-            ("Из протокола", "№ в книге", "Заводской №", "Источник / срок по Excel"), (410, 155, 105)
-        )
-        self.tabs.addTab(self.candidates, "Из выбранного протокола")
-        box.addWidget(self.tabs, 1)
-        buttons = QHBoxLayout()
-        self.add = button("Подтвердить средство", self.create, primary=True)
-        self.edit = button("Изменить подтверждение", self.modify)
-        self.archive = button("Отозвать", self.withdraw)
-        buttons.addWidget(self.add)
-        buttons.addWidget(self.edit)
-        buttons.addWidget(self.archive)
-        buttons.addStretch()
-        buttons.addWidget(button("Закрыть", self.accept))
-        box.addLayout(buttons)
-        self.tabs.currentChanged.connect(self.refresh_controls)
-        self.known.selectionModel().currentChanged.connect(self.refresh_controls)
-        self.candidates.selectionModel().currentChanged.connect(self.refresh_controls)
-        self.known.doubleClicked.connect(self.modify)
-        self.candidates.doubleClicked.connect(self.create)
-        self.search.textChanged.connect(self.refresh)
-        self.tabs.setCurrentIndex(1 if self.items else 0)
-        self.refresh()
-
-    @staticmethod
-    def portal():
-        QDesktopServices.openUrl(QUrl("https://fgis.gost.ru/fundmetrology/cm/"))
-
-    def public_search(self):
-        PublicSearchDialog(self).exec()
-
-    def refresh(self):
-        term = self.search.text().strip().casefold()
-        self.known_model.update([
-            (e, (e.name, e.serial, CATEGORIES[e.category], e.identifier or e.type_number, e.valid_until, e.evidence))
-            for e in self.storage.entries()
-            if term in " ".join((e.name, e.serial, e.identifier, e.type_number, e.description)).casefold()
-        ])
-        self.candidate_model.update([
-            (e, (e.description, e.source_id, e.serial, " · ".join(filter(None, (e.source, e.valid_hint)))))
-            for e in self.items
-            if term in " ".join((e.description, e.serial, e.source_id)).casefold()
-        ])
-        if self.known_model.rows:
-            self.known.selectRow(0)
-        if self.candidate_model.rows:
-            self.candidates.selectRow(0)
-        self.refresh_controls()
-
-    def refresh_controls(self, *_):
-        known = self.tabs.currentIndex() == 0
-        self.edit.setEnabled(known and selected(self.known) is not None)
-        self.archive.setEnabled(self.edit.isEnabled())
-        self.add.setEnabled(known or selected(self.candidates) is not None)
-        self.add.setText("Новое подтверждение" if known else "Подтвердить средство из протокола")
-
-    def create(self, *_):
-        item = selected(self.candidates) if self.tabs.currentIndex() == 1 else None
-        self.editor(item=item)
-
-    def modify(self, *_):
-        existing = selected(self.known)
-        if existing:
-            self.editor(existing=existing)
-
-    def editor(self, item=None, existing=None):
-        form = Form(self, "Подтверждение средства поверки",
-                    "Введите реквизиты конкретной карточки и срок по документу. "
-                    "Для обычного СИ номер типа и номер единицы сверяются посимвольно.")
-        values = (
-            ("description", "Строка из протокола", "text"),
-            ("local_id", "Номер из протокола / оборудования", "text"),
-            ("serial", "Номер единицы в протоколе", "text"),
-            ("name", "Название и модель", "text"),
-            ("category", "Категория в ФИФ ОЕИ", "text"),
-            ("identifier", "Номер конкретной записи эталона", "text"),
-            ("type_number", "Регномер типа обычного СИ", "text"),
-            ("registry_serial", "Номер или обозначение обычного СИ", "text"),
-            ("identity_kind", "Вид номера обычного СИ", "text"),
-            ("valid_from", "Дата поверки оборудования", "date"),
-            ("valid_until", "Поверка оборудования действительна до", "date"),
-        )
-        starting = {
-            "description": item.description, "local_id": item.source_id, "serial": item.serial, "name": item.name
-        } if item else {}
-        for key, title, kind in values:
-            choices = None
-            if key == "category":
-                choices = [("Выберите категорию", ""), *((v, k) for k, v in CATEGORIES.items())]
-            if key == "identity_kind":
-                choices = [("Заводской номер", "manufactureNum"), ("Обозначение", "inventoryNum")]
-            if key == "type_number" and item and item.source_id and "." not in item.source_id:
-                starting[key] = item.source_id
-                starting["registry_serial"] = item.serial
-            form.field(key, title, kind, getattr(existing, key) if existing else starting.get(key), choices,
-                       readonly=bool(item and key in ("description", "local_id", "serial") and starting.get(key)))
-        form.confirmation(existing.confirmer if existing else self.storage.setting("confirmer"),
-                          existing.evidence if existing else "")
-
-        def entry_from(data):
-            evidence, confirmer = confirmation_values(form, data)
-            entry = RegistryEntry(**data, evidence=evidence, confirmer=confirmer, id=existing.id if existing else 0)
-            errors = registry_issues(entry)
-            if errors:
-                raise ValueError("\n".join(errors))
-            return entry
-
-        form.validate = entry_from
-        if form.exec():
-            entry = entry_from(form.values())
-            self.storage.save_equipment(entry)
-            self.storage.set_setting("confirmer", entry.confirmer)
-            self.refresh()
-
-    def withdraw(self):
-        item = selected(self.known)
-        if not item:
-            return
-        form = Form(self, "Отзыв подтверждения", item.description, size=(550, 310), save="Отозвать")
-        form.confirmation(self.storage.setting("confirmer"))
-        form.validate = lambda data: confirmation_values(form, data)
-        if form.exec():
-            evidence, confirmer = confirmation_values(form, form.values())
-            self.storage.archive_equipment(item, f"{confirmer}: {evidence}")
-            self.refresh()
-
-
-class RegistryLookup(QThread):
-    found = Signal(object)
-    failed = Signal(str)
-
-    def __init__(self, number, serial, parent):
-        super().__init__(parent)
-        self.number = number
-        self.serial = serial
-
-    def run(self):
         try:
-            self.found.emit(find_public_verifications(self.number, self.serial))
-        except ValueError as exc:
-            self.failed.emit(str(exc))
-
-
-class PublicSearchDialog(QDialog):
-    def __init__(self, parent):
-        super().__init__(parent)
-        self.setWindowTitle("Опубликованные поверки ФИФ ОЕИ")
-        self.resize(990, 530)
-        self.worker = None
-        layout = QVBoxLayout(self)
-        layout.addWidget(label("Опубликованные поверки ФИФ ОЕИ", "heading"))
-        layout.addWidget(label("Введите номер типа и заводской номер средства. Поиск передаёт эти два поля "
-                               "в публичный реестр. Для «СИ в качестве эталона» сверьте № конкретной записи "
-                               "по перечню в личном кабинете."))
-        row = QHBoxLayout()
-        self.kind = QLineEdit()
-        self.kind.setPlaceholderText("Регистрационный № типа")
-        self.number = QLineEdit()
-        self.number.setPlaceholderText("Точный заводской номер")
-        self.search = button("Найти в ФИФ ОЕИ", self.lookup, primary=True)
-        for control in (self.kind, self.number, self.search):
-            row.addWidget(control)
-        layout.addLayout(row)
-        self.notice = label("")
-        layout.addWidget(self.notice)
-        self.table, self.model = table(("Наименование", "Заводской №", "Дата поверки",
-                                       "Действительна до", "Результат", "№ документа"),
-                                      (250, 110, 125, 125, 105))
-        layout.addWidget(self.table, 1)
-        actions = QHBoxLayout()
-        actions.addStretch()
-        actions.addWidget(button("Открыть выбранную карточку", self.open))
-        actions.addWidget(button("Закрыть", self.reject))
-        layout.addLayout(actions)
-        self.table.doubleClicked.connect(self.open)
-
-    def lookup(self):
-        if self.worker:
+            self.storage.save_equipment_choices([
+                replace(c.entry, evidence=f"{c.entry.evidence} · Выбрано по протоколу", confirmer=getuser())
+                for c in candidates
+            ])
+        except (ValueError, sqlite3.Error) as exc:
+            self.note.setText(str(exc) if isinstance(exc, ValueError) else "Не удалось сохранить выбор.")
             return
-        self.model.update([])
-        self.notice.setText("Поиск опубликованных сведений…")
-        self.search.setEnabled(False)
-        self.worker = RegistryLookup(self.kind.text().strip(), self.number.text().strip(), self)
-        self.worker.found.connect(self.show_results)
-        self.worker.failed.connect(self.notice.setText)
-        self.worker.finished.connect(self.finished_search)
-        self.worker.start()
-
-    def finished_search(self):
-        self.worker.deleteLater()
-        self.worker = None
-        self.search.setEnabled(True)
-
-    def reject(self):
-        if self.worker:
-            self.notice.setText("Дождитесь окончания запроса.")
-        else:
-            super().reject()
-
-    def show_results(self, records):
-        self.model.update([(record, (record.title, record.serial, record.verification_date,
-                                    record.valid_date, record.outcome, record.document)) for record in records])
-        self.notice.setText(f"Точных совпадений в ответе: {len(records)}. "
-                            "Для экспорта требуется отдельное подтверждение соответствия.")
-        if records:
-            self.table.selectRow(0)
-
-    def open(self, *_):
-        record = selected(self.table)
-        if record:
-            QDesktopServices.openUrl(QUrl(PUBLIC_CARD + quote(record.record_id, safe="")))
+        self.changed.emit()
 
 
 class HistoryDialog(QDialog):
@@ -585,21 +349,6 @@ class HistoryDialog(QDialog):
         if row:
             paths = [Path(row["directory"]) / name for name in json.loads(row["files"])]
             XmlDialog(self, paths, self.schema, self.storage.export_context(row["id"])).exec()
-
-    def status(self):
-        row = selected(self.table)
-        if not row:
-            return
-        form = Form(self, "Статус по личному кабинету",
-                    "Зафиксируйте фактический статус пакета и ссылку или номер заявки.", size=(560, 330))
-        form.field("status", "Статус", value=row["status"], choices=[(x, x) for x in PORTAL_STATES])
-        form.confirmation(self.storage.setting("confirmer"))
-        form.validate = lambda data: confirmation_values(form, data)
-        if form.exec():
-            data = form.values()
-            evidence, confirmer = confirmation_values(form, data)
-            self.storage.change_status(row["id"], data["status"], evidence, confirmer)
-            self.refresh()
 
     def backup(self):
         path, _ = QFileDialog.getSaveFileName(self, "Сохранить резервную копию", "arshin-backup.sqlite3",

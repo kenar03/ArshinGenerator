@@ -5,7 +5,7 @@
   #error OutputPath must point to the release directory
 #endif
 #ifndef AppVersion
-  #define AppVersion "1.4.1"
+  #define AppVersion "1.5.1"
 #endif
 
 [Setup]

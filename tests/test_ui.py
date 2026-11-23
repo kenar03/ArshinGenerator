@@ -1,3 +1,4 @@
+import json
 import os
 from datetime import date
 from pathlib import Path
@@ -8,18 +9,18 @@ from unittest.mock import patch
 from PySide6.QtCore import QEventLoop, QItemSelectionModel, QTimer, Qt
 from PySide6.QtGui import QColor, QPalette
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QComboBox, QDialog, QLabel, QLineEdit, QTableView, QTreeWidget
+from PySide6.QtWidgets import QApplication, QComboBox, QDialog, QFileDialog, QLabel, QLineEdit, QTableView, QTreeWidget
 
-from arshin_generator.arshin import NS, SCHEMA_HASH, Schema, open_xml, result_element, signature
+from arshin_generator.arshin import NS, SCHEMA_HASH, Schema, format_packets, open_xml, result_element, signature
 from arshin_generator.confirmations import protocol_key
 from arshin_generator.domain import RegistryEntry
 from arshin_generator.readers import read_protocol
 from arshin_generator.storage import Storage
-from arshin_generator.registry import EquipmentLookup, lookup_equipment, lookup_key, resolve_many
+from arshin_generator.registry import EquipmentCandidate, EquipmentLookup, lookup_equipment, lookup_key, resolve_many
 from arshin_generator.ui.dialogs import EquipmentReviewPanel, XmlDialog
 from arshin_generator.ui.main import MainWindow
 from arshin_generator.ui.style import apply_theme
-from arshin_generator.ui.workflow import PreviewDialog, RepairDialog, correction_rows
+from arshin_generator.ui.protocols import ProtocolDialog
 from tests.test_workflow import SAMPLE, SAMPLE_METHOD, approve, equipment, fixture
 from tests.test_public_registry import FixtureClient, etalon, mieta
 
@@ -64,191 +65,232 @@ class InterfaceTests(unittest.TestCase):
                     self.assertGreaterEqual(contrast(palette.color(state, role.HighlightedText),
                                                      palette.color(state, role.Highlight)), 4.5)
 
-    def test_import_preview_search_and_xml_viewer(self):
-        with TemporaryDirectory() as directory:
-            path = Path(directory)
-            storage = Storage(path / "ui.sqlite3")
-            schema = Schema()
-            main = MainWindow(storage, schema, online=False)
-            main.show()
-            main.import_paths([SAMPLE])
-            if main.thread:
-                loop = QEventLoop()
-                main.thread.finished.connect(loop.quit)
-                QTimer.singleShot(5000, loop.quit)
-                loop.exec()
-            self.assertIsNone(main.thread)
-            self.assertEqual(main.source_model.rowCount(), 1)
-            self.assertEqual(len(main.results), 25)
-            self.assertTrue(all(result.value("outcome") == "pass" for result in main.results))
-            self.assertFalse(main.export_btn.isEnabled())
-            action = main.source.indexWidget(main.source_model.index(0, 3))
-            self.assertEqual(action.text(), "Исправить")
-            with patch.object(RepairDialog, "exec", return_value=0) as opened:
-                QTest.mouseClick(action, Qt.MouseButton.LeftButton)
-                opened.assert_called_once()
-            protocol = main.protocols[0]
-            main.lookups = {
-                lookup_key(item, protocol.fields["verification_date"].value):
-                EquipmentLookup("unavailable", "Не удалось подключиться к реестру. Повторите проверку")
-                for item in protocol.equipment
-            }
-            main.recheck()
-            self.assertEqual(main.source_model.rows[0][1][2], "Нет связи с реестром")
-            repair = RepairDialog(main, protocol)
-            equipment_panel = repair.equipment_panel
-            self.assertEqual(equipment_panel.item_model.rowCount(), 7)
-            self.assertNotIn("не найдено", " ".join(row[1][-1] for row in equipment_panel.item_model.rows))
-            self.assertFalse({"modification", "sign_pass", "sign_mi"} & repair.party_editor.controls.keys())
-            repair.toggle_sign_exceptions(True)
-            repair.party_editor.controls["valid_date"].setText("14.01.2027")
-            repair.item_editor.set_value("sign_pass", False)
-            repair.save()
-            self.assertIs(main.results[0].value("sign_pass"), False)
-            self.assertTrue(all(result.value("sign_pass") is True for result in main.results[1:]))
-            self.assertTrue(all(result.value("valid_date") == "2027-01-14" for result in main.results))
-            repair.close()
-            preview = PreviewDialog(main, main.results)
-            self.assertEqual(preview.model.rowCount(), 25)
-            self.assertEqual(preview.model.headers, ("Заводской номер", "Модификация", "Дата поверки", "Результат"))
-            self.assertTrue(preview.card_btn.isEnabled())
-            with patch("arshin_generator.ui.workflow.QDialog.exec", return_value=0) as opened:
-                preview.open_card()
-                opened.assert_called_once()
-            preview.close()
-            storage.save_confirmations(correction_rows(storage.confirmations(), protocol,
-                                                       {"sign_pass": True, "sign_mi": False}))
-            main.recheck()
-            self.assertFalse(main.results[0].value("sign_pass"))
-            self.assertTrue(all(result.value("sign_mi") is False for result in main.results))
-            p = fixture(path / "ui-test.xlsx", "ТЕСТ-ИНТЕРФЕЙС", "001B6")
-            storage.save_equipment(equipment())
-            approve(storage, p)
-            main.protocols = [p]
-            main.lookups.clear()
-            main.recheck()
-            self.assertTrue(main.export_btn.isEnabled())
-            self.assertEqual(main.source_model.rows[0][1][2], "Готов к выгрузке")
-            storage.set_setting("output_folder", str(path))
-            with patch("arshin_generator.ui.main.QFileDialog.getExistingDirectory") as dialog, \
-                    patch.object(main, "show_saved") as saved:
-                QTest.mouseClick(main.export_btn, Qt.MouseButton.LeftButton)
-                saved.assert_called_once()
-                dialog.assert_not_called()
-            files, records = saved.call_args.args
-            self.assertEqual(len(records), 1)
-            self.assertTrue(files[0].is_file())
-            context = storage.export_context(storage.history()[0]["id"])
-            xml = XmlDialog(main, files, schema, context)
-            xml.search.setText("ТЕСТ-ИНТЕРФЕЙС")
-            self.assertEqual(xml.model.rowCount(), 1)
-            self.assertIn("соответствует", xml.status.text())
-            self.assertIn("001B6", xml.raw.toPlainText())
-            self.assertIn("01234567890", xml.raw.toPlainText())
-            self.assertIn("Тестова А.В.", xml.raw.toPlainText())
-            self.assertFalse(xml.tabs.isTabVisible(1))
-            xml.toggle_technical(True)
-            self.assertTrue(xml.tabs.isTabVisible(1))
-            xml.close()
-            main.close()
 
-    def test_main_export_from_the_loaded_protocol_without_stickers(self):
-        with TemporaryDirectory() as directory:
-            path = Path(directory)
-            storage = Storage(path / "ui.sqlite3")
-            protocol = read_protocol(SAMPLE)
-            for item in protocol.equipment:
-                storage.save_equipment(RegistryEntry(
+    def window(self, folder, *, online=False):
+        main = MainWindow(Storage(folder / "ui.sqlite3"), Schema(), online=online)
+        self.addCleanup(main.close)
+        return main
+
+    def wait_for_import(self, main):
+        if main.thread:
+            loop = QEventLoop()
+            main.thread.finished.connect(loop.quit)
+            QTimer.singleShot(5000, loop.quit)
+            loop.exec()
+        self.assertIsNone(main.thread)
+
+    def verify_protocols(self, main):
+        main.type_titles = {"56560-14": "Термопреобразователи сопротивления"}
+        main.lookups = {
+            lookup_key(item, p.fields["verification_date"].value): EquipmentLookup("found", "", (
+                EquipmentCandidate(RegistryEntry(
                     item.description, item.source_id, item.serial, item.name, item.category, item.registration,
-                    item.type_number, item.serial, "manufactureNum", "2026-01-01", "2027-01-01",
-                    "Подтверждённая карточка для теста", "Тест",
-                ))
-            storage.save_confirmation("protocol", protocol_key(protocol), {
+                    item.type_number, item.serial, "manufactureNum", "2025-01-01", "2027-01-14",
+                    "Ответ реестра для теста", "Публичный ФИФ ОЕИ", public_id=f"карточка-{item.serial}",
+                    automatic=True, version_hash=f"версия-{item.serial}",
+                ), "", True),
+            ))
+            for p in main.protocols for item in p.equipment
+        }
+        main.recheck()
+
+    def test_control_protocol_export_and_repeat_warning(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory)
+            main = self.window(path)
+            file = path / "Мой XML.xml"
+            main.import_paths([SAMPLE])
+            self.wait_for_import(main)
+            [protocol] = main.protocols
+            main.storage.save_confirmation("protocol", protocol_key(protocol), {
                 "verification_type": "2", "sign_cipher": "ТСТ", "calibration": False, "valid_date": "2027-01-14",
-            }, "Проверка сохранённых реквизитов", "Тест")
-            storage.set_setting("output_folder", str(path))
-            main = MainWindow(storage, Schema(), online=False)
-            main.protocols = [protocol]
-            main.type_titles = {"56560-14": "Термопреобразователи сопротивления"}
-            main.recheck()
-            self.assertTrue(all(not r.blockers for r in main.results))
+            }, "Сохранившиеся реквизиты", "Тест")
+            self.assertEqual(main.source_model.headers, ("Протокол", "Приборов", "Состояние"))
+            self.verify_protocols(main)
             self.assertTrue(main.export_btn.isEnabled())
-            preview = PreviewDialog(main, main.results, type_titles=main.type_titles)
-            self.assertIn("56560-14 · Термопреобразователи сопротивления", preview.type_label.text())
-            self.assertEqual(preview.model.rowCount(), 25)
+            overview = ProtocolDialog(main, protocol)
+            self.assertEqual(overview.equipment_panel.checked, 7)
+            self.assertIsNone(overview.editor)
+            texts = "\n".join(label.text() for label in overview.findChildren(QLabel))
+            self.assertIn("56560-14 · Термопреобразователи сопротивления", texts)
+            self.assertIn(SAMPLE_METHOD, texts)
+            overview.close()
 
-            def inspect_card(card):
-                texts = [label.text() for label in card.findChildren(QLabel)]
-                self.assertIn(f"Методика поверки · {SAMPLE_METHOD}", texts)
-                self.assertIn(preview.type_label.text(), texts)
-                return 0
-
-            with patch.object(QDialog, "exec", new=inspect_card):
-                preview.open_card()
-            preview.close()
-
-            with (
-                patch.object(main, "show_saved") as saved,
-                patch.object(main, "confirm_export_scope") as confirm,
-            ):
+            with patch.object(main, "choose_xml_path", return_value=file) as dialog, \
+                    patch("arshin_generator.ui.main.message") as prompt:
                 main.export_btn.click()
-                saved.assert_called_once()
-                confirm.assert_not_called()
-            files, records = saved.call_args.args
-            [file] = files
-            self.assertEqual(file.name, "Аршин_001.xml")
+                self.assertEqual(dialog.call_args.args[0].name, "Аршин_П-Т1-з2-1260-26.xml")
+                prompt.assert_not_called()
+            self.assertEqual(main.notice.text(), "XML сохранён: 25 записей")
             root, issues, _ = open_xml(file, main.schema)
             self.assertFalse(issues)
-            self.assertIsNone(root.getprevious())
-            self.assertEqual([signature(r) for r in root], [signature(result_element(r)) for r in records])
+            self.assertEqual([signature(r) for r in root], [signature(result_element(r)) for r in main.results])
             self.assertFalse(root.findall(f".//{{{NS}}}stickerNum"))
-            self.assertFalse(root.findall(f".//{{{NS}}}crtmitypeTitle"))
-            self.assertFalse(root.findall(f".//{{{NS}}}milmitypeTitle"))
-            self.assertEqual([r.text for r in root.findall(f".//{{{NS}}}mitypeNumber")], ["56560-14"] * 25)
-            self.assertEqual([r.text for r in root.findall(f".//{{{NS}}}docTitle")], [SAMPLE_METHOD] * 25)
-            self.assertEqual([r.instrument.serial for r in records], [f"{i:03d}W6" for i in range(9, 34)])
-            for record in records:
+            self.assertEqual([r.instrument.serial for r in main.results], [f"{i:03d}W6" for i in range(9, 34)])
+            for record in main.results:
                 self.assertEqual(len(record.equipment), 7)
                 self.assertIs(record.value("sign_pass"), True)
                 self.assertIs(record.value("sign_mi"), False)
                 self.assertEqual(record.value("valid_date"), "2027-01-14")
-            [history] = storage.history()
+            [history] = main.storage.history()
             self.assertEqual(history["schema_hash"], SCHEMA_HASH)
-            self.assertEqual(history["status"], "Сформирован")
-            self.assertEqual(len(storage.seen([r.identity for r in records])), 25)
-            with patch.object(main, "confirm_export_scope", return_value=False) as confirm:
-                main.export_btn.click()
-                self.assertEqual(len(confirm.call_args.args[2]), 25)
-            self.assertEqual(len(storage.history()), 1)
-            viewer = XmlDialog(main, [file], main.schema, storage.export_context(history["id"]))
+            self.assertEqual(history["directory"], str(path))
+            self.assertEqual(json.loads(history["files"]), [file.name])
+            viewer = XmlDialog(main, [file], main.schema, main.storage.export_context(history["id"]))
+            viewer.search.setText("009W6")
+            self.assertEqual(viewer.model.rowCount(), 1)
             self.assertIn("соответствует", viewer.status.text())
-            self.assertIn("import.2020-06-19.xsd", viewer.status.text())
-            self.assertEqual(viewer.model.rowCount(), 25)
             viewer.close()
+            with patch.object(main, "choose_xml_path") as dialog, \
+                    patch("arshin_generator.ui.main.message", return_value=False) as prompt:
+                main.export_btn.click()
+                self.assertIn("25", prompt.call_args.args[2])
+                prompt.assert_called_once()
+                dialog.assert_not_called()
+            self.assertEqual(len(main.storage.history()), 1)
             main.close()
 
-    def test_missing_method_owner_and_measurements_remain_blocking(self):
+    def test_missing_fields_prevent_registry_search_and_corrected_book_replaces_row(self):
         with TemporaryDirectory() as directory:
             path = Path(directory)
-            protocol = fixture(path / "incomplete.xlsx", "НЕПОЛНЫЕ-ДАННЫЕ", "001B6",
-                               complete=False, sticker="", owner="", method="")
-            main = MainWindow(Storage(path / "ui.sqlite3"), Schema(), online=False)
-            main.protocols = [protocol]
-            main.recheck()
+            file = path / "Проверка.xlsx"
+            fixture(file, "ТЕСТ-ПОВТОР", "001B6", complete=False, sticker="", owner="", method="")
+            main = self.window(path, online=True)
+            with patch("arshin_generator.ui.main.RegistryCheckThread") as search:
+                main.import_paths([file])
+                self.wait_for_import(main)
+                search.assert_not_called()
             self.assertFalse(main.export_btn.isEnabled())
             [record] = main.results
-            self.assertTrue(record.equipment_issues)
-            self.assertTrue(any("неполные измерения" in issue for issue in record.measurement_issues))
+            self.assertIn("неполные измерения", " ".join(record.measurement_issues))
             common = " ".join(record.shared_issues)
             self.assertIn("владельца", common)
-            self.assertIn("Методика поверки", common)
-            self.assertIn("«Отчёт»", common)
-            self.assertNotIn("наклейки", " ".join(record.blockers))
-            repair = RepairDialog(main, protocol)
-            self.assertIn("owner", repair.party_editor.controls)
-            self.assertNotIn("sticker", repair.item_editor.controls)
-            repair.close()
+            self.assertIn("Не указана методика поверки", common)
+            self.assertIn("лист «Отчёт», ячейку A33", common)
+            overview = ProtocolDialog(main, main.protocols[0])
+            self.assertFalse({"method", "owner", "modification", "metrologist"} & overview.editor.controls.keys())
+            overview.close()
+
+            updated = fixture(file, "ТЕСТ-ПОВТОР", "001B6", sticker="")
+            self.assertNotEqual(updated.digest, record.protocol.digest)
+            approve(main.storage, updated, sticker="")
+            main.online = False
+            main.import_paths([file])
+            self.wait_for_import(main)
+            self.assertEqual([p.digest for p in main.protocols], [updated.digest])
+            self.assertEqual(len(main.registry_protocols), 1)
+            self.assertFalse(main.export_btn.isEnabled())  # MIT and equipment still need a live response.
             main.close()
+
+    def test_all_or_nothing_and_removal_using_button_and_delete(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory)
+            first = fixture(path / "a.xlsx", "ТЕСТ-1", "001B6", sticker="")
+            second = fixture(path / "b.xlsx", "ТЕСТ-2", "002B6", sticker="", method="")
+            third = fixture(path / "c.xlsx", "ТЕСТ-3", "003B6", sticker="")
+            main = self.window(path)
+            for protocol in (first, second, third):
+                approve(main.storage, protocol, sticker="")
+            main.show()
+            main.import_paths([first.path, second.path, third.path])
+            self.wait_for_import(main)
+            self.verify_protocols(main)
+            self.assertEqual(len(main.protocols), 3)
+            self.assertFalse(main.remove_btn.isEnabled())
+            self.assertEqual(sum(not item.blockers for item in main.results), 2)
+            self.assertFalse(main.export_btn.isEnabled())
+            with patch.object(main, "choose_xml_path") as dialog:
+                main.export_xml()
+                dialog.assert_not_called()
+            main.source.selectRow(1)
+            self.assertTrue(main.remove_btn.isEnabled())
+            self.app.processEvents()
+            main.source.setFocus()
+            QTest.keyClick(main.source, Qt.Key.Key_Delete)
+            self.assertEqual(len(main.protocols), 2)
+            self.assertTrue(main.export_btn.isEnabled())
+            flags = QItemSelectionModel.SelectionFlag
+            for index in range(2):
+                main.source.selectionModel().select(main.source_model.index(index, 0), flags.Select | flags.Rows)
+            main.remove_btn.click()
+            self.assertIn("Протоколов 0", main.summary.text())
+            self.assertFalse(main.remove_btn.isEnabled())
+            self.assertFalse(main.export_btn.isEnabled())
+            self.assertTrue(all(protocol.path.is_file() for protocol in (first, second, third)))
+            main.close()
+
+    def test_offline_and_unknown_mit_block_despite_saved_equipment(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory)
+            p = fixture(path / "one.xlsx", "ТЕСТ-ТИП", "001B6", sticker="")
+            main = self.window(path)
+            approve(main.storage, p, sticker="")
+            main.storage.save_equipment(equipment())
+            main.protocols = [p]
+            self.verify_protocols(main)
+            self.assertTrue(main.can_export)
+            main.type_titles.clear()
+            main.type_issues["56560-14"] = "В реестре не найден точный тип СИ 56560-14."
+            main.recheck()
+            self.assertIn("не найден точный тип СИ", main.source_model.rows[0][1][2])
+            self.assertFalse(main.can_export)
+            item = p.equipment[0]
+            key = lookup_key(item, p.fields["verification_date"].value)
+            main.type_titles["56560-14"] = "Термопреобразователи сопротивления"
+            main.lookups[key] = EquipmentLookup("unavailable", "Не удалось подключиться к реестру")
+            main.recheck()
+            self.assertIn("Не удалось подключиться к реестру", main.source_model.rows[0][1][2])
+            self.assertFalse(main.can_export)
+            dialog = ProtocolDialog(main, p)
+            self.assertEqual(dialog.equipment_panel.checked, 0)
+            self.assertFalse(dialog.equipment_panel.retry_btn.isHidden())
+            dialog.close()
+            main.close()
+
+    def test_native_save_configuration_and_split_path(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory)
+            main = self.window(path)
+            save_as = path / "Выбранное имя.xml"
+
+            def accept(dialog):
+                self.assertEqual(dialog.acceptMode(), QFileDialog.AcceptMode.AcceptSave)
+                self.assertEqual(dialog.fileMode(), QFileDialog.FileMode.AnyFile)
+                self.assertFalse(dialog.testOption(QFileDialog.Option.DontUseNativeDialog))
+                self.assertFalse(dialog.testOption(QFileDialog.Option.DontConfirmOverwrite))
+                self.assertFalse(self.app.testAttribute(Qt.ApplicationAttribute.AA_DontUseNativeDialogs))
+                self.assertEqual(dialog.defaultSuffix(), "xml")
+                return QDialog.DialogCode.Accepted
+
+            with patch.object(QFileDialog, "exec", new=accept), \
+                    patch.object(QFileDialog, "selectFile") as suggested, \
+                    patch.object(QFileDialog, "selectedFiles", return_value=[str(save_as)]):
+                self.assertEqual(main.choose_xml_path(path / "Предложенное.xml"), save_as)
+                suggested.assert_called_once_with("Предложенное.xml")
+
+            for i in range(1, 3):
+                protocol = fixture(path / f"{i}.xlsx", f"ТЕСТ-{i}", f"{i:03d}B6", sticker="")
+                approve(main.storage, protocol, sticker="")
+                main.protocols.append(protocol)
+            self.verify_protocols(main)
+            limit = max(len(format_packets([r], main.schema)[0][0]) for r in main.results)
+            with patch("arshin_generator.ui.main.format_packets", side_effect=lambda r, s: format_packets(r, s, limit)), \
+                    patch.object(main, "choose_xml_path") as dialog, \
+                    patch.object(QFileDialog, "getExistingDirectory", return_value=str(path)) as chooser:
+                main.export_xml()
+                dialog.assert_not_called()
+                chooser.assert_called_once()
+            [entry] = main.storage.history()
+            names = json.loads(entry["files"])
+            stem = f"Аршин_{date.today().isoformat()}"
+            self.assertEqual(names, [f"{stem}_001.xml", f"{stem}_002.xml"])
+            self.assertEqual(entry["directory"], str(path))
+            for name in names:
+                root, issues, _ = open_xml(path / name, main.schema)
+                self.assertEqual(len(root), 1)
+                self.assertFalse(issues)
+            main.close()
+
 
     def test_equipment_candidates_require_an_explicit_selection(self):
         with TemporaryDirectory() as directory:

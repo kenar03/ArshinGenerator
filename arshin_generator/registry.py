@@ -1,5 +1,7 @@
 from dataclasses import dataclass, replace
-from datetime import date
+from datetime import date, datetime
+from hashlib import sha256
+import json
 import re
 import unicodedata
 
@@ -94,7 +96,7 @@ def resolve(item: Equipment, entries: list[RegistryEntry], when: date | None,
             online: EquipmentLookup | None = None) -> tuple[RegistryEntry | None, str]:
     matches = [
         entry for entry in entries
-        if _same_equipment(item, entry) and not registry_issues(entry)
+        if not entry.automatic and _same_equipment(item, entry) and not registry_issues(entry)
     ]
     if online and online.state in {"found", "choice", "conflict", "missing", "expired", "response"}:
         valid = [candidate.entry for candidate in online.candidates if candidate.eligible]
@@ -122,7 +124,9 @@ def resolve(item: Equipment, entries: list[RegistryEntry], when: date | None,
 
 
 def resolve_many(item: Equipment, entries: list[RegistryEntry], when: date | None,
-                 online: EquipmentLookup | None = None) -> tuple[list[RegistryEntry], str]:
+                 online: EquipmentLookup | None = None, *, require_public=False) -> tuple[list[RegistryEntry], str]:
+    if require_public and (not online or online.state not in {"found", "choice"}):
+        return [], online.message if online else "Нужна проверка ФИФ ОЕИ"
     saved = [entry for entry in entries if entry.choice_ids and _same_equipment(item, entry)
              and not registry_issues(entry) and when and iso_date(entry.valid_from) <= when <= iso_date(entry.valid_until)]
     if not saved:
@@ -182,9 +186,12 @@ def _candidate(item: Equipment, category: str, record_id: str, official_id: str,
         proof += f" · {API}vri/{proof_id}"
     if row.get("result_docnum"):
         proof += f" · {row['result_docnum']}"
+    version = sha256(json.dumps([record_id, official_id, number, serial, model, scheme, row],
+                                sort_keys=True, ensure_ascii=False).encode()).hexdigest()
     entry = RegistryEntry(
         item.description, item.source_id, item.serial, item.name, category, official_id, number, serial,
         "manufactureNum", start, end, proof, "Публичный ФИФ ОЕИ", public_id=record_id, scheme=scheme, model=model,
+        confirmed_at=datetime.now().astimezone().isoformat(timespec="seconds"), automatic=True, version_hash=version,
     )
     reason = problem or date_problem or ("В карточке отсутствует связанная поверка" if not proof_id else "")
     return EquipmentCandidate(entry, reason or "Подходит на дату поверки", not reason)
@@ -284,13 +291,17 @@ def _standards(item: Equipment, when: date, client: PublicClient) -> tuple[list[
     return candidates, corrected
 
 
-def lookup_equipment(item: Equipment, when: date, client: PublicClient | None = None) -> EquipmentLookup:
-    if not item.serial or not item.name or not (
+def has_registry_identity(item: Equipment) -> bool:
+    return bool(item.source_id and item.serial and item.name and (
         item.category in {"mis", "mieta"} and
         (TYPE_NUMBER.fullmatch(item.type_number) or
          (item.category == "mieta" and MIETA_NUMBER.fullmatch(item.registration)))
-    ):
-        return EquipmentLookup("manual", "Подтверждение: проверьте структурированные реквизиты или локальный справочник")
+    ))
+
+
+def lookup_equipment(item: Equipment, when: date, client: PublicClient | None = None) -> EquipmentLookup:
+    if not has_registry_identity(item):
+        return EquipmentLookup("manual", "Уточните реквизиты средства поверки в Excel")
     client = client or PublicClient()
     try:
         candidates, corrected = (_standards(item, when, client) if item.category == "mieta"

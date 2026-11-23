@@ -1,24 +1,29 @@
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
+from datetime import date
 from getpass import getuser
 import logging
 from pathlib import Path
+import re
 import sqlite3
 
-from PySide6.QtCore import QStandardPaths, QThread, QUrl, Qt, Signal
+from PySide6.QtCore import QItemSelectionModel, QStandardPaths, QThread, QUrl, Qt, Signal
 from PySide6.QtGui import QDesktopServices, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
-    QDialog, QFileDialog, QFrame, QHBoxLayout, QHeaderView, QMainWindow, QMenu, QToolButton, QVBoxLayout, QWidget,
+    QAbstractItemView, QDialog, QFileDialog, QFrame, QHBoxLayout, QHeaderView, QMainWindow, QMenu, QToolButton,
+    QVBoxLayout, QWidget,
 )
 
-from ..arshin import export
+from ..arshin import export, format_packets, split_paths
+from ..confirmations import get_confirmation, protocol_key, with_guards
 from ..public_registry import PublicDataError, official_type_title
 from ..readers import EXTENSIONS, read_protocol
-from ..registry import EquipmentLookup, iso_date, lookup_equipment, lookup_key, resolve_many
+from ..registry import EquipmentLookup, iso_date, lookup_equipment, lookup_key
 from ..validation import check
-from .common import button, fit_window, label, message, selected, table
-from .dialogs import HistoryDialog, RegistryDialog, XmlDialog
-from .workflow import ConnectionDialog, ExpiryRules, PreviewDialog, RepairDialog, laboratory_settings
+from .common import Form, button, fit_window, label, message, table
+from .dialogs import HistoryDialog, XmlDialog
+from .protocols import ProtocolDialog
+from .workflow import ConnectionDialog, ExpiryRules, laboratory_settings
 
 
 class ImportThread(QThread):
@@ -56,11 +61,12 @@ class RegistryCheckThread(QThread):
 
         def find_title(number):
             if self.isInterruptionRequested():
-                return ""
+                return "", "Поиск типа СИ остановлен. Повторите проверку."
             try:
-                return official_type_title(number)
+                title = official_type_title(number)
             except PublicDataError:
-                return ""
+                return "", f"Не удалось проверить тип СИ {number} в государственном реестре."
+            return title, "" if title else f"В реестре не найден точный тип СИ {number}. Проверьте номер в Excel."
 
         with ThreadPoolExecutor(max_workers=2) as executor:
             types = {number: executor.submit(find_title, number) for number in self.type_numbers}
@@ -69,6 +75,8 @@ class RegistryCheckThread(QThread):
 
 
 class MainWindow(QMainWindow):
+    checked = Signal()
+
     def __init__(self, storage, schema, *, online=True):
         super().__init__()
         self.storage = storage
@@ -80,6 +88,7 @@ class MainWindow(QMainWindow):
         self.lookup_thread = None
         self.lookups = {}
         self.type_titles = {}
+        self.type_issues = {}
         self.setWindowTitle("Аршин · Генератор XML")
         self.setMinimumSize(680, 440)
         fit_window(self, 940, 620)
@@ -97,20 +106,17 @@ class MainWindow(QMainWindow):
         self.summary = label("")
         title.addWidget(self.summary)
         header.addLayout(title, 1)
-        settings = button("Настройки")
-        menu = QMenu(settings)
+        self.settings_btn = button("Настройки")
+        menu = QMenu(self.settings_btn)
         menu.addAction("Реквизиты лаборатории", self.laboratory_settings)
-        menu.addAction("Правила срока поверки", self.expiry_rules)
-        menu.addAction("Папка для XML…", self.pick_output_folder)
-        menu.addSeparator()
-        menu.addAction("Проверить подключение", self.connection)
-        menu.addAction("Справочник средств поверки", self.registry)
-        menu.addAction("История выгрузок", self.history)
-        menu.addAction("Открыть файл XML…", self.pick_xml)
-        menu.addAction("Диагностический журнал", self.open_log)
-        menu.addAction("Папка данных", self.open_data)
-        settings.setMenu(menu)
-        header.addWidget(settings, alignment=Qt.AlignmentFlag.AlignTop)
+        service = menu.addMenu("Служебные инструменты")
+        service.addAction("Правила срока поверки", self.expiry_rules)
+        service.addAction("Исключение по сроку поверки…", self.expiry_exception)
+        service.addAction("История и резервная копия", self.history)
+        service.addAction("Открыть файл XML…", self.pick_xml)
+        service.addAction("Проверить подключение", self.connection)
+        self.settings_btn.setMenu(menu)
+        header.addWidget(self.settings_btn, alignment=Qt.AlignmentFlag.AlignTop)
         layout.addLayout(header)
 
         actions = QHBoxLayout()
@@ -122,6 +128,8 @@ class MainWindow(QMainWindow):
         add.addAction("Выбрать папку…", self.pick_folder)
         self.add_btn.setMenu(add)
         actions.addWidget(self.add_btn)
+        self.remove_btn = button("Удалить выбранные", self.remove_protocols)
+        actions.addWidget(self.remove_btn)
         actions.addStretch()
         self.preview_btn = button("Просмотреть", self.show_results)
         self.export_btn = button("Сформировать XML", self.export_xml, primary=True)
@@ -140,23 +148,23 @@ class MainWindow(QMainWindow):
         empty_layout.addStretch()
         layout.addWidget(self.empty, 1)
 
-        self.source, self.source_model = table(("Протокол", "Приборов", "Состояние", "Действие"), (214, 85, 235))
+        self.source, self.source_model = table(("Протокол", "Приборов", "Состояние"), (214, 85, 235))
+        self.source.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         sizes = self.source.horizontalHeader()
         sizes.setStretchLastSection(False)
         sizes.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         sizes.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
-        self.source.setColumnWidth(3, 118)
         self.source.verticalHeader().setDefaultSectionSize(46)
         layout.addWidget(self.source, 1)
         self.source.doubleClicked.connect(lambda index: self.open_protocol(self.source_model.rows[index.row()][0]))
+        self.source.selectionModel().selectionChanged.connect(self.update_remove_button)
 
         footer = QHBoxLayout()
         self.notice = label("")
         footer.addWidget(self.notice, 1)
-        self.retry_btn = button("Повторить поиск", self.start_registry_checks)
-        footer.addWidget(self.retry_btn)
         layout.addLayout(footer)
         QShortcut(QKeySequence("Ctrl+O"), self, activated=self.pick_files)
+        QShortcut(QKeySequence(Qt.Key.Key_Delete), self, activated=self.remove_protocols)
         self.recheck()
 
     @property
@@ -210,7 +218,7 @@ class MainWindow(QMainWindow):
             return
         self.storage.set_setting("input_folder", str(files[0].parent))
         self.notice.setText("Читаем протоколы…")
-        self.thread = ImportThread(list(dict.fromkeys(files)), self)
+        self.thread = ImportThread(list(dict.fromkeys(path.resolve() for path in files)), self)
         self.thread.imported.connect(self.append_protocols)
         self.thread.finished.connect(self.import_finished)
         self.render()
@@ -237,36 +245,58 @@ class MainWindow(QMainWindow):
         self.thread = None
         self.start_registry_checks()
 
+    def check_inputs(self):
+        self.entries = self.storage.entries()
+        self.confirmations = self.storage.confirmations()
+        self.laboratory = self.storage.laboratory()
+        local = check(self.protocols, self.confirmations, self.entries, laboratory=self.laboratory,
+                      check_registry=False, require_public=True)
+        self.local_group = defaultdict(list)
+        for record in local:
+            self.local_group[id(record.protocol)].append(record)
+        self.registry_protocols = [
+            p for p in self.protocols
+            if (records := self.local_group[id(p)]) and self.complete(p, records)
+        ]
+
+    @staticmethod
+    def complete(protocol, records):
+        return not protocol.error and bool(records) and len(records) == protocol.declared and all(
+            not result.blockers for result in records
+        )
+
     def start_registry_checks(self):
         if self.busy:
             return
+        self.check_inputs()
         requests = {}
         type_numbers = set()
-        for protocol in self.protocols:
-            if protocol.error or not protocol.instruments:
-                continue
-            number = protocol.fields["type_number"].value
-            if isinstance(number, str) and number and number not in self.type_titles:
-                type_numbers.add(number)
+        for protocol in self.registry_protocols:
+            type_numbers.add(protocol.fields["type_number"].value)
             when = iso_date(protocol.fields["verification_date"].value)
-            if when:
-                for item in protocol.equipment:
-                    requests[lookup_key(item, when.isoformat())] = item, when
-        self.lookups = {}
-        if not self.online or not (requests or type_numbers):
+            for item in protocol.equipment:
+                requests[lookup_key(item, when.isoformat())] = item, when
+        if not self.online or not type_numbers:
             self.notice.clear()
             self.recheck()
             return
         self.lookup_thread = RegistryCheckThread(requests, type_numbers, self)
         self.lookup_thread.assessed.connect(self.accept_registry_checks)
         self.lookup_thread.finished.connect(self.registry_checks_finished)
-        self.notice.setText("Проверяем сведения в реестре…")
-        self.recheck()
+        self.notice.setText("Проверяем сведения в государственном реестре…")
+        self.render()
+        self.checked.emit()
         self.lookup_thread.start()
 
     def accept_registry_checks(self, result):
-        self.lookups, titles = result
-        self.type_titles.update({number: title for number, title in titles.items() if title})
+        self.lookups, types = result
+        self.type_titles = {number: title for number, (title, _) in types.items() if title}
+        self.type_issues = {number: issue for number, (_, issue) in types.items() if issue}
+        try:
+            self.storage.save_registry_checks(c.entry for lookup in self.lookups.values()
+                                              if lookup.state == "found" for c in lookup.candidates if c.eligible)
+        except sqlite3.Error:
+            logging.exception("Не удалось сохранить результаты сверки с реестром")
 
     def registry_checks_finished(self):
         self.lookup_thread.deleteLater()
@@ -274,118 +304,160 @@ class MainWindow(QMainWindow):
         self.notice.clear()
         self.recheck()
 
-    def recheck(self):
-        self.entries = self.storage.entries()
-        self.results = check(self.protocols, self.storage.confirmations(), self.entries, self.lookups,
-                             laboratory=self.storage.laboratory())
-        self.group = defaultdict(list)
-        for item in self.results:
-            self.group[id(item.protocol)].append(item)
-        self.render()
+    def refresh_after_edit(self):
+        self.start_registry_checks()
 
-    def has_connection_issue(self, protocol):
-        if protocol.error:
-            return False
-        when = iso_date(protocol.fields["verification_date"].value)
-        if not when:
-            return False
-        for item in protocol.equipment:
-            live = self.lookups.get(lookup_key(item, when.isoformat()))
-            if live and live.state == "unavailable" and not resolve_many(item, self.entries, when, live)[0]:
-                return True
-        return False
+    def recheck(self):
+        self.check_inputs()
+        type_issues = {}
+        for protocol in self.registry_protocols:
+            number = protocol.fields["type_number"].value
+            if number not in self.type_titles:
+                type_issues[number] = self.type_issues.get(number, f"Тип СИ {number} ещё не проверен в реестре.")
+        online = check(self.registry_protocols, self.confirmations, self.entries, self.lookups,
+                       laboratory=self.laboratory, require_public=True, type_issues=type_issues)
+        self.group = self.local_group.copy()
+        for protocol in self.registry_protocols:
+            self.group[id(protocol)] = []
+        for record in online:
+            self.group[id(record.protocol)].append(record)
+        self.results = [record for protocol in self.protocols for record in self.group[id(protocol)]]
+        self.render()
+        self.checked.emit()
+
+    @property
+    def can_export(self):
+        return not self.busy and bool(self.protocols) and all(
+            self.complete(protocol, self.group[id(protocol)]) for protocol in self.protocols
+        )
 
     def state(self, protocol, records):
         if self.busy:
             return "Проверяем…"
-        if protocol.error or protocol.issues or not records or any(
-            r.instrument.problem or any(not reading.complete for reading in r.instrument.elements) for r in records
-        ):
-            return "Ошибка в протоколе"
-        ready = sum(not r.blockers for r in records)
-        if ready == len(records):
+        if self.complete(protocol, records):
             return "Готов к выгрузке"
-        if self.has_connection_issue(protocol):
-            return "Нет связи с реестром"
-        return f"Готово {ready} из {len(records)}" if ready else "Требуется уточнение"
+        if records:
+            issue = next((issue for record in records for issue in record.blockers), "")
+            issue = issue.removeprefix("Подтверждение: ").strip()
+            if issue:
+                return issue[0].upper() + issue[1:]
+        return protocol.error or next(iter(protocol.issues), "") or protocol.serial_issue or "Нет отдельных СИ"
+
+    def selected_protocols(self):
+        return [self.source_model.rows[index.row()][0] for index in self.source.selectionModel().selectedRows()]
+
+    def update_remove_button(self, *_):
+        self.remove_btn.setEnabled(bool(self.selected_protocols()) and not self.busy)
+
+    def remove_protocols(self):
+        if self.busy:
+            return
+        removed = {id(p) for p in self.selected_protocols()}
+        if not removed:
+            return
+        checked = {id(p) for p in self.registry_protocols}
+        self.protocols = [p for p in self.protocols if id(p) not in removed]
+        self.recheck()
+        if any(id(p) not in checked for p in self.registry_protocols):
+            self.start_registry_checks()
 
     def render(self):
+        chosen = {id(p) for p in self.selected_protocols()}
         rows = []
-        for p in self.protocols:
-            records = self.group[id(p)]
-            state = self.state(p, records)
-            rows.append((p, (p.number or p.path.name, p.declared or len(records), state, "")))
+        for protocol in self.protocols:
+            records = self.group[id(protocol)]
+            rows.append((protocol, (protocol.number or protocol.path.name, protocol.declared or len(records),
+                                    self.state(protocol, records))))
         self.source_model.update(rows)
-        for row, (protocol, values) in enumerate(rows):
-            action = button("Открыть" if values[2] == "Готов к выгрузке" else "Исправить",
-                            lambda checked=False, p=protocol: self.open_protocol(p))
-            action.setObjectName("rowAction")
-            action.setEnabled(not self.busy)
-            self.source.setIndexWidget(self.source_model.index(row, 3), action)
-        ready = sum(not record.blockers for record in self.results)
-        self.summary.setText(f"Протоколов {len(rows)}    ·    Приборов {len(self.results)}    ·    Готово {ready}")
+        selection = self.source.selectionModel()
+        for row, (protocol, _) in enumerate(rows):
+            if id(protocol) in chosen:
+                selection.select(self.source_model.index(row, 0), QItemSelectionModel.SelectionFlag.Select |
+                                 QItemSelectionModel.SelectionFlag.Rows)
+        screened = {id(protocol) for protocol in self.registry_protocols}
+        ready = sum(not record.blockers and id(record.protocol) in screened for record in self.results)
+        total = sum(values[1] for _, values in rows)
+        self.summary.setText(f"Протоколов {len(rows)}    ·    Приборов {total}    ·    Готово {ready}")
         self.empty.setVisible(not rows)
         self.source.setVisible(bool(rows))
         self.add_btn.setEnabled(not self.busy)
-        self.preview_btn.setEnabled(bool(self.results) and not self.busy)
-        self.export_btn.setEnabled(bool(ready) and not self.busy)
-        self.export_btn.setToolTip("Куда сохранять: " + str(self.output_folder()) if ready else
-                                   "Готовые записи появятся после устранения замечаний.")
-        retry = any(self.has_connection_issue(p) for p in self.protocols)
-        self.retry_btn.setVisible(not self.busy and retry)
-        if retry and not self.busy:
-            self.notice.setText("Не удалось подключиться к реестру.")
-        elif rows and not self.busy:
-            if not ready:
-                self.notice.setText("Откройте «Исправить», чтобы увидеть препятствия для выгрузки.")
-            else:
+        self.settings_btn.setEnabled(not self.busy)
+        self.update_remove_button()
+        self.preview_btn.setEnabled(bool(rows) and not self.busy)
+        self.export_btn.setEnabled(self.can_export)
+        self.export_btn.setToolTip("" if self.can_export else "Для выгрузки должны быть готовы все протоколы.")
+        if not self.busy:
+            if self.can_export:
                 self.notice.setText(f"В пакет войдёт записей: {ready}")
+            elif rows:
+                blocked = sum(not self.complete(p, self.group[id(p)]) for p, _ in rows)
+                problem_records = sum(sum(bool(r.blockers) for r in self.group[id(p)]) +
+                                      max(0, values[1] - len(self.group[id(p)])) for p, values in rows)
+                self.notice.setText(f"Требуют внимания: протоколов {blocked}, приборов {problem_records}. "
+                                    "Просмотрите сведения.")
+            else:
+                self.notice.clear()
 
     def open_protocol(self, protocol):
         if not self.busy:
-            RepairDialog(self, protocol).exec()
+            dialog = ProtocolDialog(self, protocol)
+            dialog.exec()
+            dialog.deleteLater()
 
     def show_results(self):
-        if self.results and not self.busy:
-            PreviewDialog(self, self.results, type_titles=self.type_titles).exec()
+        if self.protocols and not self.busy:
+            chosen = self.selected_protocols()
+            self.open_protocol(chosen[0] if chosen else None)
 
     def connection(self):
         ConnectionDialog(self, self.open_log).exec()
 
     def laboratory_settings(self):
         laboratory_settings(self, self.storage)
-        self.recheck()
+        self.refresh_after_edit()
 
     def expiry_rules(self):
         ExpiryRules(self, self.storage).exec()
-        self.recheck()
+        self.refresh_after_edit()
+
+    def expiry_exception(self):
+        selected = self.selected_protocols() or self.protocols
+        if self.busy or len(selected) != 1 or not selected[0].instruments:
+            message(self, "Исключение по сроку", "Выберите один заполненный протокол.")
+            return
+        protocol = selected[0]
+        day = iso_date(protocol.fields["verification_date"].value)
+        if not day:
+            message(self, "Исключение по сроку", "Сначала укажите дату поверки в Excel.")
+            return
+        previous = get_confirmation(self.storage.confirmations(), "expiry_exception", protocol)
+        form = Form(self, "Исключение по сроку поверки",
+                    f"Протокол {protocol.number or protocol.path.name}. Введите дату и ссылку на документ, "
+                    "который устанавливает исключение.", size=(535, 330), save="Сохранить")
+        form.field("valid_date", "Дата окончания", "date", previous[0].get("valid_date") if previous else None)
+        form.field("basis", "Документ и пункт", value=previous[1] if previous else "")
+
+        def validate(values):
+            end = iso_date(values["valid_date"])
+            if not end or end < day or not values["basis"]:
+                raise ValueError("Укажите основание и дату окончания не ранее даты поверки.")
+
+        form.validate = validate
+        if form.exec():
+            values = form.values()
+            fields = with_guards(protocol, {"valid_date": values["valid_date"]})
+            self.storage.save_confirmation("expiry_exception", protocol_key(protocol), fields, values["basis"], getuser())
+            self.refresh_after_edit()
 
     def output_folder(self):
-        saved = self.storage.setting("output_folder")
-        if saved:
-            return Path(saved)
         documents = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DocumentsLocation)
-        return (Path(documents) if documents else Path.home()) / "Аршин"
-
-    def pick_output_folder(self):
-        current = self.output_folder()
-        folder = QFileDialog.getExistingDirectory(self, "Папка для XML", str(current if current.is_dir() else current.parent))
-        if folder:
-            self.storage.set_setting("output_folder", folder)
-            self.render()
-
-    def registry(self):
-        protocol = selected(self.source)
-        if protocol is None and len(self.protocols) == 1:
-            protocol = self.protocols[0]
-        RegistryDialog(self, self.storage, protocol.equipment if protocol else ()).exec()
-        self.recheck()
+        saved = self.storage.setting("output_folder")
+        if saved and Path(saved).is_dir():
+            return Path(saved)
+        return Path(documents) if documents and Path(documents).is_dir() else Path.home()
 
     def history(self):
         HistoryDialog(self, self.storage, self.schema).exec()
-
-    def open_data(self):
-        QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.storage.path.parent)))
 
     def open_log(self):
         path = self.storage.path.parent / "diagnostics.log"
@@ -406,73 +478,60 @@ class MainWindow(QMainWindow):
                     context.update(self.storage.export_context(entry["id"]))
             XmlDialog(self, paths, self.schema, context).exec()
 
-    def source_errors(self, records):
-        present = {id(r.protocol) for r in records}
-        return [{"protocol": p.number or p.path.name, "serial": "", "issues":
-                 [p.error] if p.error else p.issues + [p.serial_issue or "Нет отдельных СИ."]}
-                for p in self.protocols if id(p) not in present]
+    def choose_xml_path(self, proposed):
+        dialog = QFileDialog(self, "Сохранить как", str(proposed.parent))
+        dialog.setAcceptMode(QFileDialog.AcceptMode.AcceptSave)
+        dialog.setFileMode(QFileDialog.FileMode.AnyFile)
+        dialog.setNameFilter("Файлы XML (*.xml)")
+        dialog.setDefaultSuffix("xml")
+        dialog.selectFile(proposed.name)
+        try:
+            if dialog.exec() == QDialog.DialogCode.Accepted:
+                return Path(dialog.selectedFiles()[0])
+            return None
+        finally:
+            dialog.deleteLater()
 
     def export_xml(self):
         if self.busy:
             return
         self.recheck()
-        ready = [result for result in self.results if not result.blockers]
-        if not ready:
+        if not self.can_export:
             return
-        excluded = [{"protocol": r.protocol.number or r.protocol.path.name, "serial": r.instrument.serial,
-                     "issues": list(r.blockers)} for r in self.results if r.blockers]
-        excluded.extend(self.source_errors(self.results))
-        previous = self.storage.seen([r.identity for r in ready])
-        repeated = [f"{r.protocol.number} / {r.instrument.serial}" for r in ready if r.identity in previous]
-        if (excluded or repeated) and not self.confirm_export_scope(ready, excluded, repeated):
+        previous = self.storage.seen([r.identity for r in self.results])
+        if previous and not message(self, "Повторная выгрузка",
+                f"Ранее сформировано результатов: {len(previous)}. При повторной загрузке могут появиться дубликаты. "
+                "Сформировать XML ещё раз?", ask=True):
             return
-        evidence = ("Подтверждён состав выгрузки" if excluded or repeated else "Все результаты проверены")
-        confirmer = f"Сеанс Windows: {getuser()}"
-        folder = self.output_folder()
         try:
-            folder.mkdir(parents=True, exist_ok=True)
-            files = export(ready, self.schema, folder, self.storage, excluded, f"{confirmer}: {evidence}")
+            packets = format_packets(self.results, self.schema)
+            name = self.protocols[0].number if len(self.protocols) == 1 else ""
+            name = name or date.today().isoformat()
+            stem = "Аршин_" + re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name).rstrip(". ")[:100]
+            folder = self.output_folder()
+            overwrite = None
+            if len(packets) == 1:
+                path = self.choose_xml_path(folder / f"{stem}.xml")
+                if path is None:
+                    return
+                paths = [path]
+                if path.exists():
+                    overwrite = path.stat()
+            else:
+                chosen = QFileDialog.getExistingDirectory(self, f"Папка для XML ({len(packets)} файлов)", str(folder))
+                if not chosen:
+                    return
+                paths = split_paths(Path(chosen), stem, len(packets))
+            files = export(packets, self.schema, paths, self.storage, f"Сеанс Windows: {getuser()}",
+                           overwrite=overwrite)
         except (ValueError, OSError, sqlite3.Error) as exc:
             logging.exception("Ошибка формирования XML")
             message(self, "Выгрузка", str(exc) if isinstance(exc, ValueError) else
-                    "Не удалось сохранить файл. Укажите доступную папку в меню «Настройки → Папка для XML».",
-                    error=True)
+                    "Не удалось сохранить XML. Проверьте права доступа и свободное место.", error=True)
             return
-        self.show_saved(files, ready)
-
-    def show_saved(self, files, records):
-        dialog = QDialog(self)
-        title = "Выгрузка готова"
-        dialog.setWindowTitle(title)
-        fit_window(dialog, 700, 300)
-        box = QVBoxLayout(dialog)
-        box.setContentsMargins(20, 18, 20, 18)
-        box.addWidget(label(title, "heading"))
-        box.addWidget(label(f"Записей {len(records)}    ·    Файлов {len(files)}"))
-        box.addWidget(label("При загрузке файла в «Аршин» записи автоматически включаются в заявку на публикацию."))
-        names = label("\n".join(str(path) for path in files))
-        names.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        box.addWidget(names, 1)
-        actions = QHBoxLayout()
-        actions.addWidget(button("Открыть папку", lambda: QDesktopServices.openUrl(
-            QUrl.fromLocalFile(str(files[0].parent))), primary=True))
-        context = {(r.instrument.serial, r.value("verification_date"), r.value("type_number")): r.protocol.number
-                   for r in records}
-        actions.addWidget(button("Просмотреть файл", lambda: XmlDialog(dialog, files, self.schema, context).exec()))
-        actions.addStretch()
-        actions.addWidget(button("Закрыть", dialog.accept))
-        box.addLayout(actions)
-        dialog.exec()
-
-    def confirm_export_scope(self, ready, excluded, repeated):
-        detail = [f"В пакет войдёт записей: {len(ready)}."]
-        if excluded:
-            grouped = defaultdict(list)
-            for entry in excluded:
-                grouped[entry["protocol"]].append(entry["serial"])
-            detail.append("Записи с замечаниями останутся в списке протоколов:")
-            detail.extend(f"• {protocol} — {len(serials)}" if all(serials) else f"• {protocol}"
-                          for protocol, serials in grouped.items())
-        if repeated:
-            detail.append(f"Ранее выгружено записей: {len(repeated)}. Они войдут в новый пакет.")
-        return message(self, "Состав выгрузки", "\n".join(detail), ask=True)
+        try:
+            self.storage.set_setting("output_folder", str(files[0].parent))
+        except sqlite3.Error:
+            logging.exception("Не удалось запомнить папку выгрузки")
+        suffix = f" · файлов {len(files)}" if len(files) > 1 else ""
+        self.notice.setText(f"XML сохранён: {len(self.results)} записей{suffix}")
