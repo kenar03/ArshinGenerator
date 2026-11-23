@@ -8,6 +8,7 @@ import sqlite3
 import sys
 
 from .domain import RegistryEntry
+from .confirmations import GUARDS, individual_key, legacy_key, protocol_key, with_guards
 
 PORTABLE_FLAG = "portable.flag"
 
@@ -103,18 +104,33 @@ class Storage:
                        (scope, subject, encode(fields), evidence, confirmer, changed))
             self._audit(db, "Подтверждение", [scope, subject, fields, evidence, confirmer])
 
-    def save_batch_outcome(self, subjects: list[str], evidence: str, confirmer: str) -> None:
+    def migrate_confirmation(self, protocol) -> None:
+        """Recover older confirmation records only from their original workbook snapshot."""
+        keys = [("protocol", protocol_key(protocol), None)]
+        keys.extend(("instrument", individual_key(protocol, instrument.serial), instrument)
+                    for instrument in protocol.instruments if instrument.serial)
+        with self.session() as db:
+            for scope, subject, instrument in keys:
+                row = db.execute("select data,evidence,confirmer,confirmed_at from confirmations where scope=? and subject=?",
+                                 (scope, legacy_key(protocol, instrument))).fetchone()
+                if row:
+                    fields = with_guards(protocol, json.loads(row["data"]), instrument)
+                    db.execute("insert or ignore into confirmations values (?,?,?,?,?,?)",
+                               (scope, subject, encode(fields), row["evidence"], row["confirmer"], row["confirmed_at"]))
+
+    def save_batch_outcome(self, subjects: dict[str, str], evidence: str, confirmer: str) -> None:
         if not subjects or not evidence.strip() or not confirmer.strip():
             raise ValueError("Укажите приборы, основание и имя сотрудника.")
         changed = now()
         with self.session() as db:
-            for subject in subjects:
+            for subject, guard in subjects.items():
                 row = db.execute("select data from confirmations where scope='instrument' and subject=?",
                                  (subject,)).fetchone()
                 fields = json.loads(row[0]) if row else {}
-                if fields.get("outcome"):
+                if fields.get("outcome") and fields.get(GUARDS, {}).get("outcome") == guard:
                     raise ValueError("Один из результатов уже подтверждён. Повторите проверку.")
                 fields["outcome"] = "pass"
+                fields.setdefault(GUARDS, {})["outcome"] = guard
                 db.execute("insert or replace into confirmations values (?,?,?,?,?,?)",
                            ("instrument", subject, encode(fields), evidence, confirmer, changed))
             self._audit(db, "Заключение подтверждено для партии", [subjects, evidence, confirmer])
@@ -134,6 +150,18 @@ class Storage:
                 db.execute("update equipment set active=0 where id=?", (entry.id,))
             db.execute("insert into equipment(data) values (?)", (encode(item),))
             self._audit(db, "Подтверждение средства поверки", item)
+
+    def save_equipment_choice(self, entry: RegistryEntry) -> None:
+        item = asdict(replace(entry, confirmed_at=now()))
+        item.pop("id")
+        with self.session() as db:
+            for row in db.execute("select id,data from equipment where active=1").fetchall():
+                previous = json.loads(row["data"])
+                if (all(previous.get(key) == item[key] for key in ("local_id", "serial", "name", "category"))
+                        and previous["valid_from"] <= entry.valid_until and entry.valid_from <= previous["valid_until"]):
+                    db.execute("update equipment set active=0 where id=?", (row["id"],))
+            db.execute("insert into equipment(data) values (?)", (encode(item),))
+            self._audit(db, "Выбор публичной карточки", item)
 
     def archive_equipment(self, entry: RegistryEntry, reason: str) -> None:
         with self.session() as db:

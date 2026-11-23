@@ -1,7 +1,10 @@
+from dataclasses import dataclass, replace
 from datetime import date
 import re
+import unicodedata
 
 from .domain import Equipment, RegistryEntry
+from .public_registry import API, PublicClient, PublicDataError, TYPE_NUMBER, exact_type, public_date
 
 CATEGORIES = {
     "mieta": "СИ, применяемое в качестве эталона",
@@ -9,6 +12,21 @@ CATEGORIES = {
     "npe": "Государственный первичный эталон",
     "mis": "СИ, применяемое при поверке",
 }
+MIETA_NUMBER = re.compile(r"[0-9]+\.[0-9]+\.[\w]+\.[0-9]+")
+
+
+@dataclass(frozen=True)
+class EquipmentCandidate:
+    entry: RegistryEntry
+    status: str
+    eligible: bool
+
+
+@dataclass(frozen=True)
+class EquipmentLookup:
+    state: str
+    message: str
+    candidates: tuple[EquipmentCandidate, ...] = ()
 
 
 def iso_date(value) -> date | None:
@@ -40,14 +58,56 @@ def registry_issues(entry: RegistryEntry) -> list[str]:
     return issues
 
 
-def resolve(item: Equipment, entries: list[RegistryEntry], when: date | None) -> tuple[RegistryEntry | None, str]:
+def _notation(value: str) -> str:
+    value = unicodedata.normalize("NFC", value).casefold().replace("ё", "е")
+    return " ".join(re.sub("[‑–—−]", "-", value).split())
+
+
+def _has_model(name: str, model: str) -> bool:
+    # Keep model characters significant: a published suffix is a different model.
+    return bool(model and re.search(r"(?<![\w/.-])" + re.escape(_notation(model)) + r"(?![\w/.-])",
+                                    _notation(name)))
+
+
+def lookup_key(item: Equipment, day: str) -> tuple:
+    return item.category, item.type_number, item.registration, item.serial, _notation(item.name), day
+
+
+def _same_equipment(item: Equipment, entry: RegistryEntry) -> bool:
+    if item.category and item.category != entry.category:
+        return False
+    if item.source_id and item.serial:
+        return (entry.local_id == item.source_id and entry.serial == item.serial and
+                (not item.name or _has_model(item.name, entry.model) or
+                 _notation(item.name) == _notation(entry.name)))
+    return item.description == entry.description and (not item.serial or entry.serial == item.serial)
+
+
+def _choice_matches(confirmed: RegistryEntry, online: RegistryEntry) -> bool:
+    if online.category == "mieta":
+        return confirmed.identifier == online.identifier
+    return bool(confirmed.public_id and confirmed.public_id == online.public_id and
+                confirmed.type_number == online.type_number and confirmed.registry_serial == online.registry_serial)
+
+
+def resolve(item: Equipment, entries: list[RegistryEntry], when: date | None,
+            online: EquipmentLookup | None = None) -> tuple[RegistryEntry | None, str]:
     matches = [
         entry for entry in entries
-        if item.description == entry.description
-        and (not item.source_id or entry.local_id == item.source_id)
-        and (not item.serial or entry.serial == item.serial)
-        and not registry_issues(entry)
+        if _same_equipment(item, entry) and not registry_issues(entry)
     ]
+    if online and online.state in {"found", "choice", "conflict", "missing"}:
+        valid = [candidate.entry for candidate in online.candidates if candidate.eligible]
+        if online.state == "found" and len(valid) == 1:
+            return valid[0], ""
+        if online.state == "choice":
+            chosen = [(entry, match) for entry in valid for match in matches if _choice_matches(match, entry)]
+            if len({entry.public_id for entry, _ in chosen}) == 1 and chosen:
+                # The human decision selects the card; dates and identity are from the live response.
+                entry, match = chosen[-1]
+                return replace(entry, evidence=f"{entry.evidence} · Выбор: {match.evidence}",
+                               confirmer=match.confirmer, confirmed_at=match.confirmed_at), ""
+        return None, online.message
     valid = [entry for entry in matches
              if when and iso_date(entry.valid_from) <= when <= iso_date(entry.valid_until)]
     if len(valid) == 1:
@@ -56,4 +116,148 @@ def resolve(item: Equipment, entries: list[RegistryEntry], when: date | None) ->
         return None, "Несколько действующих соответствий; ответственный сотрудник должен уточнить карточку"
     if matches:
         return None, "Нет подтверждённого срока действия на дату поверки"
+    if online:
+        return None, online.message
     return None, "Нет точного подтверждённого соответствия ФИФ ОЕИ"
+
+
+def _latest(rows: list[dict], when: date) -> list[dict]:
+    dated = [(iso_date(public_date(row.get("verification_date"))), row) for row in rows]
+    relevant = [(day, row) for day, row in dated if day is not None and day <= when]
+    if not relevant:
+        return []
+    latest = max(day for day, _ in relevant)
+    return [row for day, row in relevant if day == latest]
+
+
+def _interval(row: dict, when: date) -> tuple[str, str, str]:
+    start = public_date(row.get("verification_date"))
+    end = public_date(row.get("valid_date"))
+    if row.get("applicability") is not True:
+        return start, end, "Пригодность на дату не подтверждена"
+    if not start or not end:
+        return start, end, "Нет подтверждённого срока действия"
+    if not (iso_date(start) <= when <= iso_date(end)):
+        return start, end, "Срок не покрывает дату поверки"
+    return start, end, ""
+
+
+def _candidate(item: Equipment, category: str, record_id: str, official_id: str, number: str,
+               serial: str, model: str, scheme: str, row: dict, when: date, problem="") -> EquipmentCandidate:
+    start, end, date_problem = _interval(row, when)
+    proof_id = str(row.get("vri_id") or "")
+    resource = "mieta" if category == "mieta" else "vri"
+    proof = f"{API}{resource}/{record_id}"
+    if proof_id and category == "mieta":
+        proof += f" · {API}vri/{proof_id}"
+    if row.get("result_docnum"):
+        proof += f" · {row['result_docnum']}"
+    entry = RegistryEntry(
+        item.description, item.source_id, item.serial, item.name, category, official_id, number, serial,
+        "manufactureNum", start, end, proof, "Публичный ФИФ ОЕИ", public_id=record_id, scheme=scheme, model=model,
+    )
+    reason = problem or date_problem or ("В карточке отсутствует связанная поверка" if not proof_id else "")
+    return EquipmentCandidate(entry, reason or "Подходит на дату поверки", not reason)
+
+
+def _ordinary(item: Equipment, when: date, client: PublicClient) -> tuple[list[EquipmentCandidate], bool]:
+    reference = exact_type(client, item.type_number)
+    if not reference:
+        return [], False
+    result = []
+    listed = client.items("vri", mit_number=item.type_number, mi_number=item.serial,
+                          verification_date_end=when.isoformat())
+    rows = [row for row in listed if row.get("mit_number") == item.type_number and row.get("mi_number") == item.serial]
+    # Keep the latest relevant result of the identified unit, including a failed one.
+    latest = _latest(rows, when) or rows
+    status_conflict = len({row.get("applicability") is True for row in latest}) > 1
+    unknown_dates = any(not public_date(row.get("verification_date")) for row in rows)
+    for row in latest:
+        model = str(row.get("mi_modification") or row.get("mit_notation") or reference.get("notation") or "")
+        record_id = str(row.get("vri_id") or "")
+        problem = ("Поверки на одну дату дают разные результаты" if status_conflict else
+                   "В выдаче не указана дата одной из поверок" if unknown_dates else
+                   "" if _has_model(item.name, model) else "Модель расходится с протоколом")
+        result.append(_candidate(item, "mis", record_id, "", item.type_number, item.serial, model, "",
+                                 row, when, problem))
+    return result, False
+
+
+def _standards(item: Equipment, when: date, client: PublicClient) -> tuple[list[EquipmentCandidate], bool]:
+    if item.registration:
+        requested = item.registration
+        rows = [r for r in client.items("mieta", number=requested) if r.get("number") == requested]
+        # A visual substitution is only a suggestion; the user must select the official card.
+        alternative = re.sub(r"(?<=\.)[0-9]+[Pp](?=\.)", lambda m: m[0][:-1] + "Р", requested)
+        corrected = not rows and alternative != requested
+        if corrected:
+            rows = [r for r in client.items("mieta", number=alternative) if r.get("number") == alternative]
+    else:
+        corrected = False
+        rows = [r for r in client.items("mieta", mitype_num=item.type_number, factory_num=item.serial)
+                if r.get("mitype_num") == item.type_number and r.get("factory_num") == item.serial]
+    if len(rows) > 30:
+        raise PublicDataError("Найдено слишком много карточек эталона. Укажите полный регистрационный номер.")
+    types = {}
+    candidates = []
+    for row in rows:
+        record_id = str(row.get("rmieta_id") or "")
+        detail = client.detail("mieta", record_id)
+        number = str(detail.get("mitype_num") or "")
+        official_id = str(detail.get("number") or "")
+        serial = str(detail.get("factory_num") or "")
+        model = str(detail.get("modification") or detail.get("minotation") or "")
+        scheme = " · ".join(str(detail[key]) for key in ("npenumber", "rankcode", "schematitle") if detail.get(key))
+        if number not in types:
+            types[number] = exact_type(client, number) if TYPE_NUMBER.fullmatch(number) else None
+        problem = ""
+        if (not MIETA_NUMBER.fullmatch(official_id) or official_id != row.get("number") or
+                number != row.get("mitype_num") or serial != row.get("factory_num")):
+            problem = "Карточка и выдача MIETA расходятся"
+        elif not types[number] or (item.type_number and number != item.type_number):
+            problem = "Не подтверждён регистрационный номер типа в MIT"
+        elif serial != item.serial:
+            problem = "Заводской номер расходится с протоколом"
+        elif not _has_model(item.name, model):
+            problem = "Модель расходится с протоколом"
+        elif row.get("applicability") is not True or detail.get("applicability") is not True:
+            problem = "Карточка MIETA не подтверждает пригодность"
+        linked = detail.get("cresults")
+        if not isinstance(linked, list) or not all(isinstance(r, dict) for r in linked):
+            linked = []
+        latest = _latest(linked, when)
+        if len(latest) > 1:
+            problem = "Несколько связанных поверок на одну дату"
+        proof = latest[0] if latest else {}
+        candidates.append(_candidate(item, "mieta", record_id, official_id, number, serial, model, scheme,
+                                     proof, when, problem or ("Нет связанной поверки на дату протокола" if not latest else "")))
+    return candidates, corrected
+
+
+def lookup_equipment(item: Equipment, when: date, client: PublicClient | None = None) -> EquipmentLookup:
+    if not item.serial or not item.name or not (
+        item.category in {"mis", "mieta"} and
+        (TYPE_NUMBER.fullmatch(item.type_number) or
+         (item.category == "mieta" and MIETA_NUMBER.fullmatch(item.registration)))
+    ):
+        return EquipmentLookup("manual", "Подтверждение: проверьте структурированные реквизиты или локальный справочник")
+    client = client or PublicClient()
+    try:
+        candidates, corrected = (_standards(item, when, client) if item.category == "mieta"
+                                 else _ordinary(item, when, client))
+    except PublicDataError as exc:
+        return EquipmentLookup("unavailable", f"Онлайн-проверка: {exc}")
+    if not candidates:
+        return EquipmentLookup("missing", "Ошибка: точная публичная карточка не найдена")
+    available = [c for c in candidates if c.eligible]
+    if len(available) == 1 and not corrected:
+        return EquipmentLookup("found", "", tuple(candidates))
+    if available:
+        reason = ("Неоднозначность: проверьте алфавит полного регистрационного номера" if corrected
+                  else "Неоднозначность: выберите подходящую карточку ФИФ ОЕИ")
+        return EquipmentLookup("choice", reason, tuple(candidates))
+    if len(candidates) == 1:
+        candidate = candidates[0]
+        hint = f" · до {candidate.entry.valid_until}" if candidate.entry.valid_until else ""
+        return EquipmentLookup("conflict", f"Ошибка: {candidate.status}{hint}", tuple(candidates))
+    return EquipmentLookup("conflict", "Ошибка: публичные карточки не подтверждают реквизиты или срок", tuple(candidates))

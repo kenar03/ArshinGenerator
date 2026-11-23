@@ -4,7 +4,7 @@ $root = Split-Path $PSScriptRoot
 $release = Join-Path $root 'release'
 $qa = Join-Path $root ('build\qa-' + [guid]::NewGuid().ToString('N').Substring(0,8))
 New-Item -ItemType Directory -Force -Path $qa | Out-Null
-$sample = (Get-ChildItem (Join-Path $root 'Файлы для задания') -Filter '*.xlsm' -File).FullName
+$sample = (Get-Item -LiteralPath (Join-Path $root 'Файлы для задания\П-Т1-з2-1260-26.xlsm')).FullName
 $baseHash = (Get-FileHash -LiteralPath $sample).Hash
 
 function Test-Executable($exe, $report, [switch] $ImportSample) {

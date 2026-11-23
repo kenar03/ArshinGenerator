@@ -9,6 +9,7 @@ import unittest
 from openpyxl import Workbook
 
 from arshin_generator.arshin import NS, Schema, export, format_packets, open_xml, signature
+from arshin_generator.confirmations import get_confirmation, legacy_key, with_guards
 from arshin_generator.domain import Datum, RegistryEntry
 from arshin_generator.normalization import modification_candidate, metrologist, serial_list
 from arshin_generator.public_registry import exact_records
@@ -90,7 +91,8 @@ class MaterialTests(unittest.TestCase):
         self.assertEqual(len(sample.equipment), 8)
         self.assertIsNone(sample.fields["verification_type"].value)
         results = check([sample], {}, [])
-        self.assertTrue(all(any("окончательное заключение" in issue for issue in r.issues) for r in results))
+        self.assertTrue(all(r.value("outcome") == "pass" for r in results))
+        self.assertTrue(all(any("Наклейка" in issue for issue in r.issues) for r in results))
         self.assertFalse(any("учебн" in issue.casefold() for r in results for issue in r.issues))
         template = read_protocol(TEMPLATE)
         self.assertEqual(template.reader, sample.reader)
@@ -109,7 +111,8 @@ class MaterialTests(unittest.TestCase):
         self.assertTrue(details)
 
 
-def fixture(path, number, serial, *, dual=False, outcome="СООТВЕТСТВУЕТ", complete=True):
+def fixture(path, number, serial, *, dual=False, outcome="СООТВЕТСТВУЕТ", complete=True,
+            count=1, print_limit=None):
     book = Workbook()
     t = book.active
     t.title = "Таблицы"
@@ -126,27 +129,34 @@ def fixture(path, number, serial, *, dual=False, outcome="СООТВЕТСТВУ
         "B20": "01234567890", "B21": "-", "B22": "V", "B23": "Тестова Анна Викторовна",
         "B24": date(2026, 1, 15), "H26": "Схема соединения", "J26": "Кол-во",
         "A27": "ТСП-0193", "B27": "01", "L27": "56560-14", "H27": "2х4" if dual else "4",
-        "J27": 1, "A34": "Серийный №",
+        "J27": count, "A34": "Серийный №",
     }
     for cell, value in cells.items():
         t[cell] = value
     r["A20"] = f"Протокол {number}"
     r["A32"] = "Методика поверки:"
     r["A33"] = "Методика для испытаний XML"
-    r["A45"] = "Учебное заключение"
+    r["A45"] = "Заключение: СИ годны к применению."
     r["A61"] = "ТСП-0193-01-100"
     e["G1"] = "Поверен до"
     o["E1"] = "Строка для протокола"
     for col, value in {1: "Блок", 2: "Прибор №", 3: "ЧЭ №", 7: "Номер с кодом", 9: "Статус ЧЭ"}.items():
         d.cell(1, col, value)
-    for part in range(1, 3 if dual else 2):
-        for col, value in enumerate((part, 0, part, serial, "", serial, serial, serial,
-                                    outcome if part == 2 or not dual else "СООТВЕТСТВУЕТ"), 1):
-            d.cell(part + 1, col, value)
-        for row in (33 + part * 2, 34 + part * 2):
-            for col in (3, 4, 7, 8, 9, 10):
-                if complete or col != 7:
-                    t.cell(row, col, 100)
+    if print_limit is not None:
+        d["L1"] = print_limit
+    names = [serial] if count == 1 else [f"{i + 1:03d}B6" for i in range(count)]
+    t["B19"] = "№" + ", ".join(names)
+    per_device = 2 if dual else 1
+    for instrument, name in enumerate(names):
+        for part in range(1, per_device + 1):
+            block = instrument * per_device + part
+            for col, value in enumerate((block, instrument, part, name, "", name, name, name,
+                                         outcome if part == per_device else "СООТВЕТСТВУЕТ"), 1):
+                d.cell(block + 1, col, value)
+            for row in (33 + block * 2, 34 + block * 2):
+                for col in (3, 4, 7, 8, 9, 10):
+                    if complete or col != 7:
+                        t.cell(row, col, 100)
     book.save(path)
     book.close()
     return read_protocol(path)
@@ -196,7 +206,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertTrue(any("противоречит" in q for q in self.checked(p)[0].issues))
         approve(self.storage, p, outcome="fail")
         result = self.checked(p)[0]
-        self.assertEqual(result.issues, [])
+        self.assertFalse(result.blockers)
         payload, _ = format_packets([result], self.schema)[0]
         self.assertIn(b"gost:inapplicable", payload)
         self.assertNotIn(b"gost:stickerNum", payload)
@@ -227,7 +237,7 @@ class WorkflowTests(unittest.TestCase):
         approve(self.storage, p)
         approve(self.storage, q, sticker="01234567891")
         results = self.checked(p, q)
-        self.assertEqual([r.issues for r in results], [[], []])
+        self.assertEqual([r.blockers for r in results], [(), ()])
         big_packets = format_packets(results, self.schema)
         split_limit = max(len(format_packets([r], self.schema)[0][0]) for r in results)
         split = format_packets(results, self.schema, split_limit)
@@ -263,8 +273,8 @@ class WorkflowTests(unittest.TestCase):
         approve(self.storage, p, sticker="")
         p.fields["metrologist"] = Datum("Тестова Анна", "Таблицы!B23")
         results = self.checked(p)
-        issues = " ".join(results[0].issues)
-        self.assertIn("наклейки", issues)
+        issues = " ".join(results[0].blockers)
+        self.assertIn("Наклейка", issues)
         self.assertIn("ФИФ ОЕИ", issues)
         self.assertIn("поверителя", issues)
         with self.assertRaises(ValueError):
@@ -275,7 +285,7 @@ class WorkflowTests(unittest.TestCase):
         self.storage.save_equipment(equipment())
         approve(self.storage, p)
         results = self.checked(p)
-        self.assertFalse(results[0].issues)
+        self.assertFalse(results[0].blockers)
         results[0].fields["metrologist"] = Datum("А.В. Тестова", "Таблицы!B23")
         with self.assertRaisesRegex(ValueError, "Фамилия И.О."):
             format_packets(results, self.schema)
@@ -290,6 +300,44 @@ class WorkflowTests(unittest.TestCase):
         self.assertTrue(all(any("Повтор результата" in i for i in r.issues) for r in results))
         with self.assertRaises(ValueError):
             format_packets(results, self.schema)
+
+    def test_completed_workbook_exports_without_individual_outcome_confirmation(self):
+        p = fixture(self.root / "automatic.xlsx", "ТЕСТ-АВТО", "056B6")
+        self.storage.save_equipment(equipment())
+        self.storage.save_confirmation("modification", modification_key(p), {"modification": "ТСП-0193-01"},
+                                       "Описание типа", "Тест")
+        fields = {"sign_cipher": "ВЯ", "calibration": False, "valid_date": "2027-01-14"}
+        self.storage.save_confirmation("protocol", protocol_key(p), with_guards(p, fields),
+                                       "Протокол", "Тест")
+        result = self.checked(p)[0]
+        self.assertEqual(result.value("outcome"), "pass")
+        self.assertIn("заключение отчёта Excel", result.fields["outcome"].source)
+        self.assertFalse(result.blockers)
+        self.assertEqual(len(format_packets([result], self.schema)), 1)
+
+    def test_print_limit_warns_and_block_63_is_read(self):
+        p = fixture(self.root / "batch.xlsx", "ТЕСТ-ВМЕСТИМОСТЬ", "unused", count=63, print_limit=62)
+        self.assertEqual(len(p.instruments), 63)
+        self.assertEqual(p.instruments[-1].serial, "063B6")
+        self.assertTrue(p.instruments[-1].elements[0].complete)
+        self.assertFalse(p.issues)
+        self.assertIn("62", p.notices[0])
+
+    def test_confirmation_migrates_and_only_changed_evidence_is_invalidated(self):
+        p = fixture(self.root / "one.xlsx", "ТЕСТ-ПЕРЕНОС", "034C6")
+        instrument = p.instruments[0]
+        self.storage.save_confirmation("instrument", legacy_key(p, instrument),
+                                       {"sticker": "01234567890", "outcome": "pass"}, "Документ", "Тест")
+        self.storage.migrate_confirmation(p)
+        changed = replace(p, digest="updated-sha")
+        fields = get_confirmation(self.storage.confirmations(), "instrument", changed, instrument)[0]
+        self.assertEqual(fields, {"outcome": "pass", "sticker": "01234567890"})
+        first = instrument.elements[0]
+        new_instrument = replace(instrument, elements=(replace(first, status="НЕ СООТВЕТСТВУЕТ"),))
+        fields = get_confirmation(self.storage.confirmations(), "instrument", changed, new_instrument)[0]
+        self.assertEqual(fields, {"sticker": "01234567890"})
+        changed_day = replace(changed, fields={**p.fields, "verification_date": Datum("2026-03-11", "B24")})
+        self.assertIsNone(get_confirmation(self.storage.confirmations(), "instrument", changed_day, new_instrument))
 
     def test_untrusted_xml_dtd_not_read(self):
         path = self.root / "dtd.xml"

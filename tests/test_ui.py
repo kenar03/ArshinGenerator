@@ -1,4 +1,5 @@
 import os
+from datetime import date
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
@@ -10,10 +11,12 @@ from PySide6.QtWidgets import QApplication, QComboBox, QLineEdit, QTableView, QT
 
 from arshin_generator.arshin import Schema, export
 from arshin_generator.storage import Storage
-from arshin_generator.ui.dialogs import XmlDialog
+from arshin_generator.registry import lookup_equipment, lookup_key
+from arshin_generator.ui.dialogs import EquipmentReviewDialog, XmlDialog
 from arshin_generator.ui.main import MainWindow
 from arshin_generator.ui.style import apply_theme
 from tests.test_workflow import SAMPLE, approve, equipment, fixture
+from tests.test_public_registry import FixtureClient, etalon, mieta
 
 
 def contrast(foreground, background):
@@ -61,7 +64,7 @@ class InterfaceTests(unittest.TestCase):
             path = Path(directory)
             storage = Storage(path / "ui.sqlite3")
             schema = Schema()
-            main = MainWindow(storage, schema)
+            main = MainWindow(storage, schema, online=False)
             main.show()
             main.import_paths([SAMPLE])
             if main.thread:
@@ -79,6 +82,12 @@ class InterfaceTests(unittest.TestCase):
             self.assertEqual(main.result_model.rowCount(), 1)
             self.assertIn("018W6", main.card.toPlainText())
             self.assertNotIn("Учебная книга", main.card.toPlainText())
+            self.assertNotIn("Нет точного подтверждённого соответствия ФИФ ОЕИ", main.card.toPlainText())
+            self.assertTrue(main.protocol_issues_btn.isVisible())
+            QTest.mouseClick(main.protocol_issues_btn, Qt.MouseButton.LeftButton)
+            self.assertEqual(main.tabs.currentIndex(), 0)
+            self.assertEqual(main.card.toPlainText().count("Нет точного подтверждённого соответствия ФИФ ОЕИ"), 8)
+            main.show_results()
             self.assertIn("Данные!I", main.card.toPlainText())
             main.search.clear()
             p = fixture(path / "ui-test.xlsx", "ТЕСТ-ИНТЕРФЕЙС", "001B6")
@@ -99,6 +108,30 @@ class InterfaceTests(unittest.TestCase):
             self.assertIn("Тестова А.В.", xml.raw.toPlainText())
             xml.close()
             main.close()
+
+    def test_equipment_candidates_require_an_explicit_selection(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory)
+            storage = Storage(path / "ui.sqlite3")
+            protocol = fixture(path / "ui.xlsx", "ТЕСТ-КАРТОЧКИ", "001B6")
+            item = etalon()
+            protocol.equipment = [item]
+            day = date.fromisoformat(protocol.fields["verification_date"].value)
+            first = ("41", "32777.06.2Р.01000001", "ГПС 1")
+            second = ("42", "32777.06.2Р.01000002", "ГПС 2")
+            cases = []
+            for args in (first, second):
+                row, detail = mieta(*args)
+                detail["cresults"][0]["verification_date"] = "01.01.2026"
+                cases.append((row, detail))
+            found = lookup_equipment(item, day, FixtureClient(cases))
+            self.assertEqual(found.state, "choice")
+            dialog = EquipmentReviewDialog(None, storage, protocol, {lookup_key(item, day.isoformat()): found})
+            self.assertEqual(dialog.candidate_model.rowCount(), 2)
+            self.assertFalse(dialog.select_btn.isEnabled())
+            dialog.candidates.selectRow(1)
+            self.assertTrue(dialog.select_btn.isEnabled())
+            dialog.close()
 
 
 if __name__ == "__main__":

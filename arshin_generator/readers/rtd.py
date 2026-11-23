@@ -9,6 +9,17 @@ from ..normalization import serial, serial_list, structured_candidate
 VERSION = "rtd-v1"
 PASS = "СООТВЕТСТВУЕТ"
 FAIL = "НЕ СООТВЕТСТВУЕТ"
+DATA_LAST_ROW = 1001
+MEASUREMENT_LAST_ROW = 2034
+MEASUREMENT_COLUMNS = (2, 3, 6, 7, 8, 9)
+
+
+def _conclusion(text: str) -> str:
+    if re.match(r"^(?:заключение:\s*(?:си\s+)?)?не годн(?:ы|ен|а)\b", text, re.I):
+        return "fail"
+    if re.match(r"^(?:заключение:\s*(?:си\s+)?)?годн(?:ы|ен|а)\b", text, re.I):
+        return "pass"
+    return ""
 
 
 def _matrix(sheet, end: int, columns: int) -> list[tuple]:
@@ -60,39 +71,56 @@ def _equipment(t, catalog, etalons) -> list[Equipment]:
     lookup = defaultdict(set)
     for r, row in enumerate(catalog[2:], 2):
         if _present(row[4]):
-            lookup[_text(row[4])].add((_text(row[0]), _text(row[2]), _text(row[1]), r))
+            lookup[_text(row[4])].add((_text(row[0]), _text(row[2]), _text(row[1]), _text(row[3]), r))
     result = []
     for r in range(10, 19):
         text = _present(t[r][0])
         if not text:
             continue
         matches = lookup[text]
-        identities = {entry[:3] for entry in matches}
+        identities = {entry[:4] for entry in matches}
         source = f"Таблицы!A{r}"
+        category, type_number, registration = "", "", ""
         if len(identities) == 1:
-            local_id, factory, name = next(iter(identities))
+            local_id, factory, name, registry_format = next(iter(identities))
             source += " / " + ", ".join(f"Оборудование!A{k}:E{k}" for *_, k in sorted(matches))
+            if registry_format.casefold() == "г/р":
+                category, type_number = "mis", local_id
+            elif registry_format.casefold() == "фиф" or registry_format.casefold().startswith("фиф без"):
+                category = "mieta"
+                if re.fullmatch(r"[0-9]+-[0-9]+", local_id):
+                    type_number = local_id
+                elif re.fullmatch(r"[0-9]+\.[0-9]+\.[\w]+\.[0-9]+", local_id):
+                    registration = local_id
+                else:
+                    category = ""
         else:
-            ordinary = re.fullmatch(r"г/р\s*№\s*(\S+)\s+(.+?)\s+№\s*(\S+)", text)
+            # A hand-entered строка can still supply explicit individual attributes.
+            ordinary = re.fullmatch(r"г/р\s*№\s*([0-9]+-[0-9]+)\s+(.+?)\s+№\s*(\S+)", text, re.I)
             local_id, name, factory = ordinary.groups() if ordinary else ("", "", "")
+            if ordinary and not matches:
+                category, type_number = "mis", local_id
         hints = {
             f"Эталоны!F{k}:G{k}: {_text(row[5])}, до {_text(row[6])}"
             for k, row in enumerate(etalons[2:], 2)
             if factory and _text(row[0]) == _text(t[30][7]) and _text(row[0]).endswith(f"№{factory}")
         }
-        result.append(Equipment(text, source, local_id, factory, name, "; ".join(sorted(hints))))
+        result.append(Equipment(text, source, local_id, factory, name, "; ".join(sorted(hints)),
+                                category, type_number, registration))
     return result
 
 
 def read(book, protocol: Protocol) -> None:
     protocol.reader = VERSION
     protocol.modification_prefixes = ("ТСП-", "ТСМ-")
-    data = _matrix(book["Данные"], 1001, 9)
-    t = _matrix(book["Таблицы"], 2034, 12)
+    data = _matrix(book["Данные"], DATA_LAST_ROW, 12)
+    t = _matrix(book["Таблицы"], MEASUREMENT_LAST_ROW, 12)
     report = _matrix(book["Отчёт"], 61, 10)
     protocol.number = _present(t[1][3])
     protocol.evidence = _present(report[45][0])
     protocol.conclusion = _text(t[19][2]).casefold()
+    protocol.report_outcome = _conclusion(protocol.evidence)
+    protocol.conclusion_outcome = _conclusion(protocol.conclusion)
     declared = t[27][9]
     if type(declared) is int and 1 <= declared <= 1000:
         protocol.declared = declared
@@ -102,13 +130,20 @@ def read(book, protocol: Protocol) -> None:
         protocol.issues.append("Нет номера готового протокола (Таблицы!D1). Сохраните завершённую книгу в Excel.")
     if protocol.number and protocol.number not in _text(report[20][0]):
         protocol.issues.append("Номер протокола расходится с Отчёт!A20. Сохраните книгу в Excel и загрузите снова.")
+        protocol.report_outcome = ""
     scheme = _text(t[27][7]).casefold().replace("x", "х").replace("×", "х")
     if scheme in {"2", "3", "4", "2х2", "2х3", "2х4"}:
         protocol.elements = 2 if "х" in scheme else 1
     else:
         protocol.issues.append(f"Схема «{scheme}» не подтверждена для этой версии шаблона (Таблицы!H27).")
-    if protocol.declared and protocol.elements and protocol.declared * protocol.elements > 62:
-        protocol.issues.append("Партия превышает печатную вместимость шаблона в 62 блока измерений.")
+    print_limit = data[1][11]
+    if protocol.declared and protocol.elements and type(print_limit) is int and print_limit > 0:
+        blocks = protocol.declared * protocol.elements
+        if blocks > print_limit:
+            protocol.notices.append(f"Печатная вместимость «Данные»!L1 — {print_limit} блоков, в партии {blocks}. "
+                                    "Проверьте полный отчёт. Выгрузка XML проверяет все строки измерений.")
+    if protocol.declared and protocol.elements and protocol.declared * protocol.elements > DATA_LAST_ROW - 1:
+        protocol.issues.append("Количество заявленных измерительных блоков превышает диапазон расчётных строк.")
 
     def put(key, value, source, raw=None):
         protocol.fields[key] = Datum(value, source, _text(value if raw is None else raw))
@@ -156,7 +191,7 @@ def _instruments(protocol: Protocol, t: list, data: list) -> None:
     by_index = defaultdict(list)
     malformed = []
     for r, row in enumerate(data[2:], 2):
-        _, index, part, entry, suffix, padded, combined, _, status = row
+        _, index, part, entry, suffix, padded, combined, _, status = row[:9]
         if entry in ("", None) and combined in ("", None):
             continue
         if type(index) is not int or type(part) is not int:
@@ -171,11 +206,12 @@ def _instruments(protocol: Protocol, t: list, data: list) -> None:
             malformed.append(r)
         first = 35 + (r - 2) * 2
         rows = t[first:first + 2]
-        measured = len(rows) == 2 and all(
-            type(line[c]) in (int, float) and isfinite(line[c]) for line in rows for c in (2, 3, 6, 7, 8, 9)
+        values = tuple(tuple(line[c] for c in MEASUREMENT_COLUMNS) for line in rows)
+        measured = len(values) == 2 and all(
+            type(value) in (int, float) and isfinite(value) for line in values for value in line
         )
         by_index[index].append((number, raw, ElementReading(
-            part, _text(status), measured, f"Данные!I{r}, Таблицы!C{first}:J{first + 1}"
+            part, _text(status), measured, f"Данные!I{r}, Таблицы!C{first}:J{first + 1}", values if measured else ()
         )))
     if malformed:
         protocol.issues.append("Некорректные или отсутствующие кэши индексов/номеров на листе «Данные»: " +

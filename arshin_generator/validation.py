@@ -2,11 +2,12 @@ from collections import Counter
 import json
 import re
 
+from .confirmations import get_confirmation, individual_key, protocol_key
 from .domain import Datum, Protocol, Result, RegistryEntry
 from .normalization import CANONICAL_NAME, metrologist, serial_list
-from .registry import iso_date, resolve
+from .registry import iso_date, lookup_key, resolve
 
-RULES = "1.0.0"
+RULES = "1.1.0"
 PASS = "СООТВЕТСТВУЕТ"
 FAIL = "НЕ СООТВЕТСТВУЕТ"
 SHARED_FIELDS = (
@@ -17,6 +18,8 @@ SHARED_FIELDS = (
     ("owner", "Владелец СИ", "text"),
     ("valid_date", "Действительна до", "date"),
     ("valid_date_absent", "Срок не указывается по документу", "bool"),
+    ("sign_pass", "Знак в паспортах всей партии", "bool"),
+    ("sign_mi", "Знак на приборах всей партии", "bool"),
     ("temperature", "Температура", "text"),
     ("pressure", "Атмосферное давление", "text"),
     ("humidity", "Относительная влажность", "text"),
@@ -55,14 +58,6 @@ def modification_key(protocol: Protocol) -> str:
     return json.dumps([protocol.fields["type_number"].value, protocol.fields["marking"].value], ensure_ascii=False)
 
 
-def individual_key(protocol: Protocol, number: str) -> str:
-    return f"{RULES}:{protocol.reader}:{protocol.digest}:{number}"
-
-
-def protocol_key(protocol: Protocol) -> str:
-    return individual_key(protocol, "")
-
-
 def valid_modification(protocol: Protocol, value: str) -> bool:
     if not value:
         return False
@@ -86,14 +81,67 @@ def _candidate(protocol: Protocol, statuses: list[str], complete: bool) -> str:
     return "pass" if protocol.conclusion.startswith("годны к применению") else ""
 
 
-def check(protocols: list[Protocol], confirmations: dict, registry: list[RegistryEntry]) -> list[Result]:
+def _individual_evidence(protocol, instrument):
+    statuses = [e.status for e in instrument.elements]
+    complete = (bool(statuses) and not instrument.problem and len(statuses) == protocol.elements and
+                all(e.complete and e.status in {PASS, FAIL} for e in instrument.elements))
+    return statuses, complete
+
+
+def _report_agrees(protocol, evidence, shared):
+    if (protocol.serial_issue or not protocol.report_outcome or not protocol.number or "!!!!!" in protocol.number or
+            protocol.report_outcome != protocol.conclusion_outcome or
+            not iso_date(shared["verification_date"].value) or protocol.declared != len(evidence) or
+            not all(complete for _, complete in evidence)):
+        return False
+    reasons = shared.get("reasons", Datum("", "")).value
+    failing = [FAIL in statuses for statuses, _ in evidence]
+    if protocol.report_outcome == "pass":
+        return not any(failing) and not reasons
+    return protocol.declared == 1 and all(failing) and bool(reasons)
+
+
+def _check_common(protocol, fields):
+    issues = []
+    for key in ("type_number", "method", "temperature", "pressure", "humidity"):
+        if not fields.get(key, Datum("", "")).value:
+            issues.append(f"Заполните поле «{LABELS[key]}».")
+    if not iso_date(fields["verification_date"].value):
+        issues.append("Ошибка: укажите фактическую дату поверки в Таблицы!B24 и сохраните книгу в Excel.")
+    if fields.get("verification_type", Datum("", "")).value not in {"1", "2"}:
+        issues.append("Подтверждение: укажите вид поверки.")
+    if not re.fullmatch(r"[А-Я]{1,3}", str(fields.get("sign_cipher", Datum("", "")).value or "")):
+        issues.append("Подтверждение: укажите шифр знака из 1–3 заглавных букв А–Я.")
+    if type(fields.get("calibration", Datum(None, "")).value) is not bool:
+        issues.append("Подтверждение: укажите, использовались ли результаты калибровки.")
+    if not valid_modification(protocol, str(fields.get("modification", Datum("", "")).value or "")):
+        issues.append("Подтверждение: проверьте написание модификации по официальному описанию типа.")
+    try:
+        original = fields["metrologist"]
+        normalized = metrologist(str(original.value or ""))
+        if not CANONICAL_NAME.fullmatch(normalized):
+            raise ValueError
+        fields["metrologist"] = Datum(normalized, original.source, original.raw or str(original.value))
+    except (ValueError, KeyError):
+        issues.append("Подтверждение: проверьте поверителя в формате «Фамилия И.О.».")
+    return issues
+
+
+def check(protocols: list[Protocol], confirmations: dict, registry: list[RegistryEntry],
+          lookups: dict | None = None) -> list[Result]:
     results = []
+    lookups = lookups or {}
     for protocol in protocols:
         if protocol.error or not protocol.instruments:
             continue
         shared = protocol.fields.copy()
         _merge(shared, confirmations.get(("modification", modification_key(protocol))))
-        _merge(shared, confirmations.get(("protocol", protocol_key(protocol))))
+        common = get_confirmation(confirmations, "protocol", protocol)
+        if protocol.declared != 1:
+            for key in ("sign_pass", "sign_mi"):
+                item = shared.get(key, Datum(None, ""))
+                shared[key] = Datum(None, item.source + " (применение ко всей партии уточняется)", item.raw)
+        _merge(shared, common)
         issues = protocol.issues.copy()
         if protocol.serial_issue:
             try:
@@ -105,13 +153,17 @@ def check(protocols: list[Protocol], confirmations: dict, registry: list[Registr
         if protocol.elements == 2 and shared.get("one_result", Datum(None, "")).value is not True:
             issues.append("Для двух ЧЭ подтвердите по описанию типа, что на физический прибор оформляется одна запись.")
         equipment = []
+        seen_equipment_issues = set()
         when = iso_date(shared["verification_date"].value)
         for item in protocol.equipment:
-            entry, error = resolve(item, registry, when)
+            key = lookup_key(item, when.isoformat() if when else "")
+            online = lookups.get(key)
+            entry, error = resolve(item, registry, when, online)
             if entry:
                 equipment.append(entry)
-            else:
+            elif (key, error) not in seen_equipment_issues or not (item.source_id and item.serial):
                 issues.append(f"{error}: {item.description} ({item.source}).")
+                seen_equipment_issues.add((key, error))
         if not protocol.equipment:
             issues.append("Средства поверки отсутствуют в Таблицы!A10:A18.")
         equipment_keys = [
@@ -120,31 +172,36 @@ def check(protocols: list[Protocol], confirmations: dict, registry: list[Registr
         ]
         if len(set(equipment_keys)) != len(equipment_keys):
             issues.append("В списке средств поверки обнаружено повторное соответствие одному идентификатору.")
-        for instrument in protocol.instruments:
+        issues.extend(_check_common(protocol, shared))
+        evidence = [_individual_evidence(protocol, instrument) for instrument in protocol.instruments]
+        auto = _report_agrees(protocol, evidence, shared)
+        shared_issues = tuple(dict.fromkeys(issues))
+        for instrument, (statuses, complete) in zip(protocol.instruments, evidence):
             fields = shared.copy()
-            individual = confirmations.get(("instrument", individual_key(protocol, instrument.serial)))
+            individual = get_confirmation(confirmations, "instrument", protocol, instrument)
             if protocol.declared != 1:
                 for key in ("sticker", "reasons"):
                     prior = fields.get(key, Datum("", ""))
                     fields[key] = Datum("", prior.source + " (общие сведения партии)", prior.raw)
+            if auto:
+                evidence_source = "Согласованы заключение отчёта Excel и сохранённые результаты всех ЧЭ"
+                fields["outcome"] = Datum(protocol.report_outcome, evidence_source, protocol.evidence)
             _merge(fields, individual)
-            statuses = [e.status for e in instrument.elements]
-            complete = len(statuses) == protocol.elements and all(e.complete for e in instrument.elements)
             candidate = _candidate(protocol, statuses, complete)
-            result = Result(protocol, instrument, fields, equipment, issues.copy(), candidate)
-            if not individual or result.value("outcome") not in {"pass", "fail"}:
-                result.issues.append("Подтвердите окончательное заключение по этому СИ.")
+            result = Result(protocol, instrument, fields, equipment, candidate=candidate, shared_issues=shared_issues)
+            if result.value("outcome") not in {"pass", "fail"}:
+                result.issues.append("Подтверждение: проверьте окончательное заключение по этому СИ.")
             if instrument.problem:
                 result.issues.append(instrument.problem)
             if not complete or not all(status in {PASS, FAIL} for status in statuses):
                 result.issues.append("Есть неполные измерения или отсутствует сохранённый результат ЧЭ.")
             if result.value("outcome") == "pass" and (
-                FAIL in statuses or protocol.conclusion.startswith("не годны")
+                FAIL in statuses or "fail" in {protocol.report_outcome, protocol.conclusion_outcome}
             ):
                 result.issues.append("Положительный результат противоречит сохранённым данным протокола.")
             if result.value("outcome") == "pass" and result.value("reasons"):
                 result.issues.append("При положительном результате указана причина непригодности.")
-            _check_fields(result, individual[0] if individual else {})
+            _check_fields(result)
             results.append(result)
     identities = Counter((r.identity[0], r.identity[1].upper(), r.identity[2]) for r in results if r.identity[1])
     stickers = Counter(r.value("sticker") for r in results if r.value("outcome") == "pass" and r.value("sticker"))
@@ -157,39 +214,17 @@ def check(protocols: list[Protocol], confirmations: dict, registry: list[Registr
     return results
 
 
-def _check_fields(result: Result, confirmed_individual: dict) -> None:
+def _check_fields(result: Result) -> None:
     value = result.value
     issues = result.issues
-    for key in ("type_number", "method", "temperature", "pressure", "humidity"):
-        if not value(key):
-            issues.append(f"Заполните поле «{LABELS[key]}».")
     if not result.instrument.serial:
         issues.append("Заводской номер нельзя подтвердить по сохранённой строке.")
-    if not (iso_date(value("verification_date"))):
-        issues.append("Укажите фактическую дату поверки в Таблицы!B24 и сохраните книгу в Excel.")
-    if value("verification_type") not in {"1", "2"}:
-        issues.append("Укажите вид поверки.")
-    if not re.fullmatch(r"[А-Я]{1,3}", str(value("sign_cipher") or "")):
-        issues.append("Шифр знака должен содержать 1–3 заглавные кириллические буквы А–Я.")
-    if type(value("calibration")) is not bool:
-        issues.append("Подтвердите, использовались ли результаты калибровки.")
-    modification = str(value("modification") or "")
-    if not valid_modification(result.protocol, modification):
-        issues.append("Подтвердите написание модификации по официальному описанию типа.")
-    try:
-        original = result.fields["metrologist"]
-        normalized = metrologist(str(original.value or ""))
-        if not CANONICAL_NAME.fullmatch(normalized):
-            raise ValueError
-        result.fields["metrologist"] = Datum(normalized, original.source, original.raw or str(original.value))
-    except (ValueError, KeyError):
-        issues.append("Проверьте поверителя. Нужен формат «Фамилия И.О.».")
     if value("outcome") == "pass":
         sticker = str(value("sticker") or "")
         if not re.fullmatch(r"[0-9]{11}", sticker):
-            issues.append("Для пригодного СИ XSD требует фактический номер наклейки из 11 цифр.")
-        if any(type(confirmed_individual.get(key)) is not bool for key in ("sign_pass", "sign_mi")):
-            issues.append("Подтвердите нанесение знака в паспорте и на конкретном приборе.")
+            issues.append("Наклейка: пакетная XSD требует фактический номер из 11 цифр для пригодного СИ.")
+        if any(type(value(key)) is not bool for key in ("sign_pass", "sign_mi")):
+            issues.append("Подтверждение: укажите знаки на приборе и в паспорте.")
         if value("valid_date"):
             end, start = iso_date(value("valid_date")), iso_date(value("verification_date"))
             if not end or (start and end < start):

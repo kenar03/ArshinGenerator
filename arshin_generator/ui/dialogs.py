@@ -1,3 +1,4 @@
+from dataclasses import replace
 import json
 import logging
 from pathlib import Path
@@ -14,8 +15,8 @@ from PySide6.QtWidgets import (
 
 from ..arshin import NS, open_xml
 from ..domain import RegistryEntry
-from ..public_registry import PUBLIC_CARD, find_public_verifications
-from ..registry import CATEGORIES, registry_issues
+from ..public_registry import API, PUBLIC_CARD, find_public_verifications
+from ..registry import CATEGORIES, iso_date, lookup_key, registry_issues, resolve
 from ..storage import PORTAL_STATES
 from .common import Form, button, confirmation_values, label, message, selected, table
 
@@ -181,6 +182,105 @@ class XmlDialog(QDialog):
                 message(self, "Поиск по XML", "Фраза не найдена в тексте файла.")
 
 
+class EquipmentReviewDialog(QDialog):
+    def __init__(self, parent, storage, protocol, lookups):
+        super().__init__(parent)
+        self.setWindowTitle("Оборудование протокола")
+        self.resize(1100, 620)
+        self.storage = storage
+        self.protocol = protocol
+        self.lookups = lookups
+        self.day = iso_date(protocol.fields["verification_date"].value)
+        box = QVBoxLayout(self)
+        box.setContentsMargins(18, 16, 18, 16)
+        box.addWidget(label(f"Оборудование · {protocol.number}", "heading"))
+        box.addWidget(label(f"Дата поверки: {self.day or 'уточняется'}. Выберите позицию, чтобы увидеть найденные карточки."))
+        self.items, self.item_model = table(("Средство", "Номер из Excel", "Заводской №", "Статус"), (345, 160, 112))
+        box.addWidget(self.items, 2)
+        self.note = label("")
+        box.addWidget(self.note)
+        self.candidates, self.candidate_model = table(
+            ("Карточка", "Тип", "Заводской №", "Модель", "Поверена", "Действует до", "Сведения"),
+            (165, 85, 104, 150, 100, 100)
+        )
+        box.addWidget(self.candidates, 2)
+        actions = QHBoxLayout()
+        self.select_btn = button("Подтвердить выбранную карточку", self.choose, primary=True)
+        actions.addWidget(self.select_btn)
+        actions.addWidget(button("Открыть карточку", self.open_card))
+        actions.addStretch()
+        actions.addWidget(button("Закрыть", self.accept))
+        box.addLayout(actions)
+        self.items.selectionModel().currentChanged.connect(self.refresh_candidates)
+        self.candidates.selectionModel().currentChanged.connect(self.refresh_button)
+        self.refresh_items()
+
+    def lookup(self, item):
+        return self.lookups.get(lookup_key(item, self.day.isoformat())) if item and self.day else None
+
+    def refresh_items(self, current=None):
+        entries = self.storage.entries()
+        rows = []
+        for item in self.protocol.equipment:
+            live = self.lookup(item)
+            resolved, issue = resolve(item, entries, self.day, live)
+            status = (f"Проверено · до {resolved.valid_until}" if resolved and live and live.state in {"found", "choice"}
+                      else "Локальное подтверждение" if resolved else issue)
+            rows.append((item, (item.name or item.description, item.source_id, item.serial, status)))
+        self.item_model.update(rows)
+        if rows:
+            index = next((i for i, row in enumerate(rows) if row[0] == current), 0)
+            self.items.selectRow(index)
+        self.refresh_candidates()
+
+    def refresh_candidates(self, *_):
+        item = selected(self.items)
+        live = self.lookup(item)
+        candidates = live.candidates if live else ()
+        note = live.message if live and live.message else (
+            "Карточки получены из ФИФ ОЕИ." if live else "Запустите «Проверить данные» для запроса в ФИФ ОЕИ."
+        )
+        self.note.setText(note + (f" · {item.source}" if item else ""))
+        self.candidate_model.update([
+            (c, (c.entry.identifier or c.entry.public_id, c.entry.type_number, c.entry.registry_serial,
+                 c.entry.model, c.entry.valid_from,
+                 c.entry.valid_until, " · ".join(filter(None, (c.status, c.entry.scheme)))))
+            for c in candidates
+        ])
+        if candidates and live.state != "choice":
+            self.candidates.selectRow(0)
+        self.refresh_button()
+
+    def refresh_button(self, *_):
+        candidate = selected(self.candidates)
+        live = self.lookup(selected(self.items))
+        self.select_btn.setEnabled(bool(candidate and candidate.eligible and live and live.state == "choice"))
+
+    def open_card(self):
+        candidate = selected(self.candidates)
+        if candidate:
+            entry = candidate.entry
+            base = API + "mieta/" if entry.category == "mieta" else PUBLIC_CARD
+            QDesktopServices.openUrl(QUrl(base + quote(entry.public_id, safe="")))
+
+    def choose(self):
+        item = selected(self.items)
+        candidate = selected(self.candidates)
+        if not candidate or not candidate.eligible:
+            return
+        entry = candidate.entry
+        form = Form(self, "Подтверждение карточки",
+                    f"{entry.identifier or entry.public_id} · {entry.model} · {entry.scheme or entry.type_number}",
+                    size=(650, 310))
+        form.confirmation(self.storage.setting("confirmer"))
+        form.validate = lambda values: confirmation_values(form, values)
+        if form.exec():
+            evidence, confirmer = confirmation_values(form, form.values())
+            self.storage.save_equipment_choice(replace(entry, evidence=evidence, confirmer=confirmer))
+            self.storage.set_setting("confirmer", confirmer)
+            self.refresh_items(item)
+
+
 class RegistryDialog(QDialog):
     def __init__(self, parent, storage, items=()):
         super().__init__(parent)
@@ -191,7 +291,7 @@ class RegistryDialog(QDialog):
         box = QVBoxLayout(self)
         box.setContentsMargins(18, 16, 18, 16)
         box.addWidget(label("Справочник средств поверки", "heading"))
-        box.addWidget(label("Локальная база подтверждений. Онлайн-проверка не выполнена. "
+        box.addWidget(label("Локальная база подтверждений. Автоматические результаты доступны в карточке протокола. "
                             "Сверьте конкретную единицу и даты поверки в официальной карточке."))
         row = QHBoxLayout()
         self.search = QLineEdit()

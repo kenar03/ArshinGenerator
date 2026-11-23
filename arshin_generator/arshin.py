@@ -140,7 +140,7 @@ class Schema:
 
 
 def format_packets(results: list[Result], schema: Schema, limit: int = TARGET_BYTES):
-    if not results or any(r.issues for r in results):
+    if not results or any(r.blockers for r in results):
         raise ValueError("В пакет можно включить только проверенные рабочие результаты.")
     if len({(r.identity[0], r.identity[1].upper(), r.identity[2]) for r in results}) != len(results):
         raise ValueError("В пакете обнаружены одинаковые результаты.")

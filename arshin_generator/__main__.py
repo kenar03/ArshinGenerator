@@ -44,7 +44,7 @@ def main(argv=None):
             raise ValueError("Эта папка данных занята другой копией приложения.")
         storage = Storage(data / "arshin.sqlite3")
         schema = Schema()
-        window = MainWindow(storage, schema)
+        window = MainWindow(storage, schema, online=not arguments.smoke_check)
     except Exception as exc:
         logging.exception("Ошибка запуска")
         if arguments.smoke_check:
@@ -67,7 +67,7 @@ def main(argv=None):
             report = {"version": VERSION, "data": str(data), "schema": schema.hash,
                       "previous": previous, "input_folder": storage.setting("input_folder"),
                       "protocols": len(window.protocols),
-                      "instruments": len(window.results), "ready": sum(not r.issues for r in window.results)}
+                      "instruments": len(window.results), "ready": sum(not r.blockers for r in window.results)}
             arguments.smoke_check.write_text(json.dumps(report, ensure_ascii=False), encoding="utf-8")
             app.quit()
 

@@ -25,6 +25,9 @@ class Equipment:
     serial: str = ""
     name: str = ""
     valid_hint: str = ""
+    category: str = ""
+    type_number: str = ""
+    registration: str = ""
 
 
 @dataclass(frozen=True)
@@ -33,6 +36,7 @@ class ElementReading:
     status: str
     complete: bool
     source: str
+    measurements: tuple = ()
 
 
 @dataclass
@@ -63,6 +67,9 @@ class Protocol:
     proposed_modification: str = ""
     modification_prefixes: tuple[str, ...] = ()
     evidence: str = ""
+    report_outcome: str = ""
+    conclusion_outcome: str = ""
+    notices: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -82,6 +89,9 @@ class RegistryEntry:
     confirmer: str
     confirmed_at: str = ""
     id: int = 0
+    public_id: str = ""
+    scheme: str = ""
+    model: str = ""
 
 
 @dataclass
@@ -92,13 +102,18 @@ class Result:
     equipment: list[RegistryEntry] = field(default_factory=list)
     issues: list[str] = field(default_factory=list)
     candidate: str = ""
+    shared_issues: tuple[str, ...] = ()
 
     def value(self, name: str) -> Scalar:
         return self.fields[name].value if name in self.fields else None
 
     @property
     def status(self) -> str:
-        return REVIEW if self.issues else READY
+        return REVIEW if self.issues or self.shared_issues else READY
+
+    @property
+    def blockers(self) -> tuple[str, ...]:
+        return self.shared_issues + tuple(self.issues)
 
     @property
     def identity(self) -> tuple:
