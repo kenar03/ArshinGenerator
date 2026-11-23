@@ -108,18 +108,3 @@ def structured_candidate(model: str, version: str, ex: str) -> str:
     separator = "" if version.startswith(("/", "-")) else "-"
     suffix = ex.strip("-")
     return modification_candidate(f"{model}{separator}{version}" + (f"-{suffix}" if suffix else ""))
-
-
-def confirmed_rtd_modification(type_number: str, model: str, execution: str, ex: str) -> str:
-    model = family_prefix(model.translate(DASHES))
-    families = {
-        "ТСП": {"0193", "1293", "1393", "1193", "1195", "0196", "0395", "0397"},
-        "ТСМ": {"0193", "1293", "1193", "1393", "0196", "0395"},
-    }
-    family, _, code = model.partition("-")
-    if type_number != "56560-14" or code not in families.get(family, ()):
-        return ""
-    known_order_suffix = model == "ТСП-0193" and execution == "17М/РЭД"
-    if not (re.fullmatch(r"[0-9]{2}", execution) or known_order_suffix) or ex.strip("-") not in {"", "Ex"}:
-        return ""
-    return structured_candidate(model, execution, ex)

@@ -1,11 +1,14 @@
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
+from collections import OrderedDict
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timezone
+from email.utils import parsedate_to_datetime
 from http.client import HTTPException
 import json
 import logging
 import re
 import sys
+from threading import Lock
 from time import monotonic, sleep
 from urllib.parse import quote, urlencode
 from urllib.error import HTTPError, URLError
@@ -19,6 +22,7 @@ PUBLIC_CARD = "https://fgis.gost.ru/fundmetrology/cm/results/"
 TYPE_NUMBER = re.compile(r"[0-9]{2,9}-[0-9]{2,4}")
 PAGE_SIZE = 50
 MAX_RECORDS = 250
+REGISTRY_TTL = 15 * 60
 
 
 class PublicDataError(ValueError):
@@ -27,6 +31,54 @@ class PublicDataError(ValueError):
     def __init__(self, message, *, kind="response"):
         super().__init__(message)
         self.kind = kind
+
+
+class SharedResponses:
+    """Share in-flight requests and reuse completed responses for a bounded time."""
+
+    def __init__(self, ttl=REGISTRY_TTL, clock=monotonic, *, cache_errors=False):
+        self.ttl = ttl
+        self.clock = clock
+        self.cache_errors = cache_errors
+        self.lock = Lock()
+        self.ready = OrderedDict()
+        self.pending = {}
+
+    def get(self, key, fetch):
+        with self.lock:
+            now = self.clock()
+            while self.ready and next(iter(self.ready.values()))[0] <= now:
+                self.ready.popitem(last=False)
+            if key in self.ready:
+                return self.ready[key][1].result()
+            existing = self.pending.get(key)
+            if existing is None:
+                self.pending[key] = future = Future()
+        if existing is not None:
+            return existing.result()
+        try:
+            future.set_result(fetch())
+        except BaseException as exc:
+            future.set_exception(exc)
+        finally:
+            with self.lock:
+                if self.cache_errors or future.exception() is None:
+                    self.ready[key] = self.clock() + self.ttl, future
+                self.pending.pop(key)
+        return future.result()
+
+
+def _retry_delay(header, attempt):
+    if header.isdecimal() and len(header) < 9:
+        return int(header)
+    if header:
+        try:
+            until = parsedate_to_datetime(header)
+            if until.tzinfo is not None:
+                return max(0, (until - datetime.now(timezone.utc)).total_seconds())
+        except (ValueError, TypeError, OverflowError):
+            pass
+    return 2 ** attempt
 
 
 def public_date(value) -> str:
@@ -40,10 +92,12 @@ def public_date(value) -> str:
 
 
 class PublicClient:
-    def __init__(self, opener=None, budget=100):
+    def __init__(self, opener=None, budget=100, *, type_cache=None, response_cache=None):
         self.opener = opener or urlopen
         self.native = opener is None and sys.platform == "win32"
         self.deadline = monotonic() + budget
+        self.type_cache = type_cache
+        self.response_cache = response_cache
 
     def _request(self, url, timeout):
         agent = "ArshinGenerator/1.2"
@@ -57,6 +111,12 @@ class PublicClient:
             return response.read(MAX_RESPONSE + 1)
 
     def get(self, resource, filters=None):
+        if self.response_cache is not None and resource != "mit":
+            key = resource, tuple(sorted((filters or {}).items()))
+            return self.response_cache.get(key, lambda: self._get(resource, filters))
+        return self._get(resource, filters)
+
+    def _get(self, resource, filters=None):
         url = API + resource
         if filters:
             url += "?" + urlencode(filters)
@@ -81,10 +141,10 @@ class PublicClient:
                     kind = "connection" if exc.code in {401, 403, 407, 429} or 500 <= exc.code <= 599 else "response"
                     raise PublicDataError(f"Государственный реестр вернул HTTP {exc.code}.", kind=kind) from exc
                 retry_after = str(exc.headers.get("Retry-After", "")) if exc.headers else ""
-                delay = int(retry_after) if retry_after.isdecimal() and len(retry_after) < 9 else 2 ** attempt
+                delay = max(1, _retry_delay(retry_after, attempt))
                 if delay > min(15, self.deadline - monotonic()):
                     raise PublicDataError("Государственный реестр просит повторить запрос позже.", kind="connection") from exc
-                sleep(max(1, delay))
+                sleep(delay)
             except (URLError, OSError, HTTPException) as exc:
                 reason = getattr(exc, "reason", exc)
                 detail = re.sub(r"(https?://)[^/\s]+@", r"\1[скрыто]@", str(reason))
@@ -94,7 +154,10 @@ class PublicClient:
                                 detail, monotonic() - started)
                 if attempt == 2 or (code is not None and code not in {12002, 12007, 12029, 12030, 12031, 12152}):
                     raise PublicDataError("Нет ответа от государственного реестра.", kind="connection") from exc
-                sleep(2 ** attempt)
+                delay = 2 ** attempt
+                if delay >= self.deadline - monotonic():
+                    raise PublicDataError("Нет ответа от государственного реестра.", kind="connection") from exc
+                sleep(delay)
             except (ValueError, TypeError, KeyError) as exc:
                 logging.warning("ФИФ ОЕИ %s GET %s %s: %s", transport, url, type(exc).__name__, exc)
                 raise PublicDataError("Государственный реестр вернул неполные данные.") from exc
@@ -127,8 +190,16 @@ class PublicClient:
 
 
 def exact_type(client: PublicClient, number: str) -> dict | None:
-    matches = [item for item in client.items("mit", number=number) if item.get("number") == number]
-    return matches[0] if len(matches) == 1 and matches[0].get("mit_uuid") else None
+    def fetch():
+        matches = [item for item in client.items("mit", number=number) if item.get("number") == number]
+        return matches[0] if len(matches) == 1 and matches[0].get("mit_uuid") else None
+
+    def shared():
+        cache = getattr(client, "type_cache", None)
+        return cache.get(number, fetch) if cache is not None else fetch()
+
+    wave = getattr(client, "response_cache", None)
+    return wave.get(("mit", number), shared) if wave is not None else shared()
 
 
 def official_type_title(number: str, client: PublicClient | None = None) -> str:

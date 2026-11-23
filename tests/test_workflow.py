@@ -1,28 +1,34 @@
 from contextlib import closing
 from dataclasses import replace
+from datetime import date
 from hashlib import sha256
 from pathlib import Path
+from posixpath import normpath
 import sqlite3
 from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
+from zipfile import ZipFile
 
+from lxml import etree
 from openpyxl import Workbook
 
 from arshin_generator.arshin import NS, SCHEMA_HASH, Schema, export, format_packets, open_xml, signature, split_paths
-from arshin_generator.confirmations import get_confirmation, legacy_key, with_guards
+from arshin_generator.confirmations import get_confirmation, individual_key, legacy_key, protocol_key, with_guards
+from arshin_generator.dates import expiry_before_anniversary
 from arshin_generator.domain import Datum, RegistryEntry
-from arshin_generator.laboratory import expiry_rule
-from arshin_generator.normalization import confirmed_rtd_modification, modification_candidate, metrologist, serial_list
+from arshin_generator.normalization import modification_candidate, metrologist, serial_list
 from arshin_generator.public_registry import exact_records
 from arshin_generator.readers import read_protocol
+from arshin_generator.readers.rtd import confirmed_rtd_modification
 from arshin_generator.registry import iso_date, resolve
 from arshin_generator.storage import Storage
-from arshin_generator.validation import INVALID_STICKER, check, individual_key, modification_key, protocol_key
+from arshin_generator.validation import INVALID_STICKER, check, empty_protocol_issues
 
 ROOT = Path(__file__).resolve().parents[1]
 MATERIALS = ROOT / "Файлы для задания"
 SAMPLE = MATERIALS / "П-Т1-з2-1260-26.xlsm"
+INCOMPLETE = MATERIALS / "П-Т1-з2-1261-26.xlsm"
 TEMPLATE = MATERIALS / "П-Т1-з2-!!!!!-26.xltm"
 JOURNAL = MATERIALS / "Журнал.xlsx"
 XML_EXAMPLE = MATERIALS / "arshin_export_example.xml"
@@ -84,7 +90,7 @@ class NormalizationTests(unittest.TestCase):
 
 class MaterialTests(unittest.TestCase):
     def test_supplied_workbooks_are_read_only(self):
-        before = {path: sha256(path.read_bytes()).hexdigest() for path in (SAMPLE, TEMPLATE, JOURNAL)}
+        before = {path: sha256(path.read_bytes()).hexdigest() for path in (SAMPLE, INCOMPLETE, TEMPLATE, JOURNAL)}
         sample = read_protocol(SAMPLE)
         self.assertEqual(sample.digest, before[SAMPLE])
         self.assertEqual(sample.reader, "rtd-v1")
@@ -103,6 +109,7 @@ class MaterialTests(unittest.TestCase):
         self.assertTrue(all(r.value("outcome") == "pass" for r in results))
         for key, value in {
             "modification": "ТСМ-0193-01", "sign_pass": True, "sign_mi": False,
+            "valid_date": "2030-11-21",
             "owner": 'ООО "ЧТП"', "metrologist": "Еремеева А.В.", "verification_date": "2026-11-22",
             "temperature": "21,6 °C", "pressure": "99,83 кПа", "humidity": "30 %", "other": "220 В",
             "type_number": "56560-14", "method": SAMPLE_METHOD,
@@ -110,11 +117,20 @@ class MaterialTests(unittest.TestCase):
             with self.subTest(field=key):
                 self.assertEqual([r.value(key) for r in results], [value] * 25)
         self.assertTrue(all(not r.value("sticker") for r in results))
+        self.assertIn("ячейку B1", " ".join(results[0].blockers))
         self.assertFalse(any("учебн" in issue.casefold() for r in results for issue in r.issues))
         template = read_protocol(TEMPLATE)
         self.assertEqual(template.reader, sample.reader)
         self.assertEqual(template.instruments, [])
         self.assertTrue(template.issues)
+        self.assertIn("ячейку B5", " ".join(empty_protocol_issues(template, {}, {})))
+        incomplete = read_protocol(INCOMPLETE)
+        self.assertEqual(len(incomplete.instruments), 25)
+        self.assertEqual(sum(len(item.elements) for item in incomplete.instruments), 50)
+        records = check([incomplete], {}, [], check_registry=False)
+        self.assertTrue(all(result.incomplete_measurements for result in records))
+        for cell in ("B1", "B5", "B6", "B7"):
+            self.assertIn(f"ячейку {cell}", " ".join(records[0].blockers))
         self.assertTrue(read_protocol(JOURNAL).unsupported)
         self.assertEqual(before, {path: sha256(path.read_bytes()).hexdigest() for path in before})
 
@@ -133,8 +149,9 @@ class MaterialTests(unittest.TestCase):
 
 
 def fixture(path, number, serial, *, dual=False, outcome="СООТВЕТСТВУЕТ", complete=True,
-            count=1, print_limit=None, sticker="01234567890", owner="Синтетический владелец", interval=None,
-            method="Методика для испытаний XML"):
+            count=1, print_limit=None, sticker="01234567890", owner="Синтетический владелец", interval=4,
+            method="Методика для испытаний XML", day=date(2026, 1, 15), kind="первичной",
+            temperature=21.3, execution="01", ex="", inconsistent=None, positive_report=None):
     book = Workbook()
     t = book.active
     t.title = "Таблицы"
@@ -143,14 +160,16 @@ def fixture(path, number, serial, *, dual=False, outcome="СООТВЕТСТВУ
     e = book.create_sheet("Эталоны")
     o = book.create_sheet("Оборудование")
     book.create_sheet("Списки")
-    from datetime import date
+    fail = outcome == "НЕ СООТВЕТСТВУЕТ"
+    positive = not fail if positive_report is None else positive_report
+    conclusion = "годны" if positive else "не годны"
     cells = {
-        "B1": "первичной", "D1": number, "A2": "Заводские номера", "B5": 21.3, "B6": 99.3,
+        "B1": kind, "D1": number, "A2": "Заводские номера", "B5": temperature, "B6": 99.3,
         "B7": 30, "B8": 220, "A10": "г/р № 10000-10 Учебное средство № 001",
-        "B19": f"№{serial}", "C19": "годны к применению, соответствуют",
+        "B19": f"№{serial}", "C19": f"{conclusion} к применению",
         "B20": sticker, "B21": "-", "B22": "V", "B23": "Тестова Анна Викторовна",
-        "B24": date(2026, 1, 15), "H26": "Схема соединения", "J26": "Кол-во",
-        "A27": "ТСП-0193", "B27": "01", "L27": "56560-14", "H27": "2х4" if dual else "4",
+        "B24": day, "H26": "Схема соединения", "J26": "Кол-во",
+        "A27": "ТСП-0193", "B27": execution, "C27": ex, "L27": "56560-14", "H27": "2х4" if dual else "4",
         "J27": count, "K27": interval, "A34": "Серийный №",
     }
     for cell, value in cells.items():
@@ -159,7 +178,9 @@ def fixture(path, number, serial, *, dual=False, outcome="СООТВЕТСТВУ
     r["J24"] = owner
     r["A32"] = "Методика поверки:"
     r["A33"] = method
-    r["A45"] = "Заключение: СИ годны к применению."
+    r["A45"] = f"Заключение: СИ {conclusion} к применению."
+    if fail and not positive:
+        t["F20"] = "Отклонение за пределами допуска"
     r["A61"] = "ТСП-0193-01-100"
     e["G1"] = "Поверен до"
     o["E1"] = "Строка для протокола"
@@ -180,10 +201,40 @@ def fixture(path, number, serial, *, dual=False, outcome="СООТВЕТСТВУ
             for row in (33 + block * 2, 34 + block * 2):
                 for col in (3, 4, 7, 8, 9, 10):
                     if complete or col != 7:
-                        t.cell(row, col, 100)
+                        outside = (fail and part == per_device) != (inconsistent == (instrument, part))
+                        t.cell(row, col, 101 if col == 8 and outside else 100)
     book.save(path)
     book.close()
     return read_protocol(path)
+
+
+def sample_copy_with_kind(path, kind):
+    """Make an isolated test copy, retaining the original formula values and macros."""
+    namespace = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    rels_uri = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+    with ZipFile(SAMPLE) as original, ZipFile(path, "w") as copied:
+        workbook = etree.fromstring(original.read("xl/workbook.xml"))
+        sheet = workbook.find(f".//{{{namespace}}}sheet[@name='Таблицы']")
+        rel_id = sheet.get(f"{{{rels_uri}}}id")
+        rels = etree.fromstring(original.read("xl/_rels/workbook.xml.rels"))
+        target = next(rel.get("Target") for rel in rels if rel.get("Id") == rel_id)
+        name = target.lstrip("/") if target.startswith("/") else normpath(f"xl/{target}")
+        for item in original.infolist():
+            contents = original.read(item)
+            if item.filename == name:
+                sheet = etree.fromstring(contents)
+                row = sheet.find(f".//{{{namespace}}}row[@r='1']")
+                cell = row.find(f"{{{namespace}}}c[@r='B1']")
+                if cell is None:
+                    cell = etree.Element(f"{{{namespace}}}c", r="B1")
+                    row.insert(1, cell)
+                for child in list(cell):
+                    cell.remove(child)
+                cell.set("t", "inlineStr")
+                etree.SubElement(etree.SubElement(cell, f"{{{namespace}}}is"), f"{{{namespace}}}t").text = kind
+                contents = etree.tostring(sheet, encoding="utf-8")
+            copied.writestr(item, contents)
+    return path
 
 
 def equipment():
@@ -192,18 +243,8 @@ def equipment():
                          "2025-01-01", "2027-01-01", "Условная запись для теста", "Тест")
 
 
-def approve(storage, p, *, outcome="pass", sticker="01234567890", modification="ТСП-0193-01"):
-    evidence, user = "Условное подтверждение для теста", "Тест"
-    storage.save_confirmation("modification", modification_key(p), {"modification": modification}, evidence, user)
-    storage.save_confirmation("protocol", protocol_key(p),
-                              {"sign_cipher": "ВЯ", "calibration": False, "valid_date": "2027-01-14",
-                               "one_result": True}, evidence, user)
-    for i in p.instruments:
-        storage.save_confirmation("instrument", individual_key(p, i.serial),
-                                  {"outcome": outcome, "sticker": sticker,
-                                   "sign_pass": True, "sign_mi": False,
-                                   "reasons": "Отказ второго элемента" if outcome == "fail" else ""},
-                                  evidence, user)
+def seed_lab(storage):
+    storage.save_laboratory({"sign_cipher": "ВЯ", "calibration": False}, "Тест")
 
 
 class WorkflowTests(unittest.TestCase):
@@ -217,7 +258,7 @@ class WorkflowTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def checked(self, *protocols):
-        return check(protocols, self.storage.confirmations(), self.storage.entries())
+        return check(protocols, self.storage.confirmations(), self.storage.entries(), laboratory=self.storage.laboratory())
 
     def test_batch_corrections_are_atomic(self):
         rows = [("protocol", "A", {"sign_cipher": "ТСТ"}, "Тест", "Тест"),
@@ -229,49 +270,46 @@ class WorkflowTests(unittest.TestCase):
         self.storage.save_confirmations(rows)
         self.assertEqual(len(self.storage.confirmations()), 2)
 
-    def test_lab_defaults_precedence_and_type_scoped_expiry(self):
-        protocol = fixture(self.root / "source.xlsx", "ТЕСТ-ПРАВИЛО", "001B6", interval=4)
-        self.storage.save_equipment(equipment())
-        rule = expiry_rule({"type_number": "56560-14", "from_date": "2026-01-01",
-                            "until_date": "2026-12-31", "years": "4", "document": "Тестовое правило"})
-        settings = {"sign_cipher": "ТСТ", "calibration": False, "verification_type": "2",
-                    "expiry_rules": {"56560-14": rule}}
+    def test_lab_defaults_leave_excel_kind_authoritative_and_ignore_legacy_expiry(self):
+        day = date(2026, 11, 23)
+        protocol = fixture(self.root / "source.xlsx", "ТЕСТ-СРОК", "001B6", day=day)
+        seed_lab(self.storage)
+        settings = {**self.storage.laboratory(), "verification_type": "2",
+                    "expiry_rules": {"56560-14": {"years": 2}}}
         self.storage.save_laboratory(settings, "Тест")
-        saved = Storage(self.storage.path).laboratory()
-        self.assertEqual(saved, settings)
+        self.storage.save_confirmation("protocol", protocol_key(protocol),
+            {"valid_date": "2027-01-14", "verification_type": "2"}, "Старые сведения", "Тест")
+        self.storage.save_confirmation("expiry_exception", protocol_key(protocol),
+            {"valid_date": "2038-11-23"}, "Старое исключение", "Тест")
+        self.storage.save_confirmation("instrument", individual_key(protocol, "001B6"),
+            {"valid_date": "2028-11-23", "outcome": "fail"}, "Старые сведения", "Тест")
+        self.storage.save_equipment(equipment())
+        result = self.checked(protocol)[0]
+        self.assertEqual(result.value("verification_type"), "1")
+        self.assertIs(result.value("calibration"), False)
+        self.assertEqual(result.value("outcome"), "pass")
+        self.assertEqual(result.value("valid_date"), "2030-11-22")
+        self.assertIn("Таблицы!B24 и K27", result.fields["valid_date"].source)
+        self.assertFalse(result.blockers)
 
-        def result():
-            return check([protocol], {}, self.storage.entries(), laboratory=saved)[0]
-
-        actual = result()
-        self.assertEqual(actual.value("verification_type"), "1")
-        self.assertIs(actual.value("calibration"), False)
-        self.assertEqual(actual.value("valid_date"), "2030-01-14")
-        self.assertIn("Тестовое правило", actual.fields["valid_date"].source)
-        protocol.fields["verification_type"] = Datum(None, "Таблицы!B1", "неизвестное значение")
-        self.assertIsNone(result().value("verification_type"))
         protocol.fields["verification_type"] = Datum(None, "Таблицы!B1")
-        self.assertEqual(result().value("verification_type"), "2")
-        protocol.fields["interval"] = Datum("3", "Таблицы!K27")
-        self.assertIsNone(result().value("valid_date"))
-        protocol.fields["interval"] = Datum("4", "Таблицы!K27")
-        protocol.fields["calibration"] = Datum(True, "Протокол")
-        self.assertIs(result().value("calibration"), True)
-        self.assertIsNone(result().value("valid_date"))
+        result = self.checked(protocol)[0]
+        self.assertIsNone(result.value("verification_type"))
+        self.assertIn("ячейку B1", " ".join(result.blockers))
 
-    def test_modification_confirmation_uses_code_and_execution_without_length(self):
-        p = fixture(self.root / "source.xlsx", "ТЕСТ-МОДИФИКАЦИЯ", "011B6")
-        p.modification_parts = ("ТСП-0193", "17M", "Ex")
-        p.fields["modification"] = Datum("", "")
-        self.storage.save_confirmation("modification", modification_key(p), {"modification": "ТСП-0193-17M-Ex"},
-                                       "Подтверждённое исполнение", "Тест")
-        p.fields["marking"] = Datum("ТСП-0193-17M-Ex-225", "Отчёт!A61")
-        self.assertEqual(self.checked(p)[0].value("modification"), "ТСП-0193-17M-Ex")
-        p.modification_parts = ("ТСП-0193", "18M", "Ex")
-        self.assertIsNone(self.checked(p)[0].value("modification") or None)
+    def test_modification_comes_from_structured_excel_values(self):
+        known = fixture(self.root / "known.xlsx", "ТЕСТ-ИСПОЛНЕНИЕ", "011B6", execution="01Б", ex="Ex-")
+        self.assertEqual(known.fields["modification"].value, "ТСП-0193-01Б-Ex")
+        unknown = fixture(self.root / "unknown.xlsx", "ТЕСТ-АЛЬТЕРНАТИВА", "012B6", execution="01Заказ")
+        self.storage.save_confirmation("protocol", protocol_key(unknown),
+            {"modification": "ТСП-0193-Произвольное"}, "Старое значение", "Тест")
+        record = self.checked(unknown)[0]
+        self.assertFalse(record.value("modification"))
+        self.assertIn("Не удалось определить модификацию по данным протокола", " ".join(record.blockers))
+        self.assertIn("A27:C27", " ".join(record.blockers))
 
     def test_full_batch_without_stickers_roundtrips_with_method_and_equipment_identity(self):
-        protocol = fixture(self.root / "batch.xlsx", "ТЕСТ-ПАКЕТ", "001B6", count=25, sticker="",
+        protocol = fixture(self.root / "batch.xlsx", "ТЕСТ-ПАКЕТ", "001B6", count=25, dual=True, sticker="",
                            method="  ГОСТ 8.461-2009\n Термопреобразователи   СИ  ")
         self.storage.save_equipment(replace(equipment(), identity_kind="inventoryNum"))
         self.storage.save_confirmation("protocol", protocol_key(protocol), {
@@ -285,6 +323,8 @@ class WorkflowTests(unittest.TestCase):
         ns = {"g": NS}
         self.assertFalse(issues)
         self.assertEqual(len(root), 25)
+        self.assertEqual([r.findtext(f".//{{{NS}}}manufactureNum") for r in root],
+                         [f"{i:03d}B6" for i in range(1, 26)])
         self.assertEqual(root.xpath("g:result/g:docTitle/text()", namespaces=ns),
                          ["ГОСТ 8.461-2009 Термопреобразователи СИ"] * 25)
         self.assertEqual(root.xpath("g:result/g:means/g:mis/g:mi/g:inventoryNum/text()", namespaces=ns), ["001"] * 25)
@@ -302,7 +342,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertFalse(issues)
         self.assertEqual(root.findtext(f".//{{{NS}}}stickerNum"), "00А-12")
         p.fields["sticker"] = Datum("A" * 129, "Таблицы!B20")
-        self.assertIn(INVALID_STICKER, self.checked(p)[0].blockers)
+        self.assertIn(INVALID_STICKER, " ".join(self.checked(p)[0].blockers))
 
     def test_batch_sticker_requires_a_specific_instrument(self):
         p = fixture(self.root / "batch.xlsx", "ТЕСТ-НАКЛЕЙКА", "001B6", sticker="00А-12", count=2)
@@ -310,7 +350,7 @@ class WorkflowTests(unittest.TestCase):
         self.storage.save_confirmation("protocol", protocol_key(p), {
             "sign_cipher": "ТСТ", "calibration": False, "valid_date": "2027-01-14",
         }, "Тест", "Тест")
-        self.assertTrue(all("sticker" in r.repair_fields for r in self.checked(p)))
+        self.assertTrue(all("Один номер наклейки указан на партию" in " ".join(r.blockers) for r in self.checked(p)))
         self.storage.save_confirmation("instrument", individual_key(p, p.instruments[1].serial),
                                        {"sticker": "00А-12"}, "Документ", "Тест")
         payload, _ = format_packets(self.checked(p), self.schema)[0]
@@ -320,29 +360,41 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(root[1].findtext(f".//{{{NS}}}stickerNum"), "00А-12")
 
     def test_dual_group_and_negative(self):
+        self.storage.save_equipment(equipment())
+        seed_lab(self.storage)
         p = fixture(self.root / "two.xlsm", "ТЕСТ-ДВА", "019B6", dual=True, outcome="НЕ СООТВЕТСТВУЕТ")
-        self.assertEqual(p.issues, [])
         self.assertEqual(len(p.instruments), 1)
         self.assertEqual([r.index for r in p.instruments[0].elements], [1, 2])
-        self.assertEqual(self.checked(p)[0].candidate, "fail")
-        self.storage.save_equipment(equipment())
-        approve(self.storage, p)
-        self.assertTrue(any("противоречит" in q for q in self.checked(p)[0].issues))
-        approve(self.storage, p, outcome="fail")
         result = self.checked(p)[0]
+        self.assertEqual(result.value("outcome"), "fail")
         self.assertFalse(result.blockers)
         payload, _ = format_packets([result], self.schema)[0]
         self.assertIn(b"gost:inapplicable", payload)
         self.assertNotIn(b"gost:stickerNum", payload)
         self.assertNotIn(b"gost:validDate", payload)
 
+        opposite = fixture(self.root / "opposite.xlsx", "ТЕСТ-ПРОТИВОРЕЧИЕ", "019B6", dual=True,
+                           outcome="НЕ СООТВЕТСТВУЕТ", positive_report=True)
+        self.assertIn("заключение расходится с измерениями", " ".join(self.checked(opposite)[0].blockers))
+        stale = fixture(self.root / "stale.xlsx", "ТЕСТ-КЭШ-ФОРМУЛЫ", "019B6", dual=True, inconsistent=(0, 2))
+        self.assertIn("расходится с допусками", " ".join(self.checked(stale)[0].blockers))
+
+        positive = fixture(self.root / "positive.xlsx", "ТЕСТ-ДВА-ПРИГОДЕН", "019B6", dual=True, sticker="")
+        result = self.checked(positive)[0]
+        self.assertFalse(result.blockers)
+        root, issues, _ = self.schema.inspect(format_packets([result], self.schema)[0][0])
+        self.assertFalse(issues)
+        self.assertEqual(len(root), 1)
+        self.assertEqual(root.findtext(f".//{{{NS}}}manufactureNum"), "019B6")
+
     def test_incomplete_measurements_block(self):
         p = fixture(self.root / "incomplete.xlsx", "ТЕСТ-НЕПОЛНЫЙ", "023B6", complete=False)
         self.storage.save_equipment(equipment())
-        approve(self.storage, p)
+        seed_lab(self.storage)
         result = self.checked(p)[0]
-        self.assertFalse(result.candidate)
-        self.assertTrue(any("неполные" in q for q in result.issues))
+        self.assertFalse(result.value("outcome"))
+        self.assertTrue(result.incomplete_measurements)
+        self.assertEqual(sum("измерения" in issue for issue in result.issues), 1)
 
     def test_exact_equipment_and_expiration(self):
         p = fixture(self.root / "match.xlsx", "ТЕСТ-РЕЕСТР", "035K6")
@@ -356,10 +408,10 @@ class WorkflowTests(unittest.TestCase):
 
     def test_export_two_protocols_readback_and_history(self):
         p = fixture(self.root / "one.xlsx", "ТЕСТ-1", "001B6")
-        q = fixture(self.root / "two.xlsx", "ТЕСТ-2", "002B6")
+        q = fixture(self.root / "two.xlsx", "ТЕСТ-2", "002B6", sticker="01234567891")
         self.storage.save_equipment(equipment())
-        approve(self.storage, p)
-        approve(self.storage, q, sticker="01234567891")
+        seed_lab(self.storage)
+        seed_lab(self.storage)
         results = self.checked(p, q)
         self.assertEqual([r.blockers for r in results], [(), ()])
         big_packets = format_packets(results, self.schema)
@@ -394,7 +446,7 @@ class WorkflowTests(unittest.TestCase):
 
     def test_positive_without_sticker_or_registry_and_wrong_fio(self):
         p = fixture(self.root / "one.xlsx", "ТЕСТ-НАКЛЕЙКА", "034C6")
-        approve(self.storage, p, sticker="")
+        seed_lab(self.storage)
         p.fields["metrologist"] = Datum("Тестова Анна", "Таблицы!B23")
         results = self.checked(p)
         issues = " ".join(results[0].blockers)
@@ -407,7 +459,7 @@ class WorkflowTests(unittest.TestCase):
     def test_xml_layer_rejects_reversed_metrologist(self):
         p = fixture(self.root / "ready.xlsx", "ТЕСТ-ФИО", "034C6")
         self.storage.save_equipment(equipment())
-        approve(self.storage, p)
+        seed_lab(self.storage)
         results = self.checked(p)
         self.assertFalse(results[0].blockers)
         results[0].fields["metrologist"] = Datum("А.В. Тестова", "Таблицы!B23")
@@ -418,8 +470,8 @@ class WorkflowTests(unittest.TestCase):
         p = fixture(self.root / "one.xlsx", "ТЕСТ-А", "034C6")
         q = fixture(self.root / "two.xlsx", "ТЕСТ-Б", "034С6")
         self.storage.save_equipment(equipment())
-        approve(self.storage, p)
-        approve(self.storage, q, sticker="01234567891")
+        seed_lab(self.storage)
+        seed_lab(self.storage)
         results = self.checked(p, q)
         self.assertTrue(all(any("Повтор результата" in i for i in r.issues) for r in results))
         with self.assertRaises(ValueError):
@@ -428,14 +480,12 @@ class WorkflowTests(unittest.TestCase):
     def test_completed_workbook_exports_without_individual_outcome_confirmation(self):
         p = fixture(self.root / "automatic.xlsx", "ТЕСТ-АВТО", "056B6")
         self.storage.save_equipment(equipment())
-        self.storage.save_confirmation("modification", modification_key(p), {"modification": "ТСП-0193-01"},
-                                       "Описание типа", "Тест")
         fields = {"sign_cipher": "ВЯ", "calibration": False, "valid_date": "2027-01-14"}
         self.storage.save_confirmation("protocol", protocol_key(p), with_guards(p, fields),
                                        "Протокол", "Тест")
         result = self.checked(p)[0]
         self.assertEqual(result.value("outcome"), "pass")
-        self.assertIn("заключение отчёта Excel", result.fields["outcome"].source)
+        self.assertIn("Данные!", result.fields["outcome"].source)
         self.assertFalse(result.blockers)
         self.assertEqual(len(format_packets([result], self.schema)), 1)
 
@@ -472,7 +522,7 @@ class WorkflowTests(unittest.TestCase):
     def test_disk_audit_failure_rolls_back_export(self):
         p = fixture(self.root / "one.xlsx", "ТЕСТ-ОТКАТ", "034C6")
         self.storage.save_equipment(equipment())
-        approve(self.storage, p)
+        seed_lab(self.storage)
         results = self.checked(p)
 
         class NoAudit:
@@ -487,7 +537,7 @@ class WorkflowTests(unittest.TestCase):
     def test_existing_file_requires_permission_and_is_restored_on_audit_failure(self):
         protocol = fixture(self.root / "one.xlsx", "ТЕСТ-ЗАМЕНА", "034C6")
         self.storage.save_equipment(equipment())
-        approve(self.storage, protocol)
+        seed_lab(self.storage)
         packets = format_packets(self.checked(protocol), self.schema)
         path = self.root / "Выбранный файл.xml"
         path.write_bytes(b"previous contents")
@@ -504,10 +554,10 @@ class WorkflowTests(unittest.TestCase):
 
     def test_split_collision_rolls_back_parts_already_written(self):
         first = fixture(self.root / "first.xlsx", "ТЕСТ-1", "034C6")
-        second = fixture(self.root / "second.xlsx", "ТЕСТ-2", "035C6")
+        second = fixture(self.root / "second.xlsx", "ТЕСТ-2", "035C6", sticker="01234567891")
         self.storage.save_equipment(equipment())
-        approve(self.storage, first)
-        approve(self.storage, second, sticker="01234567891")
+        seed_lab(self.storage)
+        seed_lab(self.storage)
         results = self.checked(first, second)
         packets = format_packets(results, self.schema, max(len(format_packets([r], self.schema)[0][0]) for r in results))
         paths = split_paths(self.root, "Аршин", len(packets))
@@ -519,29 +569,33 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(self.storage.history(), [])
         self.assertTrue(all(not path.exists() for path in split_paths(self.root, "Аршин", len(packets))))
 
-    def test_confirmed_interval_corrects_saved_date_but_documents_can_define_exception(self):
-        protocol = fixture(self.root / "expiry.xlsx", "ТЕСТ-СРОК", "001B6", interval=4)
-        protocol.fields["verification_date"] = Datum("2026-11-23", "Таблицы!B24")
-        approve(self.storage, protocol)
-        rule = expiry_rule({"type_number": "56560-14", "from_date": "2026-01-01",
-                            "until_date": "", "years": "4", "document": "Тест, пункт 1"})
-        settings = {"expiry_rules": {"56560-14": rule}}
+    def test_expiry_calendar_and_invalid_rtd_inputs(self):
+        self.assertEqual(expiry_before_anniversary(date(2026, 11, 22), 4), date(2030, 11, 21))
+        self.assertEqual(expiry_before_anniversary(date(2026, 11, 23), 4), date(2030, 11, 22))
+        self.assertEqual(expiry_before_anniversary(date(2024, 2, 29), 4), date(2028, 2, 28))
+        with self.assertRaisesRegex(ValueError, "29 февраля"):
+            expiry_before_anniversary(date(2024, 2, 29), 1)
 
-        def result():
-            return check([protocol], self.storage.confirmations(), [], laboratory=settings,
-                         check_registry=False, require_public=True)[0]
+        for given, interval, expected in ((None, 4, "ячейку B24"), (date(2026, 11, 22), None, "ячейку K27"),
+                                           (date(2026, 11, 22), 1.5, "ячейку K27"), (date(2024, 2, 29), 1, "29 февраля")):
+            with self.subTest(given=given, interval=interval):
+                protocol = fixture(self.root / "expiry.xlsx", "ТЕСТ-СРОК", "001B6", day=given, interval=interval)
+                self.assertIn(expected, " ".join(self.checked(protocol)[0].blockers))
 
-        checked = result()
-        self.assertEqual(checked.value("valid_date"), "2030-11-22")
-        self.assertIn("пересчитана", " ".join(checked.warnings))
-        protocol.fields["valid_date"] = Datum("2030-11-23", "Сведения!B4")
-        self.assertIn("Дата окончания в Excel расходится", " ".join(result().blockers))
-        self.storage.save_confirmation("expiry_exception", protocol_key(protocol),
-            with_guards(protocol, {"valid_date": "2030-11-23"}), "Документ об исключении, пункт 3", "Тест")
-        checked = result()
-        self.assertEqual(checked.value("valid_date"), "2030-11-23")
-        self.assertIn("Документ об исключении", " ".join(checked.warnings))
-        self.assertFalse(checked.blockers)
+    def test_two_elements_require_same_serial_and_both_blocks(self):
+        from openpyxl import load_workbook
+        path = self.root / "channels.xlsx"
+        for cell, value, issue in (("G3", "020B6", "расходятся заводские номера"),
+                                   ("C3", 1, "повторный чувствительный элемент")):
+            with self.subTest(cell=cell):
+                fixture(path, "ТЕСТ-ЧЭ", "019B6", dual=True)
+                book = load_workbook(path)
+                book["Данные"][cell] = value
+                if cell == "G3":
+                    book["Данные"]["F3"] = value
+                book.save(path)
+                book.close()
+                self.assertIn(issue, " ".join(self.checked(read_protocol(path))[0].blockers))
 
 
 if __name__ == "__main__":

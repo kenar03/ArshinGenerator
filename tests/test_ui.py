@@ -9,7 +9,9 @@ from unittest.mock import patch
 from PySide6.QtCore import QEventLoop, QItemSelectionModel, QTimer, Qt
 from PySide6.QtGui import QColor, QPalette
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QComboBox, QDialog, QFileDialog, QLabel, QLineEdit, QTableView, QTreeWidget
+from PySide6.QtWidgets import (
+    QApplication, QComboBox, QDialog, QFileDialog, QLabel, QLineEdit, QPushButton, QTableView, QTreeWidget,
+)
 
 from arshin_generator.arshin import NS, SCHEMA_HASH, Schema, format_packets, open_xml, result_element, signature
 from arshin_generator.confirmations import protocol_key
@@ -21,8 +23,9 @@ from arshin_generator.ui.dialogs import EquipmentReviewPanel, XmlDialog
 from arshin_generator.ui.main import MainWindow
 from arshin_generator.ui.style import apply_theme
 from arshin_generator.ui.protocols import ProtocolDialog
-from tests.test_workflow import SAMPLE, SAMPLE_METHOD, approve, equipment, fixture
-from tests.test_public_registry import FixtureClient, etalon, mieta
+from arshin_generator.verification import RegistrySession
+from tests.test_workflow import INCOMPLETE, SAMPLE, SAMPLE_METHOD, equipment, fixture, sample_copy_with_kind, seed_lab
+from tests.test_public_registry import FixtureClient, etalon, mieta, registry_http
 
 
 def contrast(foreground, background):
@@ -66,18 +69,21 @@ class InterfaceTests(unittest.TestCase):
                                                      palette.color(state, role.Highlight)), 4.5)
 
 
-    def window(self, folder, *, online=False):
-        main = MainWindow(Storage(folder / "ui.sqlite3"), Schema(), online=online)
+    def window(self, folder, *, online=False, registry_session=None):
+        main = MainWindow(Storage(folder / "ui.sqlite3"), Schema(), online=online, registry_session=registry_session)
         self.addCleanup(main.close)
         return main
 
     def wait_for_import(self, main):
-        if main.thread:
+        for attribute in ("thread", "lookup_thread"):
+            thread = getattr(main, attribute)
+            if not thread:
+                continue
             loop = QEventLoop()
-            main.thread.finished.connect(loop.quit)
+            thread.finished.connect(loop.quit)
             QTimer.singleShot(5000, loop.quit)
             loop.exec()
-        self.assertIsNone(main.thread)
+            self.assertIsNone(getattr(main, attribute))
 
     def verify_protocols(self, main):
         main.type_titles = {"56560-14": "Термопреобразователи сопротивления"}
@@ -99,7 +105,7 @@ class InterfaceTests(unittest.TestCase):
             path = Path(directory)
             main = self.window(path)
             file = path / "Мой XML.xml"
-            main.import_paths([SAMPLE])
+            main.import_paths([sample_copy_with_kind(path / "Изолированное испытание.xlsm", "периодической")])
             self.wait_for_import(main)
             [protocol] = main.protocols
             main.storage.save_confirmation("protocol", protocol_key(protocol), {
@@ -110,10 +116,10 @@ class InterfaceTests(unittest.TestCase):
             self.assertTrue(main.export_btn.isEnabled())
             overview = ProtocolDialog(main, protocol)
             self.assertEqual(overview.equipment_panel.checked, 7)
-            self.assertIsNone(overview.editor)
+            self.assertFalse(overview.findChildren(QLineEdit))
             texts = "\n".join(label.text() for label in overview.findChildren(QLabel))
             self.assertIn("56560-14 · Термопреобразователи сопротивления", texts)
-            self.assertIn(SAMPLE_METHOD, texts)
+            self.assertIn("Готов к выгрузке", texts)
             overview.close()
 
             with patch.object(main, "choose_xml_path", return_value=file) as dialog, \
@@ -126,12 +132,13 @@ class InterfaceTests(unittest.TestCase):
             self.assertFalse(issues)
             self.assertEqual([signature(r) for r in root], [signature(result_element(r)) for r in main.results])
             self.assertFalse(root.findall(f".//{{{NS}}}stickerNum"))
+            self.assertEqual(root.findtext(f".//{{{NS}}}docTitle"), SAMPLE_METHOD)
             self.assertEqual([r.instrument.serial for r in main.results], [f"{i:03d}W6" for i in range(9, 34)])
             for record in main.results:
                 self.assertEqual(len(record.equipment), 7)
                 self.assertIs(record.value("sign_pass"), True)
                 self.assertIs(record.value("sign_mi"), False)
-                self.assertEqual(record.value("valid_date"), "2027-01-14")
+                self.assertEqual(record.value("valid_date"), "2030-11-21")
             [history] = main.storage.history()
             self.assertEqual(history["schema_hash"], SCHEMA_HASH)
             self.assertEqual(history["directory"], str(path))
@@ -162,18 +169,18 @@ class InterfaceTests(unittest.TestCase):
                 search.assert_not_called()
             self.assertFalse(main.export_btn.isEnabled())
             [record] = main.results
-            self.assertIn("неполные измерения", " ".join(record.measurement_issues))
+            self.assertTrue(record.incomplete_measurements)
             common = " ".join(record.shared_issues)
             self.assertIn("владельца", common)
             self.assertIn("Не указана методика поверки", common)
             self.assertIn("лист «Отчёт», ячейку A33", common)
             overview = ProtocolDialog(main, main.protocols[0])
-            self.assertFalse({"method", "owner", "modification", "metrologist"} & overview.editor.controls.keys())
+            self.assertFalse(overview.findChildren(QLineEdit))
             overview.close()
 
             updated = fixture(file, "ТЕСТ-ПОВТОР", "001B6", sticker="")
             self.assertNotEqual(updated.digest, record.protocol.digest)
-            approve(main.storage, updated, sticker="")
+            seed_lab(main.storage)
             main.online = False
             main.import_paths([file])
             self.wait_for_import(main)
@@ -190,7 +197,7 @@ class InterfaceTests(unittest.TestCase):
             third = fixture(path / "c.xlsx", "ТЕСТ-3", "003B6", sticker="")
             main = self.window(path)
             for protocol in (first, second, third):
-                approve(main.storage, protocol, sticker="")
+                seed_lab(main.storage)
             main.show()
             main.import_paths([first.path, second.path, third.path])
             self.wait_for_import(main)
@@ -224,7 +231,7 @@ class InterfaceTests(unittest.TestCase):
             path = Path(directory)
             p = fixture(path / "one.xlsx", "ТЕСТ-ТИП", "001B6", sticker="")
             main = self.window(path)
-            approve(main.storage, p, sticker="")
+            seed_lab(main.storage)
             main.storage.save_equipment(equipment())
             main.protocols = [p]
             self.verify_protocols(main)
@@ -243,9 +250,83 @@ class InterfaceTests(unittest.TestCase):
             self.assertFalse(main.can_export)
             dialog = ProtocolDialog(main, p)
             self.assertEqual(dialog.equipment_panel.checked, 0)
-            self.assertFalse(dialog.equipment_panel.retry_btn.isHidden())
+            self.assertIn("Повторить проверку", [btn.text() for btn in dialog.findChildren(QPushButton)])
             dialog.close()
             main.close()
+
+    def test_incomplete_real_workbook_groups_measurements_and_short_settings(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory)
+            main = self.window(path, online=True)
+            seed_lab(main.storage)
+            with patch("arshin_generator.ui.main.RegistryCheckThread") as search:
+                main.import_paths([INCOMPLETE, SAMPLE])
+                self.wait_for_import(main)
+                search.assert_not_called()
+            self.assertFalse(main.can_export)
+            self.assertIsNone(main.settings_btn.menu())
+            dialog = ProtocolDialog(main, main.protocols[0])
+            detail = "\n".join(label.text() for label in dialog.findChildren(QLabel))
+            self.assertEqual(detail.count("Приборов с незавершёнными измерениями: 25"), 1)
+            self.assertIn("и ещё 21", detail)
+            self.assertFalse(dialog.findChildren(QLineEdit))
+            dialog.close()
+            main.close()
+
+    def test_http_counts_for_reimport_settings_and_shared_equipment(self):
+        with TemporaryDirectory() as directory, registry_http() as server:
+            path = Path(directory)
+            main = self.window(path, online=True, registry_session=RegistrySession(opener=server.opener))
+            seed_lab(main.storage)
+            self.assertFalse(server.calls)
+            file = path / "first.xlsx"
+            second = path / "second.xlsx"
+            fixture(file, "ТЕСТ-ПЕРВЫЙ", "001B6", sticker="")
+            fixture(second, "ТЕСТ-ВТОРОЙ", "002B6", sticker="")
+            main.import_paths([file])
+            self.wait_for_import(main)
+            self.assertTrue(main.can_export)
+            self.assertEqual(sum(server.calls.values()), 3)
+            main.import_paths([file, second])
+            self.wait_for_import(main)
+            self.assertEqual(len(main.protocols), 2)
+            self.assertTrue(main.can_export)
+            self.assertEqual(sum(server.calls.values()), 3)
+
+            main.source.selectRow(0)
+            with patch.object(ProtocolDialog, "exec", return_value=0):
+                main.show_results()
+            dialog = ProtocolDialog(main)
+            dialog.selector.setCurrentIndex(1)
+            dialog.close()
+            apply_theme(self.app)
+            with patch("arshin_generator.ui.main.laboratory_settings", return_value=False):
+                main.settings_btn.click()
+            main.recheck()
+            self.assertEqual(sum(server.calls.values()), 3)
+
+            fixture(file, "ТЕСТ-ПЕРВЫЙ", "001B6", sticker="", day=date(2027, 1, 2))
+            main.import_paths([file])
+            self.wait_for_import(main)
+            self.assertEqual(sum(server.calls.values()), 4)
+            self.assertFalse(main.can_export)
+            self.assertIn("Срок поверки средства истёк", main.source_model.rows[0][1][2])
+            self.assertEqual(main.source_model.rows[1][1][2], "Готов к выгрузке")
+
+    def test_single_missing_excel_fields_block_before_any_http(self):
+        with TemporaryDirectory() as directory, registry_http() as server:
+            path = Path(directory)
+            main = self.window(path, online=True, registry_session=RegistrySession(opener=server.opener))
+            seed_lab(main.storage)
+            file = path / "unchecked.xlsx"
+            for fields, cell in (({"temperature": None}, "B5"), ({"kind": None}, "B1")):
+                with self.subTest(cell=cell):
+                    fixture(file, "ТЕСТ-ПОЛЕ", "001B6", sticker="", **fields)
+                    main.import_paths([file])
+                    self.wait_for_import(main)
+                    self.assertIn(f"ячейку {cell}", main.source_model.rows[0][1][2])
+                    self.assertFalse(main.can_export)
+                    self.assertFalse(server.calls)
 
     def test_native_save_configuration_and_split_path(self):
         with TemporaryDirectory() as directory:
@@ -270,7 +351,7 @@ class InterfaceTests(unittest.TestCase):
 
             for i in range(1, 3):
                 protocol = fixture(path / f"{i}.xlsx", f"ТЕСТ-{i}", f"{i:03d}B6", sticker="")
-                approve(main.storage, protocol, sticker="")
+                seed_lab(main.storage)
                 main.protocols.append(protocol)
             self.verify_protocols(main)
             limit = max(len(format_packets([r], main.schema)[0][0]) for r in main.results)

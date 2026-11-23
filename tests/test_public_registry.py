@@ -1,11 +1,18 @@
+from collections import Counter
+from contextlib import contextmanager
 from dataclasses import replace
 from datetime import date
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
+import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from threading import Thread
 import unittest
 from unittest.mock import patch
 from urllib.error import HTTPError
+from urllib.parse import parse_qs, urlsplit
+from urllib.request import ProxyHandler, build_opener
 
 from arshin_generator.arshin import NS, Schema, format_packets
 from arshin_generator.domain import Equipment
@@ -13,8 +20,9 @@ from arshin_generator.public_registry import PublicClient, PublicDataError, offi
 from arshin_generator.registry import lookup_equipment, lookup_key, resolve, resolve_many
 from arshin_generator.storage import Storage
 from arshin_generator.validation import check
+from arshin_generator.verification import RegistrySession
 
-from .test_workflow import approve, fixture
+from .test_workflow import seed_lab, fixture
 
 
 DAY = date(2026, 11, 23)
@@ -34,6 +42,66 @@ def mieta(identifier, number, scheme, *, serial="003342", expiry="13.04.2027"):
          "applicability": True}
     ]}
     return row, detail
+
+
+@contextmanager
+def registry_http():
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            url = urlsplit(self.path)
+            query = {key: values[0] for key, values in parse_qs(url.query).items()}
+            self.server.calls[self.path] += 1
+            resource = url.path.removeprefix("/")
+            status, result = self.server.response(resource, query)
+            body = json.dumps({"result": result}).encode()
+            self.send_response(status)
+            self.send_header("Content-Length", str(len(body)))
+            if status == 429:
+                self.send_header("Retry-After", "3600")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_):
+            pass
+
+    def page(records, filters):
+        return {"items": records, "count": len(records), "start": int(filters.get("start", 0))}
+
+    def response(resource, filters):
+        if resource == "mit":
+            number = filters["number"]
+            return 200, page([{"number": number, "mit_uuid": number, "title": f"Тип {number}",
+                               "notation": "Учебное средство"}], filters)
+        if resource == "vri":
+            if server.failure:
+                return server.failure, {}
+            return 200, page([{"vri_id": "1-111", "mit_number": filters["mit_number"],
+                               "mi_number": filters["mi_number"], "mi_modification": "Учебное средство",
+                               "verification_date": "2025-01-01", "valid_date": server.valid_until,
+                               "applicability": True}], filters)
+        if resource == "mieta":
+            return 200, page([row for row, _ in server.standards
+                             if all(row.get(k) == v for k, v in filters.items() if k not in {"rows", "start"})], filters)
+        if resource.startswith(("mieta/", "vri/")):
+            path, identifier = resource.split("/", 1)
+            return 200, FixtureClient(server.standards).detail(path, identifier)
+        return 404, {}
+
+    with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
+        server.calls = Counter()
+        server.failure = 0
+        server.valid_until = "2027-01-01"
+        server.standards = []
+        server.response = response
+        server.opener = build_opener(ProxyHandler({})).open
+        task = Thread(target=server.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True)
+        task.start()
+        try:
+            with patch("arshin_generator.public_registry.API", f"http://127.0.0.1:{server.server_port}/"):
+                yield server
+        finally:
+            server.shutdown()
+            task.join()
 
 
 class FixtureClient:
@@ -76,6 +144,74 @@ class RegistryLookupTests(unittest.TestCase):
         self.second = mieta("100002", "32777.06.2Р.01000002", "ГПС 2")
         self.expired = mieta("100003", "32777.06.2Р.01000003", "ГПС 3", expiry="20.11.2026")
         self.client = FixtureClient((self.first, self.second, self.expired))
+
+    def test_http_deduplication_changed_date_model_and_expiry(self):
+        day = date(2026, 1, 15)
+        item = Equipment("Средство", "Книга", "10000-10", "001", "Учебное средство", category="mis",
+                         type_number="10000-10")
+        ticks = [0]
+        numbers = {item.type_number}
+        with registry_http() as server:
+            session = RegistrySession(ttl=30, clock=lambda: ticks[0], opener=server.opener)
+
+            def batch(equipment, when):
+                requests = {lookup_key(unit, when.isoformat()): (unit, when) for unit in equipment}
+                session.remember(*session.check(*session.pending(requests, numbers)))
+                return session.snapshot(requests, numbers)
+
+            lookup, types = batch([item, item], day)
+            self.assertEqual(types[item.type_number].title, "Тип 10000-10")
+            self.assertEqual(next(iter(lookup.values())).state, "found")
+            self.assertEqual(sum(server.calls.values()), 2)  # MIT is shared by the type and the equipment.
+            batch([item], day)
+            self.assertEqual(sum(server.calls.values()), 2)
+
+            next_day = date(2026, 1, 16)
+            batch([item], next_day)
+            self.assertEqual(sum(server.calls.values()), 3)
+            changed, _ = batch([replace(item, name="Другая модель")], next_day)
+            self.assertEqual(next(iter(changed.values())).state, "conflict")
+            self.assertEqual(sum(server.calls.values()), 4)
+
+            ticks[0] = 31
+            key = lookup_key(item, day.isoformat())
+            self.assertEqual(session.snapshot({key: (item, day)}, numbers), ({}, {}))
+            batch([item], day)
+            self.assertEqual(sum(server.calls.values()), 6)
+
+    def test_http_429_is_bounded_and_manual_retry_only_checks_failed_keys(self):
+        item = Equipment("Средство", "Книга", "10000-10", "001", "Учебное средство", category="mis",
+                         type_number="10000-10")
+        key = lookup_key(item, DAY.isoformat())
+        requests, numbers = {key: (item, DAY)}, {item.type_number}
+        with registry_http() as server:
+            server.failure = 429
+            session = RegistrySession(opener=server.opener)
+            session.remember(*session.check(*session.pending(requests, numbers)))
+            self.assertEqual(session.snapshot(requests, numbers)[0][key].state, "unavailable")
+            self.assertEqual(session.pending(requests, numbers), ({}, set()))
+            self.assertEqual(sum(server.calls.values()), 2)
+            server.failure = 0
+            retry = session.pending(requests, numbers, (requests, numbers))
+            self.assertEqual(retry, (requests, set()))
+            session.remember(*session.check(*retry))
+            self.assertEqual(session.snapshot(requests, numbers)[0][key].state, "found")
+            self.assertEqual(sum(server.calls.values()), 3)
+
+    def test_mieta_http_choices_share_exact_mit(self):
+        item = etalon()
+        key = lookup_key(item, DAY.isoformat())
+        requests, numbers = {key: (item, DAY)}, {item.type_number}
+        with registry_http() as server:
+            server.standards = [self.first, self.second]
+            session = RegistrySession(opener=server.opener)
+            session.remember(*session.check(*session.pending(requests, numbers)))
+            decision = session.snapshot(requests, numbers)[0][key]
+            self.assertEqual(decision.state, "choice")
+            self.assertEqual(len([candidate for candidate in decision.candidates if candidate.eligible]), 2)
+            self.assertFalse(resolve_many(item, [], DAY, decision, require_public=True)[0])
+            self.assertEqual(sum(server.calls.values()), 6)  # One MIT, one list, two MIETA and two VRI cards.
+            self.assertEqual(max(server.calls.values()), 1)
 
     def test_display_title_requires_an_exact_mit_record(self):
         client = FixtureClient()
@@ -136,8 +272,8 @@ class RegistryLookupTests(unittest.TestCase):
             lookups = {lookup_key(item, day.isoformat()): lookup_equipment(item, day, fresh)
                        for item in p.equipment}
             storage = Storage(root / "database.sqlite3")
-            approve(storage, p)
-            results = check([p], storage.confirmations(), [], lookups)
+            seed_lab(storage)
+            results = check([p], storage.confirmations(), [], lookups, laboratory=storage.laboratory())
             self.assertFalse(results[0].blockers)
             schema = Schema()
             payload = format_packets(results, schema)[0][0]
@@ -159,7 +295,7 @@ class RegistryLookupTests(unittest.TestCase):
             current = lookup_equipment(item, day, FixtureClient(early_cards))
             self.assertEqual(current.state, "choice")
             storage = Storage(root / "database.sqlite3")
-            approve(storage, protocol)
+            seed_lab(storage)
             selected = [candidate.entry for candidate in current.candidates if candidate.eligible]
             storage.save_equipment_choices(selected)
             storage.save_equipment_choices([replace(
@@ -167,7 +303,7 @@ class RegistryLookupTests(unittest.TestCase):
             )])
             self.assertEqual([entry.identifier for entry in resolve_many(item, storage.entries(), day)[0]], numbers)
             lookups = {lookup_key(item, day.isoformat()): current}
-            result = check([protocol], storage.confirmations(), storage.entries(), lookups)
+            result = check([protocol], storage.confirmations(), storage.entries(), lookups, laboratory=storage.laboratory())
             self.assertFalse(result[0].blockers)
             schema = Schema()
             payload = format_packets(result, schema)[0][0]

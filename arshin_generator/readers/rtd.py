@@ -3,8 +3,9 @@ from datetime import date, datetime
 from math import isfinite
 import re
 
+from ..dates import expiry_before_anniversary
 from ..domain import Datum, ElementReading, Equipment, Instrument, Protocol
-from ..normalization import confirmed_rtd_modification, serial, serial_list, structured_candidate
+from ..normalization import DASHES, family_prefix, serial, serial_list, structured_candidate
 
 VERSION = "rtd-v1"
 PASS = "СООТВЕТСТВУЕТ"
@@ -12,6 +13,22 @@ FAIL = "НЕ СООТВЕТСТВУЕТ"
 DATA_LAST_ROW = 1001
 MEASUREMENT_LAST_ROW = 2034
 MEASUREMENT_COLUMNS = (2, 3, 6, 7, 8, 9)
+
+
+def confirmed_rtd_modification(type_number: str, model: str, execution: str, ex: str) -> str:
+    model = family_prefix(model.translate(DASHES))
+    families = {
+        "ТСП": {"0193", "1293", "1393", "1193", "1195", "0196", "0395", "0397"},
+        "ТСМ": {"0193", "1293", "1193", "1393", "0196", "0395"},
+    }
+    family, _, code = model.partition("-")
+    if type_number != "56560-14" or code not in families.get(family, ()):
+        return ""
+    known_order_suffix = model == "ТСП-0193" and execution == "17М/РЭД"
+    execution_pattern = r"[0-9]{2}[МMБ]?" if code == "0193" else r"[0-9]{2}"
+    if not (re.fullmatch(execution_pattern, execution) or known_order_suffix) or ex.strip("-") not in {"", "Ex"}:
+        return ""
+    return structured_candidate(model, execution, ex)
 
 
 def _conclusion(text: str) -> str:
@@ -121,7 +138,7 @@ def _equipment(t, catalog, etalons) -> list[Equipment]:
 
 def read(book, protocol: Protocol) -> None:
     protocol.reader = VERSION
-    protocol.modification_prefixes = ("ТСП-", "ТСМ-")
+    protocol.measurement_hint = "Проверьте сохранённые результаты на листах «Данные» и «Таблицы»."
     data = _matrix(book["Данные"], DATA_LAST_ROW, 12)
     t = _matrix(book["Таблицы"], MEASUREMENT_LAST_ROW, 12)
     report = _matrix(book["Отчёт"], 61, 10)
@@ -144,7 +161,7 @@ def read(book, protocol: Protocol) -> None:
     if scheme in {"2", "3", "4", "2х2", "2х3", "2х4"}:
         protocol.elements = 2 if "х" in scheme else 1
     else:
-        protocol.issues.append(f"Схема «{scheme}» не подтверждена для этой версии шаблона (Таблицы!H27).")
+        protocol.issues.append("Укажите поддерживаемую схему соединения в Таблицы!H27.")
     print_limit = data[1][11]
     if protocol.declared and protocol.elements and type(print_limit) is int and print_limit > 0:
         blocks = protocol.declared * protocol.elements
@@ -180,13 +197,26 @@ def read(book, protocol: Protocol) -> None:
         "Отчёт!A61 / Таблицы!A27:D27")
     put("wiring", scheme, "Таблицы!H27")
     put("interval", _present(t[27][10]), "Таблицы!K27")
+    put("model", model, "Таблицы!A27")
+    interval = protocol.fields["interval"].value
+    if not re.fullmatch(r"[1-9][0-9]*", interval):
+        protocol.issues.append("Укажите МПИ в полных годах. Проверьте лист «Таблицы», ячейку K27.")
+    elif type(actual) is date:
+        try:
+            if len(interval) > 4:
+                raise ValueError("МПИ выводит дату окончания за допустимый диапазон дат.")
+            expiry = expiry_before_anniversary(actual, int(interval))
+            put("valid_date", expiry.isoformat(), "Таблицы!B24 и K27 · дата поверки + МПИ − 1 день")
+        except ValueError as exc:
+            protocol.issues.append(f"{exc} Проверьте дату и МПИ в Таблицы!B24 и K27.")
     put("serial_list", _present(t[19][1]), "Таблицы!B19 / D2:G4")
     put("aggregate", _present(t[19][2]), "Таблицы!C19 / Отчёт!A45")
     put("selected_standard", _present(t[30][7]), "Таблицы!H30:J30")
+    put("equipment_list", None, "Таблицы!A10:A18")
     protocol.modification_parts = (model, execution, ex)
     protocol.proposed_modification = structured_candidate(model, execution, ex)
     modification = confirmed_rtd_modification(protocol.fields["type_number"].value, model, execution, ex)
-    put("modification", modification, "Таблицы!A27:C27 · правило обозначений типа 56560-14", full)
+    put("modification", modification, "Таблицы!A27:C27", full)
     protocol.equipment = _equipment(t, _matrix(book["Оборудование"], 301, 5), _matrix(book["Эталоны"], 301, 7))
     for row in range(10, 19):
         if _text(t[row][0]).startswith("#"):
@@ -197,6 +227,14 @@ def read(book, protocol: Protocol) -> None:
                             model_text.strip().casefold() in item.description.casefold() for item in protocol.equipment):
         protocol.issues.append("Выбранный эталон из Таблицы!H30 не идентифицирован среди средств поверки A10:A18.")
     _instruments(protocol, t, data)
+    if not protocol.report_outcome or not protocol.conclusion_outcome:
+        protocol.issues.append("Не заполнено итоговое заключение. Проверьте Таблицы!C19 и Отчёт!A45.")
+    elif protocol.report_outcome != protocol.conclusion_outcome:
+        protocol.issues.append("Итоговые заключения расходятся. Проверьте Таблицы!C19 и Отчёт!A45.")
+    elif protocol.instruments and all(item.outcome for item in protocol.instruments):
+        measured = "fail" if any(item.outcome == "fail" for item in protocol.instruments) else "pass"
+        if measured != protocol.report_outcome:
+            protocol.issues.append("Итоговое заключение расходится с измерениями. Проверьте Таблицы!C19 и Отчёт!A45.")
 
 
 def _source_ranges(t):
@@ -241,7 +279,7 @@ def _instruments(protocol: Protocol, t: list, data: list) -> None:
         values = tuple(tuple(line[c] for c in MEASUREMENT_COLUMNS) for line in rows)
         measured = len(values) == 2 and all(
             type(value) in (int, float) and isfinite(value) for line in values for value in line
-        )
+        ) and all(line[-1] >= 0 for line in values)
         by_index[index].append((number, raw, ElementReading(
             part, _text(status), measured, f"Данные!I{r}, Таблицы!C{first}:J{first + 1}", values if measured else ()
         )))
@@ -254,15 +292,21 @@ def _instruments(protocol: Protocol, t: list, data: list) -> None:
     for index, parts in sorted(by_index.items()):
         numbers = {item[0] for item in parts}
         number = parts[0][0]
+        elements = tuple(item[2] for item in parts)
         problem = ""
+        outcome = ""
         if len(numbers) != 1 or len({item[1] for item in parts}) != 1:
             problem = "У чувствительных элементов одного прибора расходятся заводские номера."
         elif sorted(item[2].index for item in parts) != list(range(1, protocol.elements + 1)):
             problem = "Недостающий или повторный чувствительный элемент."
-        first = 2 + index * protocol.elements
-        source = f"Данные!B{first}:I{first + len(parts) - 1} / Таблицы!B19"
-        protocol.instruments.append(Instrument(number, parts[0][1], source,
-                                              tuple(item[2] for item in parts), problem))
+        else:
+            mismatched = next((e for e in elements if _status_disagrees(e)), None)
+            if mismatched:
+                problem = f"Сохранённый результат ЧЭ расходится с допусками. Проверьте {mismatched.source}."
+            elif all(e.complete and e.status in {PASS, FAIL} for e in elements):
+                outcome = "fail" if any(e.status == FAIL for e in elements) else "pass"
+        source = ", ".join(item.source.split(", ", 1)[0] for item in elements) + " / Таблицы!B19"
+        protocol.instruments.append(Instrument(number, parts[0][1], source, elements, problem, outcome))
     try:
         source = _source_ranges(t)
         raw_list = _text(t[19][1])
@@ -277,9 +321,18 @@ def _instruments(protocol: Protocol, t: list, data: list) -> None:
         if batch != [item.serial for item in protocol.instruments]:
             raise ValueError("Список партии и номера в сохранённых строках измерений различаются.")
     except ValueError as exc:
-        protocol.serial_issue = str(exc)
+        protocol.serial_issue = f"{exc} Проверьте Таблицы!B19, D2:G4 и лист «Данные»."
         if not protocol.instruments and _present(t[19][1]):
             try:
                 protocol.instruments = [Instrument(n, _text(t[19][1]), "Таблицы!B19") for n in serial_list(_text(t[19][1]))]
             except ValueError:
                 pass
+
+
+def _status_disagrees(reading: ElementReading) -> bool:
+    if not reading.complete or reading.status not in {PASS, FAIL}:
+        return False
+    # Данные!I сравнивает верхнюю и нижнюю границы H/I с допуском J в двух точках.
+    within_limits = all(upper <= limit and lower >= -limit
+                        for _, _, _, upper, lower, limit in reading.measurements)
+    return within_limits != (reading.status == PASS)

@@ -7,7 +7,7 @@ READY = "Готов"
 REVIEW = "Требует проверки"
 ERROR = "Ошибка"
 UNSUPPORTED = "Формат не поддерживается"
-OUTCOMES = {"pass": "Пригоден", "fail": "Непригоден", "": "Не подтверждён"}
+OUTCOMES = {"pass": "Пригоден", "fail": "Непригоден", "": "Нет результата"}
 
 
 @dataclass(frozen=True)
@@ -46,6 +46,7 @@ class Instrument:
     source: str
     elements: tuple[ElementReading, ...] = ()
     problem: str = ""
+    outcome: str = ""
 
 
 @dataclass
@@ -66,7 +67,7 @@ class Protocol:
     conclusion: str = ""
     proposed_modification: str = ""
     modification_parts: tuple[str, ...] = ()
-    modification_prefixes: tuple[str, ...] = ()
+    measurement_hint: str = ""
     evidence: str = ""
     report_outcome: str = ""
     conclusion_outcome: str = ""
@@ -105,13 +106,10 @@ class Result:
     fields: dict[str, Datum]
     equipment: list[RegistryEntry] = field(default_factory=list)
     issues: list[str] = field(default_factory=list)
-    candidate: str = ""
     shared_issues: tuple[str, ...] = ()
     equipment_issues: tuple[str, ...] = ()
-    missing_fields: tuple[str, ...] = ()
-    repair_fields: set[str] = field(default_factory=set)
-    measurement_issues: tuple[str, ...] = ()
-    warnings: tuple[str, ...] = ()
+    registry_issues: tuple[str, ...] = ()
+    incomplete_measurements: bool = False
 
     def value(self, name: str) -> Scalar:
         return self.fields[name].value if name in self.fields else None

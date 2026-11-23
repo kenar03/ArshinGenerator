@@ -193,13 +193,13 @@ class XmlDialog(QDialog):
 
 class EquipmentReviewPanel(QWidget):
     changed = Signal()
-    retry = Signal()
 
-    def __init__(self, parent, storage, protocol, lookups):
+    def __init__(self, parent, storage, protocol, lookups, *, checked_inputs=True):
         super().__init__(parent)
         self.storage = storage
         self.protocol = protocol
         self.lookups = lookups
+        self.checked_inputs = checked_inputs
         day = protocol.fields.get("verification_date")
         self.day = iso_date(day.value if day else None)
         box = QVBoxLayout(self)
@@ -225,8 +225,6 @@ class EquipmentReviewPanel(QWidget):
         actions = QHBoxLayout()
         self.select_btn = button("Выбрать запись", self.choose, primary=True)
         actions.addWidget(self.select_btn)
-        self.retry_btn = button("Повторить поиск", self.retry.emit)
-        actions.addWidget(self.retry_btn)
         actions.addStretch()
         box.addLayout(actions)
         self.items.selectionModel().currentChanged.connect(self.refresh_candidates)
@@ -242,14 +240,14 @@ class EquipmentReviewPanel(QWidget):
         self.assessments = {}
         for item in self.protocol.equipment:
             live = self.lookup(item)
-            resolved, issue = resolve_many(item, entries, self.day, live, require_public=True)
+            resolved, issue = resolve_many(item, entries, self.day, live, require_public=True) if self.checked_inputs else ([], "")
             self.assessments[item] = bool(resolved), issue
             numbers = ", ".join(entry.identifier or entry.type_number for entry in resolved)
             rows.append((item, (item.name or item.description, item.serial, numbers, "Проверено" if resolved else issue)))
         self.pending = [item for item, (ready, _) in self.assessments.items() if not ready]
         self.checked = sum(self.assessments[item][0] for item, _ in rows)
-        self.summary.setText(f"Средства поверки · проверено {self.checked} из {len(rows)} · "
-                             f"требуют внимания {len(rows) - self.checked}")
+        suffix = f" · проверено {self.checked} из {len(rows)}" if self.checked_inputs else ""
+        self.summary.setText("Средства поверки" + suffix)
         self.item_model.update(rows)
         if rows:
             focus = current or (self.pending[0] if self.pending else None)
@@ -274,7 +272,7 @@ class EquipmentReviewPanel(QWidget):
                 note += f". Поверка действовала до {end:%d.%m.%Y}."
             if candidates[0].status.startswith(("Модель", "Заводской номер")):
                 note += f" {candidates[0].status}."
-        self.note.setText(note if item else "В протоколе нужно указать средства поверки.")
+        self.note.setText(note if live and (live.state == "choice" or live.state == "expired") else "")
         self.note.setVisible(bool(self.note.text()))
         eligible = [candidate for candidate in candidates if candidate.eligible]
         self.candidate_model.update([
@@ -283,7 +281,6 @@ class EquipmentReviewPanel(QWidget):
             for c in eligible
         ])
         self.candidates.setVisible(bool(not resolved and live and live.state in {"found", "choice"} and eligible))
-        self.retry_btn.setVisible(bool(not resolved and live and live.state in {"unavailable", "response"}))
         self.refresh_button()
 
     def refresh_button(self, *_):
@@ -310,6 +307,7 @@ class EquipmentReviewPanel(QWidget):
             ])
         except (ValueError, sqlite3.Error) as exc:
             self.note.setText(str(exc) if isinstance(exc, ValueError) else "Не удалось сохранить выбор.")
+            self.note.show()
             return
         self.changed.emit()
 

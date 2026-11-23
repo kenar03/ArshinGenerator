@@ -33,7 +33,7 @@ def read_protocol(path: Path) -> Protocol:
         finally:
             workbook.close()
         protocol.unsupported = True
-        protocol.error = "Структура книги не соответствует поддерживаемой версии протокола ТСП/ТСМ."
+        protocol.error = "Структура книги не соответствует ни одному поддерживаемому формату протокола."
     except Exception:
         logging.exception("Ошибка чтения %s", path)
         protocol.error = "Книга не прочитана. Проверьте формат, доступ к файлу и сохранение в Excel."

@@ -14,6 +14,7 @@ from arshin_generator.arshin import Schema
 from arshin_generator.public_registry import check_connection
 from arshin_generator.storage import Storage, data_directory
 from arshin_generator.ui.common import message
+from arshin_generator.ui.dialogs import HistoryDialog, XmlDialog
 from arshin_generator.ui.main import MainWindow
 from arshin_generator.ui.style import apply_theme
 
@@ -23,6 +24,9 @@ def main(argv=None):
     parser.add_argument("paths", nargs="*", type=Path)
     parser.add_argument("--smoke-check", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--check-connection", type=Path, help=argparse.SUPPRESS)
+    service = parser.add_mutually_exclusive_group()
+    service.add_argument("--history", action="store_true", help="Открыть историю выгрузок и резервное копирование")
+    service.add_argument("--view-xml", type=Path, help="Открыть сохранённый XML")
     arguments = parser.parse_args(argv)
     if arguments.check_connection:
         log = arguments.check_connection.with_suffix(".log")
@@ -53,7 +57,6 @@ def main(argv=None):
             raise ValueError("Эта папка данных занята другой копией приложения.")
         storage = Storage(data / "arshin.sqlite3")
         schema = Schema()
-        window = MainWindow(storage, schema, online=not arguments.smoke_check)
     except Exception as exc:
         logging.exception("Ошибка запуска")
         if arguments.smoke_check:
@@ -61,6 +64,13 @@ def main(argv=None):
         else:
             message(None, "Запуск приложения", "Не удалось открыть папку данных или схему XML.\n" + str(exc), error=True)
         return 1
+    if arguments.history or arguments.view_xml:
+        dialog = (HistoryDialog(None, storage, schema) if arguments.history else
+                  XmlDialog(None, [arguments.view_xml.resolve()], schema, {}))
+        dialog.exec()
+        lock.unlock()
+        return 0
+    window = MainWindow(storage, schema, online=not arguments.smoke_check)
     if arguments.smoke_check:
         window.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen)
     window.show()

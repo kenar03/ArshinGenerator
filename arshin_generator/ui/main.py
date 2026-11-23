@@ -1,29 +1,27 @@
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 from getpass import getuser
 import logging
+from math import ceil
 from pathlib import Path
 import re
 import sqlite3
 
-from PySide6.QtCore import QItemSelectionModel, QStandardPaths, QThread, QUrl, Qt, Signal
-from PySide6.QtGui import QDesktopServices, QKeySequence, QShortcut
+from PySide6.QtCore import QItemSelectionModel, QStandardPaths, QThread, QTimer, Qt, Signal
+from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView, QDialog, QFileDialog, QFrame, QHBoxLayout, QHeaderView, QMainWindow, QMenu, QToolButton,
     QVBoxLayout, QWidget,
 )
 
 from ..arshin import export, format_packets, split_paths
-from ..confirmations import get_confirmation, protocol_key, with_guards
-from ..public_registry import PublicDataError, official_type_title
 from ..readers import EXTENSIONS, read_protocol
-from ..registry import EquipmentLookup, iso_date, lookup_equipment, lookup_key
-from ..validation import check
-from .common import Form, button, fit_window, label, message, table
-from .dialogs import HistoryDialog, XmlDialog
+from ..registry import iso_date, lookup_key
+from ..validation import check, empty_protocol_issues
+from ..verification import RegistrySession
+from .common import button, fit_window, label, message, table
 from .protocols import ProtocolDialog
-from .workflow import ConnectionDialog, ExpiryRules, laboratory_settings
+from .workflow import laboratory_settings
 
 
 class ImportThread(QThread):
@@ -40,48 +38,25 @@ class ImportThread(QThread):
 class RegistryCheckThread(QThread):
     assessed = Signal(object)
 
-    def __init__(self, requests, type_numbers, parent):
+    def __init__(self, session, requests, type_numbers, parent):
         super().__init__(parent)
         self.requests = requests
         self.type_numbers = type_numbers
+        self.session = session
 
     def run(self):
-        no_connection = EquipmentLookup("unavailable", "Не удалось подключиться к реестру. Повторите проверку")
-
-        def verify(request):
-            if self.isInterruptionRequested():
-                return EquipmentLookup("response", "Поиск остановлен. Повторите проверку")
-            item, day = request
-            try:
-                result = lookup_equipment(item, day)
-            except Exception:
-                logging.exception("Ошибка проверки публичной карточки")
-                return no_connection
-            return result
-
-        def find_title(number):
-            if self.isInterruptionRequested():
-                return "", "Поиск типа СИ остановлен. Повторите проверку."
-            try:
-                title = official_type_title(number)
-            except PublicDataError:
-                return "", f"Не удалось проверить тип СИ {number} в государственном реестре."
-            return title, "" if title else f"В реестре не найден точный тип СИ {number}. Проверьте номер в Excel."
-
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            types = {number: executor.submit(find_title, number) for number in self.type_numbers}
-            verified = dict(zip(self.requests, executor.map(verify, self.requests.values())))
-            self.assessed.emit((verified, {number: request.result() for number, request in types.items()}))
+        self.assessed.emit(self.session.check(self.requests, self.type_numbers, self.isInterruptionRequested))
 
 
 class MainWindow(QMainWindow):
     checked = Signal()
 
-    def __init__(self, storage, schema, *, online=True):
+    def __init__(self, storage, schema, *, online=True, registry_session=None):
         super().__init__()
         self.storage = storage
         self.schema = schema
         self.online = online
+        self.registry = registry_session or RegistrySession()
         self.protocols = []
         self.results = []
         self.thread = None
@@ -89,6 +64,10 @@ class MainWindow(QMainWindow):
         self.lookups = {}
         self.type_titles = {}
         self.type_issues = {}
+        self.retryable_types = set()
+        self.expiry_timer = QTimer(self)
+        self.expiry_timer.setSingleShot(True)
+        self.expiry_timer.timeout.connect(self.start_registry_checks)
         self.setWindowTitle("Аршин · Генератор XML")
         self.setMinimumSize(680, 440)
         fit_window(self, 940, 620)
@@ -106,16 +85,7 @@ class MainWindow(QMainWindow):
         self.summary = label("")
         title.addWidget(self.summary)
         header.addLayout(title, 1)
-        self.settings_btn = button("Настройки")
-        menu = QMenu(self.settings_btn)
-        menu.addAction("Реквизиты лаборатории", self.laboratory_settings)
-        service = menu.addMenu("Служебные инструменты")
-        service.addAction("Правила срока поверки", self.expiry_rules)
-        service.addAction("Исключение по сроку поверки…", self.expiry_exception)
-        service.addAction("История и резервная копия", self.history)
-        service.addAction("Открыть файл XML…", self.pick_xml)
-        service.addAction("Проверить подключение", self.connection)
-        self.settings_btn.setMenu(menu)
+        self.settings_btn = button("Настройки", self.laboratory_settings)
         header.addWidget(self.settings_btn, alignment=Qt.AlignmentFlag.AlignTop)
         layout.addLayout(header)
 
@@ -258,6 +228,14 @@ class MainWindow(QMainWindow):
             p for p in self.protocols
             if (records := self.local_group[id(p)]) and self.complete(p, records)
         ]
+        self.source_issues = {id(p): empty_protocol_issues(p, self.laboratory, self.confirmations)
+                              for p in self.protocols if not self.local_group[id(p)]}
+        self.requests = {}
+        self.type_numbers = set()
+        for protocol in self.registry_protocols:
+            requests, number = self.registry_keys(protocol)
+            self.requests.update(requests)
+            self.type_numbers.add(number)
 
     @staticmethod
     def complete(protocol, records):
@@ -265,22 +243,32 @@ class MainWindow(QMainWindow):
             not result.blockers for result in records
         )
 
-    def start_registry_checks(self):
+    def registry_keys(self, protocol):
+        when = iso_date(protocol.fields["verification_date"].value)
+        return ({lookup_key(item, when.isoformat()): (item, when) for item in protocol.equipment},
+                protocol.fields["type_number"].value)
+
+    def retry_registry(self, protocol):
+        requests, number = self.registry_keys(protocol)
+        self.start_registry_checks(retry=(requests, {number}))
+
+    def schedule_expiry(self):
+        self.expiry_timer.stop()
+        if self.online and not self.busy:
+            expiry = self.registry.next_expiry(self.requests, self.type_numbers)
+            if expiry is not None:
+                self.expiry_timer.start(max(1, ceil((expiry - self.registry.clock()) * 1_000)))
+
+    def start_registry_checks(self, *, retry=None):
         if self.busy:
             return
         self.check_inputs()
-        requests = {}
-        type_numbers = set()
-        for protocol in self.registry_protocols:
-            type_numbers.add(protocol.fields["type_number"].value)
-            when = iso_date(protocol.fields["verification_date"].value)
-            for item in protocol.equipment:
-                requests[lookup_key(item, when.isoformat())] = item, when
-        if not self.online or not type_numbers:
-            self.notice.clear()
+        requests, type_numbers = self.registry.pending(self.requests, self.type_numbers, retry)
+        if not self.online or not (requests or type_numbers):
             self.recheck()
             return
-        self.lookup_thread = RegistryCheckThread(requests, type_numbers, self)
+        self.expiry_timer.stop()
+        self.lookup_thread = RegistryCheckThread(self.registry, requests, type_numbers, self)
         self.lookup_thread.assessed.connect(self.accept_registry_checks)
         self.lookup_thread.finished.connect(self.registry_checks_finished)
         self.notice.setText("Проверяем сведения в государственном реестре…")
@@ -289,11 +277,10 @@ class MainWindow(QMainWindow):
         self.lookup_thread.start()
 
     def accept_registry_checks(self, result):
-        self.lookups, types = result
-        self.type_titles = {number: title for number, (title, _) in types.items() if title}
-        self.type_issues = {number: issue for number, (_, issue) in types.items() if issue}
+        lookups, types = result
+        self.registry.remember(lookups, types)
         try:
-            self.storage.save_registry_checks(c.entry for lookup in self.lookups.values()
+            self.storage.save_registry_checks(c.entry for lookup in lookups.values()
                                               if lookup.state == "found" for c in lookup.candidates if c.eligible)
         except sqlite3.Error:
             logging.exception("Не удалось сохранить результаты сверки с реестром")
@@ -304,11 +291,13 @@ class MainWindow(QMainWindow):
         self.notice.clear()
         self.recheck()
 
-    def refresh_after_edit(self):
-        self.start_registry_checks()
-
     def recheck(self):
         self.check_inputs()
+        if self.online:
+            self.lookups, types = self.registry.snapshot(self.requests, self.type_numbers)
+            self.type_titles = {number: result.title for number, result in types.items() if result.title}
+            self.type_issues = {number: result.issue for number, result in types.items() if result.issue}
+            self.retryable_types = {number for number, result in types.items() if result.retryable}
         type_issues = {}
         for protocol in self.registry_protocols:
             number = protocol.fields["type_number"].value
@@ -323,6 +312,7 @@ class MainWindow(QMainWindow):
             self.group[id(record.protocol)].append(record)
         self.results = [record for protocol in self.protocols for record in self.group[id(protocol)]]
         self.render()
+        self.schedule_expiry()
         self.checked.emit()
 
     @property
@@ -336,12 +326,8 @@ class MainWindow(QMainWindow):
             return "Проверяем…"
         if self.complete(protocol, records):
             return "Готов к выгрузке"
-        if records:
-            issue = next((issue for record in records for issue in record.blockers), "")
-            issue = issue.removeprefix("Подтверждение: ").strip()
-            if issue:
-                return issue[0].upper() + issue[1:]
-        return protocol.error or next(iter(protocol.issues), "") or protocol.serial_issue or "Нет отдельных СИ"
+        issue = next((issue for record in records for issue in record.blockers), "")
+        return issue or next(iter(self.source_issues.get(id(protocol), ())), "Нет отдельных СИ")
 
     def selected_protocols(self):
         return [self.source_model.rows[index.row()][0] for index in self.source.selectionModel().selectedRows()]
@@ -409,45 +395,13 @@ class MainWindow(QMainWindow):
             chosen = self.selected_protocols()
             self.open_protocol(chosen[0] if chosen else None)
 
-    def connection(self):
-        ConnectionDialog(self, self.open_log).exec()
-
     def laboratory_settings(self):
-        laboratory_settings(self, self.storage)
-        self.refresh_after_edit()
+        if laboratory_settings(self, self.storage):
+            eligible = {id(p) for p in self.registry_protocols}
+            self.recheck()
+            if any(id(p) not in eligible for p in self.registry_protocols):
+                self.start_registry_checks()
 
-    def expiry_rules(self):
-        ExpiryRules(self, self.storage).exec()
-        self.refresh_after_edit()
-
-    def expiry_exception(self):
-        selected = self.selected_protocols() or self.protocols
-        if self.busy or len(selected) != 1 or not selected[0].instruments:
-            message(self, "Исключение по сроку", "Выберите один заполненный протокол.")
-            return
-        protocol = selected[0]
-        day = iso_date(protocol.fields["verification_date"].value)
-        if not day:
-            message(self, "Исключение по сроку", "Сначала укажите дату поверки в Excel.")
-            return
-        previous = get_confirmation(self.storage.confirmations(), "expiry_exception", protocol)
-        form = Form(self, "Исключение по сроку поверки",
-                    f"Протокол {protocol.number or protocol.path.name}. Введите дату и ссылку на документ, "
-                    "который устанавливает исключение.", size=(535, 330), save="Сохранить")
-        form.field("valid_date", "Дата окончания", "date", previous[0].get("valid_date") if previous else None)
-        form.field("basis", "Документ и пункт", value=previous[1] if previous else "")
-
-        def validate(values):
-            end = iso_date(values["valid_date"])
-            if not end or end < day or not values["basis"]:
-                raise ValueError("Укажите основание и дату окончания не ранее даты поверки.")
-
-        form.validate = validate
-        if form.exec():
-            values = form.values()
-            fields = with_guards(protocol, {"valid_date": values["valid_date"]})
-            self.storage.save_confirmation("expiry_exception", protocol_key(protocol), fields, values["basis"], getuser())
-            self.refresh_after_edit()
 
     def output_folder(self):
         documents = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DocumentsLocation)
@@ -455,28 +409,6 @@ class MainWindow(QMainWindow):
         if saved and Path(saved).is_dir():
             return Path(saved)
         return Path(documents) if documents and Path(documents).is_dir() else Path.home()
-
-    def history(self):
-        HistoryDialog(self, self.storage, self.schema).exec()
-
-    def open_log(self):
-        path = self.storage.path.parent / "diagnostics.log"
-        if path.is_file():
-            QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
-        else:
-            message(self, "Диагностический журнал", "В журнале пока нет записей.")
-
-    def pick_xml(self):
-        files, _ = QFileDialog.getOpenFileNames(self, "Открыть сформированный XML",
-                                                str(self.output_folder()), "Файлы XML (*.xml)")
-        if files:
-            paths = [Path(file) for file in files]
-            local = {path.resolve().parent for path in paths}
-            context = {}
-            for entry in self.storage.history():
-                if Path(entry["directory"]).resolve() in local:
-                    context.update(self.storage.export_context(entry["id"]))
-            XmlDialog(self, paths, self.schema, context).exec()
 
     def choose_xml_path(self, proposed):
         dialog = QFileDialog(self, "Сохранить как", str(proposed.parent))
@@ -498,6 +430,13 @@ class MainWindow(QMainWindow):
         self.recheck()
         if not self.can_export:
             return
+        self.expiry_timer.stop()
+        try:
+            self.save_xml()
+        finally:
+            self.schedule_expiry()
+
+    def save_xml(self):
         previous = self.storage.seen([r.identity for r in self.results])
         if previous and not message(self, "Повторная выгрузка",
                 f"Ранее сформировано результатов: {len(previous)}. При повторной загрузке могут появиться дубликаты. "
@@ -522,12 +461,19 @@ class MainWindow(QMainWindow):
                 if not chosen:
                     return
                 paths = split_paths(Path(chosen), stem, len(packets))
+            if self.online and any(self.registry.pending(self.requests, self.type_numbers)):
+                self.start_registry_checks()
+                message(self, "Проверка ФИФ ОЕИ", "Сведения обновляются. Дождитесь окончания проверки и повторите сохранение.")
+                return
             files = export(packets, self.schema, paths, self.storage, f"Сеанс Windows: {getuser()}",
                            overwrite=overwrite)
-        except (ValueError, OSError, sqlite3.Error) as exc:
+        except ValueError as exc:
+            logging.exception("Ошибка проверки формата XML")
+            message(self, "Проверка формата XML", str(exc), error=True)
+            return
+        except (OSError, sqlite3.Error):
             logging.exception("Ошибка формирования XML")
-            message(self, "Выгрузка", str(exc) if isinstance(exc, ValueError) else
-                    "Не удалось сохранить XML. Проверьте права доступа и свободное место.", error=True)
+            message(self, "Сохранение XML", "Не удалось сохранить XML. Проверьте права доступа и свободное место.", error=True)
             return
         try:
             self.storage.set_setting("output_folder", str(files[0].parent))

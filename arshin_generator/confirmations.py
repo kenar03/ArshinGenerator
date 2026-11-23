@@ -28,7 +28,7 @@ def individual_key(protocol, number: str) -> str:
 
 def _guard(protocol, key, instrument):
     values = [_value(protocol, key)]
-    if key in {"one_result", "valid_date", "valid_date_absent"}:
+    if key in {"valid_date", "valid_date_absent"}:
         values.extend(_value(protocol, name) for name in ("marking", "wiring", "verification_type", "interval"))
     if key in {"calibration", "outcome", "reasons"}:
         values.extend([protocol.conclusion, protocol.report_outcome, protocol.conclusion_outcome, _value(protocol, "reasons"),

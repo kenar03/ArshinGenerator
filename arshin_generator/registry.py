@@ -72,7 +72,7 @@ def _has_model(name: str, model: str) -> bool:
 
 
 def lookup_key(item: Equipment, day: str) -> tuple:
-    return item.category, item.type_number, item.registration, item.serial, _notation(item.name), day
+    return item.category, item.type_number, item.registration, item.source_id, item.serial, _notation(item.name), day
 
 
 def _same_equipment(item: Equipment, entry: RegistryEntry) -> bool:
