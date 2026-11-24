@@ -16,7 +16,7 @@ from PySide6.QtWidgets import (
 from ..arshin import NS, open_xml
 from ..registry import CATEGORIES, iso_date, lookup_key, resolve_many
 from ..storage import PORTAL_STATES
-from .common import Form, button, fit_window, label, message, selected, table
+from .common import Form, apply_dialog_icon, button, fit_window, label, message, selected, table
 
 TAGS = {
     "application": "Пакет поверок", "result": "Результат поверки", "miInfo": "Сведения о СИ",
@@ -62,6 +62,7 @@ def tree_items(element, parent):
 class XmlDialog(QDialog):
     def __init__(self, parent, paths, schema, protocols=None):
         super().__init__(parent)
+        apply_dialog_icon(self)
         self.setWindowTitle("Просмотр и проверка XML")
         fit_window(self, 930, 650)
         self.schema = schema
@@ -331,6 +332,7 @@ class EquipmentReviewPanel(QWidget):
 class HistoryDialog(QDialog):
     def __init__(self, parent, storage, schema):
         super().__init__(parent)
+        apply_dialog_icon(self)
         self.setWindowTitle("История XML")
         self.resize(960, 560)
         self.storage = storage

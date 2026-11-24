@@ -151,7 +151,7 @@ def fixture(path, number, serial, *, dual=False, outcome="СООТВЕТСТВУ
             count=1, print_limit=None, sticker="01234567890", owner="Синтетический владелец", interval=4,
             method="Методика для испытаний XML", day=date(2026, 1, 15), kind="первичной",
             temperature=21.3, model="ТСП-0193", execution="01", ex="", length=None, inconsistent=None,
-            positive_report=None, serial_start=1):
+            positive_report=None, serial_start=1, equipment_serial="001"):
     book = Workbook()
     t = book.active
     t.title = "Таблицы"
@@ -165,7 +165,7 @@ def fixture(path, number, serial, *, dual=False, outcome="СООТВЕТСТВУ
     conclusion = "годны" if positive else "не годны"
     cells = {
         "B1": kind, "D1": number, "A2": "Заводские номера", "B5": temperature, "B6": 99.3,
-        "B7": 30, "B8": 220, "A10": "г/р № 10000-10 Учебное средство № 001",
+        "B7": 30, "B8": 220, "A10": f"г/р № 10000-10 Учебное средство № {equipment_serial}",
         "B19": f"№{serial}", "C19": f"{conclusion} к применению",
         "B20": sticker, "B21": "-", "B22": "V", "B23": "Тестова Анна Викторовна",
         "B24": day, "H26": "Схема соединения", "J26": "Кол-во",
@@ -185,7 +185,7 @@ def fixture(path, number, serial, *, dual=False, outcome="СООТВЕТСТВУ
     r["A61"] = "ТСП-0193-01-100"
     e["G1"] = "Поверен до"
     o["E1"] = "Строка для протокола"
-    o.append(["10000-10", "Учебное средство", "001", "г/р", t["A10"].value])
+    o.append(["10000-10", "Учебное средство", equipment_serial, "г/р", t["A10"].value])
     for col, value in {1: "Блок", 2: "Прибор №", 3: "ЧЭ №", 7: "Номер с кодом", 9: "Статус ЧЭ"}.items():
         d.cell(1, col, value)
     if print_limit is not None:

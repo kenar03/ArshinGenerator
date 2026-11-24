@@ -7,10 +7,10 @@ from pathlib import Path
 import re
 import sqlite3
 
-from PySide6.QtCore import QItemSelectionModel, QStandardPaths, QThread, QTimer, Qt, Signal
+from PySide6.QtCore import QStandardPaths, QThread, QTimer, Qt, Signal
 from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (
-    QAbstractItemView, QDialog, QFileDialog, QHBoxLayout, QHeaderView, QMainWindow, QMenu, QToolButton,
+    QDialog, QFileDialog, QHBoxLayout, QHeaderView, QMainWindow, QMenu, QToolButton,
     QVBoxLayout, QWidget,
 )
 
@@ -20,7 +20,8 @@ from ..readers import EXTENSIONS, read_protocol
 from ..registry import iso_date, lookup_key
 from ..validation import check, empty_protocol_issues
 from ..verification import RegistrySession
-from .common import button, fit_window, label, message, table
+from .common import apply_dialog_icon, button, fit_window, label, message, selected, table
+from .protocol_list import ProtocolHeader, ProtocolTableModel
 from .protocols import ProtocolDialog
 from .workflow import laboratory_settings
 
@@ -71,13 +72,15 @@ class MainWindow(QMainWindow):
         self.results = []
         self.thread = None
         self.lookup_thread = None
+        self.after_registry_check = None
         self.lookups = {}
         self.type_titles = {}
         self.type_issues = {}
         self.retryable_types = set()
         self.expiry_timer = QTimer(self)
         self.expiry_timer.setSingleShot(True)
-        self.expiry_timer.timeout.connect(self.start_registry_checks)
+        self.expiry_timer.setTimerType(Qt.TimerType.PreciseTimer)
+        self.expiry_timer.timeout.connect(self.recheck)
         self.setWindowTitle("Аршин · Генератор XML")
         self.setMinimumSize(680, 440)
         fit_window(self, 900, 600)
@@ -121,16 +124,18 @@ class MainWindow(QMainWindow):
         self.empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self.empty, 1)
 
-        self.source, self.source_model = table(("Протокол", "Тип протокола", "Приборов", "Состояние"),
-                                               (250, 140, 80, 152))
-        self.source.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.source, self.source_model = table(("", "Протокол", "Тип протокола", "Приборов", "Состояние"),
+                                               (34, 250, 140, 80, 152), model_class=ProtocolTableModel,
+                                               header_class=ProtocolHeader)
         sizes = self.source.horizontalHeader()
         sizes.setStretchLastSection(False)
-        sizes.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        sizes.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+        sizes.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        sizes.select_all.clicked.connect(self.source_model.set_all_checked)
+        self.source_model.marks_changed.connect(self.update_marks)
         self.source.verticalHeader().setDefaultSectionSize(36)
         layout.addWidget(self.source, 1)
-        self.source.doubleClicked.connect(lambda index: self.open_protocol(self.source_model.rows[index.row()][0]))
-        self.source.selectionModel().selectionChanged.connect(self.update_remove_button)
+        self.source.doubleClicked.connect(self.open_row)
 
         self.notice = label("")
         layout.addWidget(self.notice)
@@ -150,6 +155,7 @@ class MainWindow(QMainWindow):
         if self.busy:
             self.set_notice("Дождитесь окончания проверки.")
             if self.lookup_thread:
+                self.after_registry_check = None
                 self.lookup_thread.requestInterruption()
             event.ignore()
         else:
@@ -270,15 +276,18 @@ class MainWindow(QMainWindow):
             if expiry is not None:
                 self.expiry_timer.start(max(1, ceil((expiry - self.registry.clock()) * 1_000)))
 
-    def start_registry_checks(self, *, retry=None):
+    def start_registry_checks(self, *, retry=None, after_check=None):
         if self.busy:
             return
         self.check_inputs()
         requests, type_numbers = self.registry.pending(self.requests, self.type_numbers, retry)
         if not self.online or not (requests or type_numbers):
             self.recheck(inputs_checked=True)
+            if after_check:
+                self.continue_export(after_check)
             return
         self.expiry_timer.stop()
+        self.after_registry_check = after_check
         self.lookup_thread = RegistryCheckThread(self.registry, requests, type_numbers, self)
         self.lookup_thread.assessed.connect(self.accept_registry_checks)
         self.lookup_thread.finished.connect(self.registry_checks_finished)
@@ -299,7 +308,18 @@ class MainWindow(QMainWindow):
     def registry_checks_finished(self):
         self.lookup_thread.deleteLater()
         self.lookup_thread = None
+        after_check, self.after_registry_check = self.after_registry_check, None
         self.recheck()
+        if after_check:
+            self.continue_export(after_check)
+
+    def continue_export(self, save):
+        if self.can_export:
+            save()
+        elif self.can_refresh_for_export():
+            self.set_notice("Не удалось завершить проверку ФИФ ОЕИ. Проверьте подключение и повторите формирование XML.")
+        else:
+            self.set_notice("XML не сформирован. Откройте просмотр, чтобы проверить сведения ФИФ ОЕИ.")
 
     def recheck(self, *, inputs_checked=False):
         if not inputs_checked:
@@ -332,6 +352,15 @@ class MainWindow(QMainWindow):
             self.complete(protocol, self.group[id(protocol)]) for protocol in self.protocols
         )
 
+    def can_refresh_for_export(self):
+        return (
+            self.online and not self.busy and bool(self.protocols)
+            and len(self.registry_protocols) == len(self.protocols)
+            and not self.type_issues.keys() - self.retryable_types
+            and not any(record.equipment_conflict for record in self.results)
+            and any(self.registry.pending(self.requests, self.type_numbers, (self.requests, self.type_numbers)))
+        )
+
     def state(self, protocol, records):
         if self.busy:
             return CHECKING
@@ -341,52 +370,56 @@ class MainWindow(QMainWindow):
             return READY
         return REVIEW
 
-    def selected_protocols(self):
-        return [self.source_model.rows[index.row()][0] for index in self.source.selectionModel().selectedRows()]
-
-    def update_remove_button(self, *_):
-        self.remove_btn.setEnabled(bool(self.selected_protocols()) and not self.busy)
+    def update_marks(self):
+        select_all = self.source.horizontalHeader().select_all
+        select_all.setCheckState(self.source_model.all_check_state())
+        select_all.setEnabled(bool(self.protocols) and not self.busy)
+        self.remove_btn.setEnabled(bool(self.source_model.marked_paths) and not self.busy)
 
     def remove_protocols(self):
         if self.busy:
             return
-        removed = {id(p) for p in self.selected_protocols()}
+        removed = self.source_model.marked_paths
         if not removed:
             return
-        checked = {id(p) for p in self.registry_protocols}
-        self.protocols = [p for p in self.protocols if id(p) not in removed]
+        self.protocols = [p for p in self.protocols if p.path not in removed]
         self.recheck()
-        if any(id(p) not in checked for p in self.registry_protocols):
-            self.start_registry_checks()
 
     def render(self):
-        chosen = {id(p) for p in self.selected_protocols()}
+        chosen = selected(self.source)
         rows = []
         for protocol in self.protocols:
             records = self.group[id(protocol)]
-            rows.append((protocol, (protocol.number or protocol.path.name, protocol.reader_name,
+            rows.append((protocol, ("", protocol.number or protocol.path.name, protocol.reader_name,
                                     protocol.declared or len(records),
                                     self.state(protocol, records))))
         self.source_model.update(rows)
-        selection = self.source.selectionModel()
-        for row, (protocol, _) in enumerate(rows):
-            if id(protocol) in chosen:
-                selection.select(self.source_model.index(row, 0), QItemSelectionModel.SelectionFlag.Select |
-                                 QItemSelectionModel.SelectionFlag.Rows)
+        if chosen:
+            for row, (protocol, _) in enumerate(rows):
+                if protocol.path == chosen.path:
+                    self.source.selectRow(row)
+                    break
         screened = {id(protocol) for protocol in self.registry_protocols}
         ready = sum(not record.blockers and id(record.protocol) in screened for record in self.results)
-        total = sum(values[2] for _, values in rows)
+        total = sum(values[3] for _, values in rows)
         self.summary.setText(f"Протоколов {len(rows)}  ·  Приборов {total}  ·  Готово {ready}")
         self.empty.setVisible(not rows)
         self.source.setVisible(bool(rows))
         self.add_btn.setEnabled(not self.busy)
         self.settings_btn.setEnabled(not self.busy)
-        self.update_remove_button()
         self.preview_btn.setEnabled(bool(rows) and not self.busy)
-        self.export_btn.setEnabled(self.can_export)
-        self.export_btn.setToolTip("" if self.can_export else "Для выгрузки должны быть готовы все протоколы.")
+        refreshable = self.can_refresh_for_export()
+        self.export_btn.setEnabled(self.can_export or refreshable)
+        self.export_btn.setToolTip(
+            "Перед сохранением программа проверит сведения в ФИФ ОЕИ." if refreshable else
+            "" if self.can_export else "Для выгрузки должны быть готовы все протоколы."
+        )
         if not self.busy:
             self.set_notice("")
+
+    def open_row(self, index):
+        if index.column() != 0:
+            self.open_protocol(self.source_model.rows[index.row()][0])
 
     def open_protocol(self, protocol):
         if not self.busy:
@@ -396,16 +429,11 @@ class MainWindow(QMainWindow):
 
     def show_results(self):
         if self.protocols and not self.busy:
-            chosen = self.selected_protocols()
-            self.open_protocol(chosen[0] if chosen else None)
+            self.open_protocol(selected(self.source))
 
     def laboratory_settings(self):
         if laboratory_settings(self, self.storage):
-            eligible = {id(p) for p in self.registry_protocols}
             self.recheck()
-            if any(id(p) not in eligible for p in self.registry_protocols):
-                self.start_registry_checks()
-
 
     def output_folder(self):
         documents = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DocumentsLocation)
@@ -416,6 +444,7 @@ class MainWindow(QMainWindow):
 
     def choose_xml_path(self, proposed):
         dialog = QFileDialog(self, "Сохранить как", str(proposed.parent))
+        apply_dialog_icon(dialog)
         dialog.setAcceptMode(QFileDialog.AcceptMode.AcceptSave)
         dialog.setFileMode(QFileDialog.FileMode.AnyFile)
         dialog.setNameFilter("Файлы XML (*.xml)")
@@ -432,43 +461,44 @@ class MainWindow(QMainWindow):
         if self.busy:
             return
         self.recheck()
-        if not self.can_export:
-            return
+        if self.can_export:
+            self.save_xml()
+        elif self.can_refresh_for_export():
+            self.start_registry_checks(retry=(self.requests, self.type_numbers), after_check=self.save_xml)
+
+    def save_xml(self, destination=None, *, refresh_after_dialog=True):
         self.expiry_timer.stop()
         try:
-            self.save_xml()
+            self.write_xml(destination, refresh_after_dialog=refresh_after_dialog)
         finally:
             self.schedule_expiry()
 
-    def save_xml(self):
-        previous = self.storage.seen([r.identity for r in self.results])
-        if previous and not message(self, "Повторная выгрузка",
-                f"Ранее сформировано результатов: {len(previous)}. При повторной загрузке могут появиться дубликаты. "
-                "Сформировать XML ещё раз?", ask=True):
-            return
+    def choose_destination(self, packet_count):
+        name = self.protocols[0].number if len(self.protocols) == 1 else ""
+        name = name or date.today().isoformat()
+        stem = "Аршин_" + re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name).rstrip(". ")[:100]
+        folder = self.output_folder()
+        if packet_count == 1:
+            path = self.choose_xml_path(folder / f"{stem}.xml")
+            return ([path], path.stat() if path.exists() else None) if path is not None else None
+        chosen = QFileDialog.getExistingDirectory(self, f"Папка для XML ({packet_count} файлов)", str(folder))
+        return (split_paths(Path(chosen), stem, packet_count), None) if chosen else None
+
+    def write_xml(self, destination, *, refresh_after_dialog):
         try:
             packets = format_packets(self.results, self.schema)
-            name = self.protocols[0].number if len(self.protocols) == 1 else ""
-            name = name or date.today().isoformat()
-            stem = "Аршин_" + re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name).rstrip(". ")[:100]
-            folder = self.output_folder()
-            overwrite = None
-            if len(packets) == 1:
-                path = self.choose_xml_path(folder / f"{stem}.xml")
-                if path is None:
-                    return
-                paths = [path]
-                if path.exists():
-                    overwrite = path.stat()
-            else:
-                chosen = QFileDialog.getExistingDirectory(self, f"Папка для XML ({len(packets)} файлов)", str(folder))
-                if not chosen:
-                    return
-                paths = split_paths(Path(chosen), stem, len(packets))
-            if self.online and any(self.registry.pending(self.requests, self.type_numbers)):
-                self.start_registry_checks()
-                message(self, "Проверка ФИФ ОЕИ", "Сведения обновляются. Дождитесь окончания проверки и повторите сохранение.")
+            if destination is None or len(destination[0]) != len(packets):
+                destination = self.choose_destination(len(packets))
+            if destination is None:
                 return
+            if self.online and any(self.registry.pending(self.requests, self.type_numbers)):
+                if refresh_after_dialog:
+                    self.start_registry_checks(after_check=lambda: self.save_xml(destination, refresh_after_dialog=False))
+                else:
+                    self.recheck()
+                    self.set_notice("Срок проверки сведений ФИФ ОЕИ истёк. Нажмите «Сформировать XML» ещё раз.")
+                return
+            paths, overwrite = destination
             files = export(packets, self.schema, paths, self.storage, f"Сеанс Windows: {getuser()}",
                            overwrite=overwrite)
         except ValueError as exc:

@@ -1,4 +1,6 @@
 import argparse
+import ctypes
+from importlib.resources import files
 import json
 import logging
 from logging.handlers import RotatingFileHandler
@@ -35,11 +37,15 @@ def main(argv=None):
         report = {"version": VERSION, "registries": check_connection()}
         arguments.check_connection.write_text(json.dumps(report, ensure_ascii=False), encoding="utf-8")
         return int(any(status != "Доступен" for status in report["registries"].values()))
+    if sys.platform == "win32":
+        set_app_id = ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID
+        set_app_id.argtypes = [ctypes.c_wchar_p]
+        set_app_id("ArshinGenerator.Desktop")
     app = QApplication([sys.argv[0]])
     app.setApplicationName("Аршин · Генератор XML")
     app.setApplicationVersion(VERSION)
     apply_theme(app)
-    app.setWindowIcon(QIcon(str(Path(__file__).parent / "assets" / "app.ico")))
+    app.setWindowIcon(QIcon(str(files("arshin_generator").joinpath("assets", "app.ico"))))
     locale = QLocale("ru_RU")
     QLocale.setDefault(locale)
     translations = QLibraryInfo.path(QLibraryInfo.LibraryPath.TranslationsPath)
@@ -84,6 +90,7 @@ def main(argv=None):
             previous = storage.setting("smoke_check_count")
             storage.set_setting("smoke_check_count", str(int(previous or "0") + 1))
             report = {"version": VERSION, "data": str(data), "schema": schema.hash,
+                      "icon_sizes": sorted(size.width() for size in app.windowIcon().availableSizes()),
                       "previous": previous, "input_folder": storage.setting("input_folder"),
                       "protocols": len(window.protocols),
                       "equipment": sum(len(protocol.equipment) for protocol in window.protocols),

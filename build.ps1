@@ -24,12 +24,13 @@ try {
     $dist = Join-Path $root 'build\distribution'
     $out = Join-Path $root 'release'
     $work = Join-Path $root 'build\pyinstaller'
+    $appIcon = Join-Path $root 'arshin_generator\assets\app.ico'
     New-Item -ItemType Directory -Force $work,$dist,$out | Out-Null
     $env:PYINSTALLER_CONFIG_DIR = Join-Path $work 'cache'
     & $Python -m PyInstaller --noconfirm --clean --windowed --onedir --name ArshinGenerator `
         --paths $root --workpath $work --distpath $dist --specpath $work `
-        --icon "$root/arshin_generator/assets/app.ico" `
-        --add-data "$root/arshin_generator/assets/app.ico:arshin_generator/assets" `
+        --icon $appIcon `
+        --add-data "${appIcon}:arshin_generator/assets" `
         --add-data "$root/arshin_generator/schemas/import.2020-06-19.xsd:arshin_generator/schemas" `
         --exclude-module numpy --exclude-module pandas --exclude-module matplotlib `
         'arshin_generator/__main__.py'

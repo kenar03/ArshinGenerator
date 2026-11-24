@@ -49,8 +49,10 @@ class RegistrySession:
         )
 
     def next_expiry(self, requests, numbers):
-        expiries = [entries[key][0] for entries, keys in ((self.equipment, requests), (self.types, numbers))
-                    for key in keys if key in entries and entries[key][0] is not None]
+        now = self.clock()
+        expiries = [expiry for entries, keys in ((self.equipment, requests), (self.types, numbers))
+                    for key in keys if key in entries
+                    for expiry, _ in (entries[key],) if expiry is not None and expiry > now]
         return min(expiries, default=None)
 
     def remember(self, equipment, types):
@@ -60,7 +62,7 @@ class RegistrySession:
                 if expiry is not None and expiry <= now:
                     del entries[key]
         for key, result in equipment.items():
-            expiry = None if result.state in {"unavailable", "response"} else now + self.ttl
+            expiry = None if result.retryable else now + self.ttl
             self.equipment[key] = expiry, result
         for number, result in types.items():
             self.types[number] = (None if result.retryable else now + self.ttl), result

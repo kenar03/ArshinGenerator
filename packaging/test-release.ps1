@@ -33,6 +33,9 @@ function Test-Executable($exe, $report, [switch] $ImportSample) {
         if ($check.schema -ne 'cc92b2a1f8670d230a405d42f9ad08a729a6a35cab94751d5bb1208cf493e361') {
             throw 'Unexpected XSD.'
         }
+        if (($check.icon_sizes -join ',') -ne '16,24,32,48,64,128,256') {
+            throw 'The packaged Qt window icon is missing or incomplete.'
+        }
         if ($ImportSample -and ($check.protocols -ne 1 -or $check.instruments -ne 25 -or
                 $check.equipment -ne 7 -or $check.ready -ne 0)) {
             throw 'Workbook check failed.'
@@ -99,11 +102,24 @@ else {
         if (-not (Test-Path -LiteralPath $menu) -or -not (Test-Path -LiteralPath $desktop)) {
             throw 'Expected Start or opted-in Desktop shortcut not created.'
         }
+        $exe = Join-Path $installTarget 'ArshinGenerator.exe'
+        $shortcuts = New-Object -ComObject WScript.Shell
+        $shell = New-Object -ComObject Shell.Application
+        foreach ($link in $menu, $desktop) {
+            $shortcut = $shortcuts.CreateShortcut($link)
+            $shellItem = $shell.NameSpace((Split-Path $link)).ParseName((Split-Path $link -Leaf))
+            if ($shortcut.TargetPath -ne $exe -or $shortcut.IconLocation -ne "$exe,0" -or
+                $shellItem.ExtendedProperty('System.AppUserModel.ID') -ne 'ArshinGenerator.Desktop') {
+                throw "Incorrect shortcut target, icon or AppUserModelID: $link"
+            }
+        }
+        if ((Get-ItemPropertyValue -LiteralPath $key -Name DisplayIcon) -ne $exe) {
+            throw 'Unexpected icon for Installed apps.'
+        }
         if (Test-Path -LiteralPath (Join-Path $installTarget 'portable.flag')) { throw 'Installed build has portable mode flag.' }
         $oldLocal = $env:LOCALAPPDATA
         try {
             $env:LOCALAPPDATA = $appDataRoot
-            $exe = Join-Path $installTarget 'ArshinGenerator.exe'
             $before = Test-Executable $exe (Join-Path $qa 'installed-1.json') -ImportSample
             $after = Test-Executable $exe (Join-Path $qa 'installed-2.json')
             if ($CheckConnection) {
@@ -137,7 +153,7 @@ else {
     if (-not (Test-Path -LiteralPath (Join-Path $appDataRoot 'ArshinGenerator\arshin.sqlite3'))) {
         throw 'Uninstall removed application data.'
     }
-    $result.installer = @{ started = $true; per_user = $true; start_menu = $true; desktop_opt_in = $true;
+    $result.installer = @{ started = $true; per_user = $true; start_menu = $true; desktop_opt_in = $true; icons = $true;
                            settings_restored = $true; uninstall = $true; retained_data = $true; sample_results = 25 }
 }
 

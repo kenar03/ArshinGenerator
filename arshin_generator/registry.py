@@ -30,6 +30,10 @@ class EquipmentLookup:
     message: str
     candidates: tuple[EquipmentCandidate, ...] = ()
 
+    @property
+    def retryable(self):
+        return self.state in {"unavailable", "response"}
+
 
 def iso_date(value) -> date | None:
     if isinstance(value, str) and re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", value):

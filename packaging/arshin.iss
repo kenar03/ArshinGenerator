@@ -5,7 +5,7 @@
   #error OutputPath must point to the release directory
 #endif
 #ifndef AppVersion
-  #define AppVersion "2.0.0"
+  #define AppVersion "2.1.0"
 #endif
 
 [Setup]
@@ -41,8 +41,8 @@ Name: "desktopicon"; Description: "Создать ярлык на рабочем
 Source: "{#PortablePath}\*"; DestDir: "{app}"; Excludes: "portable.flag,data"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
-Name: "{autoprograms}\Аршин · Генератор XML"; Filename: "{app}\ArshinGenerator.exe"; WorkingDir: "{app}"
-Name: "{autodesktop}\Аршин · Генератор XML"; Filename: "{app}\ArshinGenerator.exe"; WorkingDir: "{app}"; Tasks: desktopicon
+Name: "{autoprograms}\Аршин · Генератор XML"; Filename: "{app}\ArshinGenerator.exe"; WorkingDir: "{app}"; IconFilename: "{app}\ArshinGenerator.exe"; AppUserModelID: "ArshinGenerator.Desktop"
+Name: "{autodesktop}\Аршин · Генератор XML"; Filename: "{app}\ArshinGenerator.exe"; WorkingDir: "{app}"; IconFilename: "{app}\ArshinGenerator.exe"; AppUserModelID: "ArshinGenerator.Desktop"; Tasks: desktopicon
 
 [Run]
 Filename: "{app}\ArshinGenerator.exe"; Description: "Запустить приложение"; Flags: nowait postinstall skipifsilent

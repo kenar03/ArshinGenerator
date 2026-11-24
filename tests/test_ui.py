@@ -7,9 +7,10 @@ import sqlite3
 from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
+from urllib.error import URLError
 
 from openpyxl import load_workbook
-from PySide6.QtCore import QEventLoop, QItemSelectionModel, QTimer, Qt
+from PySide6.QtCore import QEventLoop, QItemSelectionModel, QPoint, QTimer, Qt
 from PySide6.QtGui import QColor, QPalette
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
@@ -104,7 +105,7 @@ class InterfaceTests(unittest.TestCase):
         }
         main.recheck()
 
-    def test_control_protocol_export_and_repeat_warning(self):
+    def test_control_protocol_repeat_export_without_warning(self):
         with TemporaryDirectory() as directory:
             path = Path(directory)
             main = self.window(path)
@@ -115,11 +116,11 @@ class InterfaceTests(unittest.TestCase):
             main.storage.save_confirmation("protocol", protocol_key(protocol), {
                 "verification_type": "2", "sign_cipher": "ТСТ", "calibration": False, "valid_date": "2027-01-14",
             }, "Сохранившиеся реквизиты", "Тест")
-            self.assertEqual(main.source_model.headers, ("Протокол", "Тип протокола", "Приборов", "Состояние"))
+            self.assertEqual(main.source_model.headers, ("", "Протокол", "Тип протокола", "Приборов", "Состояние"))
             self.assertEqual(main.source.verticalHeader().defaultSectionSize(), 36)
             self.verify_protocols(main)
             self.assertTrue(main.export_btn.isEnabled())
-            self.assertEqual(main.source_model.rows[0][1][1:], ("ТСП/ТСМ", 25, "Готов"))
+            self.assertEqual(main.source_model.rows[0][1][2:], ("ТСП/ТСМ", 25, "Готов"))
             self.assertFalse(main.notice.text())
             overview = ProtocolDialog(main, protocol)
             self.assertEqual(overview.equipment_panel.checked, 7)
@@ -182,13 +183,14 @@ class InterfaceTests(unittest.TestCase):
             self.assertEqual(viewer.model.rowCount(), 1)
             self.assertIn("соответствует", viewer.status.text())
             viewer.close()
-            with patch.object(main, "choose_xml_path") as dialog, \
-                    patch("arshin_generator.ui.main.message", return_value=False) as prompt:
+            repeated = path / "Повтор.xml"
+            with patch.object(main, "choose_xml_path", return_value=repeated) as dialog, \
+                    patch("arshin_generator.ui.main.message") as prompt:
                 main.export_btn.click()
-                self.assertIn("25", prompt.call_args.args[2])
-                prompt.assert_called_once()
-                dialog.assert_not_called()
-            self.assertEqual(len(main.storage.history()), 1)
+                prompt.assert_not_called()
+                dialog.assert_called_once()
+            self.assertEqual(repeated.read_bytes(), file.read_bytes())
+            self.assertEqual(len(main.storage.history()), 2)
             main.close()
 
     def test_preview_identifies_only_failed_instruments_in_a_separate_section(self):
@@ -323,15 +325,38 @@ class InterfaceTests(unittest.TestCase):
                 main.export_xml()
                 dialog.assert_not_called()
             main.source.selectRow(1)
-            self.assertTrue(main.remove_btn.isEnabled())
+            self.assertFalse(main.remove_btn.isEnabled())
+            state = Qt.CheckState
+            model = main.source_model
+            header = main.source.horizontalHeader().select_all
+            main.source.setCurrentIndex(model.index(1, 0))
             self.app.processEvents()
+            rect = main.source.visualRect(model.index(1, 0))
+            QTest.mouseClick(main.source.viewport(), Qt.MouseButton.LeftButton,
+                             pos=QPoint(rect.left() + 10, rect.center().y()))
+            self.assertEqual(model.marked_paths, {second.path})
+            self.assertEqual(header.checkState(), state.PartiallyChecked)
+            self.assertTrue(main.remove_btn.isEnabled())
+            main.source.selectRow(0)
             main.source.setFocus()
             QTest.keyClick(main.source, Qt.Key.Key_Delete)
-            self.assertEqual(len(main.protocols), 2)
+            self.assertEqual([p.path for p in main.protocols], [first.path, third.path])
+            self.assertEqual(header.checkState(), state.Unchecked)
             self.assertTrue(main.export_btn.isEnabled())
-            flags = QItemSelectionModel.SelectionFlag
-            for index in range(2):
-                main.source.selectionModel().select(main.source_model.index(index, 0), flags.Select | flags.Rows)
+            model.setData(model.index(0, 0), state.Checked, Qt.ItemDataRole.CheckStateRole)
+            with patch.object(main, "choose_xml_path", return_value=path / "all.xml"):
+                main.export_btn.click()
+            root, issues, _ = open_xml(path / "all.xml", main.schema)
+            self.assertFalse(issues)
+            self.assertEqual(root.xpath("g:result/g:miInfo/g:singleMI/g:manufactureNum/text()", namespaces={"g": NS}),
+                             ["001B6", "003B6"])
+            QTest.mouseClick(header, Qt.MouseButton.LeftButton)
+            self.assertEqual(header.checkState(), state.Checked)
+            QTest.mouseClick(header, Qt.MouseButton.LeftButton)
+            self.assertEqual(header.checkState(), state.Unchecked)
+            self.assertFalse(main.remove_btn.isEnabled())
+            self.assertTrue(main.export_btn.isEnabled())
+            QTest.mouseClick(header, Qt.MouseButton.LeftButton)
             main.remove_btn.click()
             self.assertIn("Протоколов 0", main.summary.text())
             self.assertFalse(main.remove_btn.isEnabled())
@@ -408,15 +433,19 @@ class InterfaceTests(unittest.TestCase):
             self.wait_for_import(main)
             self.assertTrue(main.can_export)
             self.assertEqual(sum(server.calls.values()), 3)
+            main.source_model.set_all_checked(True)
             main.import_paths([file, second])
             self.wait_for_import(main)
             self.assertEqual(len(main.protocols), 2)
             self.assertTrue(main.can_export)
             self.assertEqual(sum(server.calls.values()), 3)
+            self.assertEqual(main.source_model.marked_paths, {file})
+            self.assertEqual(main.source.horizontalHeader().select_all.checkState(), Qt.CheckState.PartiallyChecked)
 
             main.source.selectRow(0)
             with patch.object(ProtocolDialog, "exec", return_value=0):
                 main.show_results()
+                main.source.doubleClicked.emit(main.source_model.index(1, 1))
             dialog = ProtocolDialog(main)
             self.assertIn("001B6", [label.text() for label in dialog.scroll.widget().findChildren(QLabel)])
             dialog.selector.setCurrentIndex(1)
@@ -430,17 +459,141 @@ class InterfaceTests(unittest.TestCase):
                 main.settings_btn.click()
             main.recheck()
             self.assertEqual(sum(server.calls.values()), 3)
+            self.assertEqual(main.source_model.marked_paths, {file})
 
+            third = path / "third.xlsx"
+            fixture(third, "ТЕСТ-НОВОЕ-СРЕДСТВО", "003B6", sticker="", equipment_serial="0002")
+            main.import_paths([third])
+            self.wait_for_import(main)
+            self.assertTrue(main.can_export)
+            self.assertEqual(sum(server.calls.values()), 4)
+            self.assertTrue(any("mi_number=0002" in url for url in server.calls))
             fixture(file, "ТЕСТ-ПЕРВЫЙ", "001B6", sticker="", day=date(2027, 1, 2))
             main.import_paths([file])
             self.wait_for_import(main)
-            self.assertEqual(sum(server.calls.values()), 4)
+            self.assertEqual(main.source_model.marked_paths, {file})
+            self.assertEqual(sum(server.calls.values()), 5)
             self.assertFalse(main.can_export)
+            self.assertFalse(main.export_btn.isEnabled())
             self.assertEqual(main.source_model.rows[0][1][-1], "Требует проверки")
             self.assertEqual(main.source_model.rows[1][1][-1], "Готов")
             details = ProtocolDialog(main, main.protocols[0])
             self.assertIn("Срок поверки средства истёк", details.equipment_panel.item_model.rows[0][1][-1])
             details.close()
+
+    def test_expiry_is_passive_and_export_renews_only_stale_entries(self):
+        with TemporaryDirectory() as directory, registry_http() as server:
+            path = Path(directory)
+            ticks = [0]
+            session = RegistrySession(clock=lambda: ticks[0], opener=server.opener)
+            main = self.window(path, online=True, registry_session=session)
+            seed_lab(main.storage)
+            first = fixture(path / "first.xlsx", "ТЕСТ-1", "001B6", sticker="")
+            second = fixture(path / "second.xlsx", "ТЕСТ-2", "002B6", sticker="", equipment_serial="002")
+            main.import_paths([first.path])
+            self.wait_for_import(main)
+            self.assertEqual(sum(server.calls.values()), 3)
+            ticks[0] = 450
+            main.import_paths([second.path])
+            self.wait_for_import(main)
+            self.assertEqual(sum(server.calls.values()), 4)
+            self.assertTrue(main.can_export)
+            initial = server.calls.copy()
+
+            ticks[0] = 900
+            main.expiry_timer.start(1)
+            QTest.qWait(20)
+            self.assertFalse(main.can_export)
+            self.assertTrue(main.export_btn.isEnabled())
+            self.assertEqual(main.expiry_timer.interval(), 450_000)
+            with patch.object(ProtocolDialog, "exec", return_value=0) as preview:
+                main.open_protocol(main.protocols[0])
+                main.open_protocol(main.protocols[1])
+                self.assertEqual(preview.call_count, 2)
+            self.assertEqual(server.calls, initial)
+
+            output = path / "verified.xml"
+            with patch.object(main, "choose_xml_path", return_value=output) as chooser:
+                main.export_btn.click()
+                self.assertTrue(main.busy)
+                self.assertFalse(main.export_btn.isEnabled())
+                chooser.assert_not_called()
+                self.wait_for_import(main)
+                chooser.assert_called_once()
+            new_requests = server.calls - initial
+            self.assertEqual(sum(new_requests.values()), 3)
+            self.assertFalse(any("mi_number=002" in url for url in new_requests))
+            root, issues, _ = open_xml(output, main.schema)
+            self.assertEqual(len(root), 2)
+            self.assertFalse(issues)
+
+    def test_expiry_during_save_dialog_preserves_destination_and_continues(self):
+        with TemporaryDirectory() as directory, registry_http() as server:
+            path = Path(directory)
+            ticks = [0]
+            session = RegistrySession(clock=lambda: ticks[0], opener=server.opener)
+            main = self.window(path, online=True, registry_session=session)
+            seed_lab(main.storage)
+            protocol = fixture(path / "input.xlsx", "ТЕСТ-ДИАЛОГ", "001B6", sticker="")
+            main.import_paths([protocol.path])
+            self.wait_for_import(main)
+            output = path / "after dialog.xml"
+
+            def choose(_):
+                ticks[0] += 900
+                return output
+
+            with patch.object(main, "choose_xml_path", side_effect=choose) as chooser:
+                main.export_btn.click()
+                self.assertFalse(output.exists())
+                self.wait_for_import(main)
+                chooser.assert_called_once()
+            self.assertTrue(output.is_file())
+            self.assertEqual(sum(server.calls.values()), 6)
+
+    def test_export_retry_after_connection_error_and_http_429(self):
+        for failure, attempts, http_requests in (("connection", 3, 0), ("rate", 1, 1)):
+            with self.subTest(failure=failure), TemporaryDirectory() as directory, registry_http() as server:
+                path = Path(directory)
+                ticks = [0]
+                session = RegistrySession(clock=lambda: ticks[0], opener=server.opener)
+                main = self.window(path, online=True, registry_session=session)
+                seed_lab(main.storage)
+                protocol = fixture(path / "input.xlsx", "ТЕСТ-СБОЙ", "001B6", sticker="")
+                main.import_paths([protocol.path])
+                self.wait_for_import(main)
+                self.assertTrue(main.can_export)
+                ticks[0] = 900
+                before = server.calls.copy()
+                server.failure = 429 if failure == "rate" else 0
+
+                def opener(request, *args, **kwargs):
+                    if failure == "connection" and "/vri?" in request.full_url:
+                        raise URLError("Соединение отсутствует")
+                    return server.opener(request, *args, **kwargs)
+
+                output = path / "retry.xml"
+                with patch.object(session, "opener", side_effect=opener) as requests, \
+                        patch("arshin_generator.public_registry.sleep") as delay, \
+                        patch.object(main, "choose_xml_path", return_value=output) as chooser:
+                    main.export_btn.click()
+                    self.wait_for_import(main)
+                    chooser.assert_not_called()
+                    self.assertFalse(output.exists())
+                    self.assertFalse(main.can_export)
+                    self.assertTrue(main.export_btn.isEnabled())
+                    self.assertIn("Не удалось завершить проверку", main.notice.text())
+                    self.assertEqual(sum("/vri?" in call.args[0].full_url for call in requests.call_args_list), attempts)
+                    self.assertEqual(sum((server.calls - before).values()), 2 + http_requests)
+                    self.assertEqual(delay.call_count, 2 if failure == "connection" else 0)
+                    before = server.calls.copy()
+                    server.failure = 0
+                    requests.side_effect = server.opener
+                    main.export_btn.click()
+                    self.wait_for_import(main)
+                    chooser.assert_called_once()
+                    self.assertTrue(output.exists())
+                    self.assertEqual(sum((server.calls - before).values()), 1)
 
     def test_single_missing_excel_fields_block_before_any_http(self):
         with TemporaryDirectory() as directory, registry_http() as server:
@@ -471,7 +624,7 @@ class InterfaceTests(unittest.TestCase):
             second.preview_fields = (PreviewField("model", "Обозначение испытаний"),)
             main.protocols = [first, second]
             self.verify_protocols(main)
-            self.assertEqual([row[1][1] for row in main.source_model.rows], ["ТСП/ТСМ", "Тестовый формат"])
+            self.assertEqual([row[1][2] for row in main.source_model.rows], ["ТСП/ТСМ", "Тестовый формат"])
             preview = ProtocolDialog(main, first)
             texts = [label.text() for label in preview.scroll.widget().findChildren(QLabel)]
             self.assertIn("ТСП/ТСМ", texts)

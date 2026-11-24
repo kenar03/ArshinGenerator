@@ -4,7 +4,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QComboBox, QDialog, QFormLayout, QFrame, QHBoxLayout, QScrollArea, QVBoxLayout, QWidget
 
 from ..registry import iso_date
-from .common import button, display, fit_window, label
+from .common import apply_dialog_icon, button, display, fit_window, label
 from .dialogs import EquipmentReviewPanel
 
 SERIES_NUMBER = re.compile(r"([0-9]+)([A-Za-zА-Яа-яЁё][A-Za-zА-Яа-яЁё0-9]*)?")
@@ -58,6 +58,7 @@ def section_label(text):
 class ProtocolDialog(QDialog):
     def __init__(self, window, protocol=None):
         super().__init__(window)
+        apply_dialog_icon(self)
         self.window = window
         self.setWindowTitle("Сведения о поверке")
         fit_window(self, 835, 600)
@@ -115,7 +116,7 @@ class ProtocolDialog(QDialog):
             if in_registry_stage:
                 requests, number = self.window.registry_keys(protocol)
                 retry = number in self.window.retryable_types or any(
-                    self.window.lookups[key].state in {"unavailable", "response"}
+                    self.window.lookups[key].retryable
                     for key in requests if key in self.window.lookups
                 )
                 if retry and not self.window.busy:

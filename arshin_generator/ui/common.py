@@ -1,11 +1,12 @@
 from datetime import date, datetime
+import sys
 
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QComboBox, QDialog, QFormLayout, QHBoxLayout, QLabel, QLineEdit, QMessageBox,
     QPlainTextEdit, QPushButton, QScrollArea, QTableView, QVBoxLayout, QWidget,
-    QAbstractItemView, QHeaderView,
+    QAbstractItemView, QApplication, QHeaderView,
 )
 
 from ..domain import ERROR, READY, REVIEW, UNSUPPORTED
@@ -29,8 +30,15 @@ def label(text, style="muted"):
     return widget
 
 
+def apply_dialog_icon(dialog):
+    dialog.setWindowIcon(QApplication.windowIcon())
+    if sys.platform == "win32":
+        dialog.setWindowFlag(Qt.WindowType.WindowSystemMenuHint)
+
+
 def message(parent, title, detail, *, ask=False, error=False):
     dialog = QMessageBox(parent)
+    apply_dialog_icon(dialog)
     dialog.setWindowTitle(title)
     dialog.setTextFormat(Qt.TextFormat.PlainText)
     dialog.setText(detail)
@@ -92,9 +100,11 @@ class TableModel(QAbstractTableModel):
         return None
 
 
-def table(headers, widths):
+def table(headers, widths, *, model_class=TableModel, header_class=None):
     view = QTableView()
-    model = TableModel(headers, view)
+    if header_class:
+        view.setHorizontalHeader(header_class(view))
+    model = model_class(headers, view)
     view.setModel(model)
     view.setAlternatingRowColors(True)
     view.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
@@ -198,6 +208,7 @@ class Fields(QWidget):
 class Form(QDialog):
     def __init__(self, parent, title, guidance="", *, size=(610, 700), save="Сохранить"):
         super().__init__(parent)
+        apply_dialog_icon(self)
         self.setWindowTitle(title)
         fit_window(self, *size)
         self.editor = Fields()

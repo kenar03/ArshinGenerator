@@ -121,6 +121,7 @@ def check(protocols: list[Protocol], confirmations: dict, registry: list[Registr
         shared, issues = _prepare(protocol, laboratory or {}, confirmations)
         equipment = []
         equipment_issues = []
+        equipment_conflict = False
         when = iso_date(shared.get("verification_date", Datum(None, "")).value)
         for item in protocol.equipment:
             if not check_registry:
@@ -133,12 +134,14 @@ def check(protocols: list[Protocol], confirmations: dict, registry: list[Registr
                 equipment.extend(entries)
             else:
                 equipment_issues.append(f"{item.name or item.description} · {error.rstrip('.')}.")
+                equipment_conflict |= online is not None and not online.retryable
         identities = [
             (e.category, e.type_number, e.registry_serial, e.identity_kind) if e.category == "mis"
             else (e.category, e.identifier) for e in equipment
         ]
         if len(set(identities)) != len(identities):
             equipment_issues.append("Несколько средств поверки сопоставлены с одной записью реестра.")
+            equipment_conflict = True
         number = shared.get("type_number", Datum(None, "")).value
         type_issue = type_issues.get(number, "") if check_registry and type_issues else ""
         registry_issues = tuple(dict.fromkeys(([type_issue] if type_issue else []) + equipment_issues))
@@ -163,7 +166,8 @@ def check(protocols: list[Protocol], confirmations: dict, registry: list[Registr
                                              sticker.raw)
             result = Result(protocol, instrument, fields, equipment,
                             shared_issues=tuple(dict.fromkeys(issues + list(registry_issues))),
-                            equipment_issues=tuple(dict.fromkeys(equipment_issues)), registry_issues=registry_issues)
+                            equipment_issues=tuple(dict.fromkeys(equipment_issues)), registry_issues=registry_issues,
+                            equipment_conflict=equipment_conflict)
             if instrument.problem:
                 result.issues.append(instrument.problem if "Проверьте" in instrument.problem else
                                      f"{instrument.problem} Проверьте {instrument.source}.")

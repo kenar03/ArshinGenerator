@@ -117,6 +117,7 @@ class Result:
     shared_issues: tuple[str, ...] = ()
     equipment_issues: tuple[str, ...] = ()
     registry_issues: tuple[str, ...] = ()
+    equipment_conflict: bool = False
     incomplete_measurements: bool = False
 
     def value(self, name: str) -> Scalar:
