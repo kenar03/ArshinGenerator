@@ -1,10 +1,11 @@
 import re
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QUrl
+from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import QComboBox, QDialog, QFormLayout, QFrame, QHBoxLayout, QScrollArea, QVBoxLayout, QWidget
 
 from ..registry import iso_date
-from .common import apply_dialog_icon, button, display, fit_window, label
+from .common import apply_dialog_icon, button, display, fit_window, label, message
 from .dialogs import EquipmentReviewPanel
 
 SERIES_NUMBER = re.compile(r"([0-9]+)([A-Za-zА-Яа-яЁё][A-Za-zА-Яа-яЁё0-9]*)?")
@@ -80,16 +81,34 @@ class ProtocolDialog(QDialog):
         layout.addWidget(self.scroll, 1)
         row = QHBoxLayout()
         row.addStretch()
+        self.open_excel_btn = button("Открыть в Excel", self.open_excel)
+        row.addWidget(self.open_excel_btn)
         row.addWidget(button("Закрыть", self.accept))
         layout.addLayout(row)
         self.selector.currentIndexChanged.connect(self.refresh)
         window.checked.connect(self.refresh)
         self.refresh()
 
+    def open_excel(self):
+        if self.protocol is None:
+            return
+        path = self.protocol.path
+        try:
+            with path.open("rb"):
+                pass
+        except OSError:
+            pass
+        else:
+            if QDesktopServices.openUrl(QUrl.fromLocalFile(str(path))):
+                return
+        message(self, "Исходный протокол", "Не удалось открыть исходный протокол. Проверьте, существует ли файл.",
+                error=True)
+
     def refresh(self):
         protocol = self.selector.currentData()
         expanded = self.protocol is protocol and self.serial_toggle is not None and self.serial_toggle.isChecked()
         self.protocol = protocol
+        self.open_excel_btn.setEnabled(protocol is not None)
         self.serial_toggle = None
         self.records = self.window.group.get(id(protocol), [])
         self.equipment_panel = None

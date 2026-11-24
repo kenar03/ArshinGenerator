@@ -199,15 +199,28 @@ def verify_disk_content(payload, items, schema):
         raise ValueError("Содержимое XML не совпадает с предварительным просмотром.")
 
 
-def split_paths(directory: Path, stem: str, count: int):
+def _unused_stem(stem: str, taken: set[str]):
     base = stem
     revision = 2
-    while True:
-        paths = [directory / f"{base}_{index:03d}.xml" for index in range(1, count + 1)]
-        if not any(path.exists() for path in paths):
-            return paths
+    while base.casefold() in taken:
         base = f"{stem}_{revision}"
         revision += 1
+    return base
+
+
+def split_paths(directory: Path, stem: str, count: int):
+    # Reserve the entire series even if only a later part of an earlier export still exists.
+    taken = {match[1] for path in directory.iterdir()
+             if (match := re.fullmatch(r"(.+)_[0-9]{3,}\.xml", path.name.casefold()))}
+    base = _unused_stem(stem, taken)
+    return [directory / f"{base}_{index:03d}.xml" for index in range(1, count + 1)]
+
+
+def automatic_paths(directory: Path, stem: str, count: int):
+    if count > 1:
+        return split_paths(directory, stem, count)
+    taken = {path.stem.casefold() for path in directory.iterdir() if path.suffix.casefold() == ".xml"}
+    return [directory / f"{_unused_stem(stem, taken)}.xml"]
 
 
 def _file_identity(stat):

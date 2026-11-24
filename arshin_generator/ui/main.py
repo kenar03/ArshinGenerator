@@ -14,7 +14,8 @@ from PySide6.QtWidgets import (
     QVBoxLayout, QWidget,
 )
 
-from ..arshin import export, format_packets, split_paths
+from .. import APP_NAME
+from ..arshin import automatic_paths, export, format_packets, split_paths
 from ..domain import CHECKING, ERROR, READY, REVIEW
 from ..readers import EXTENSIONS, read_protocol
 from ..registry import iso_date, lookup_key
@@ -81,7 +82,7 @@ class MainWindow(QMainWindow):
         self.expiry_timer.setSingleShot(True)
         self.expiry_timer.setTimerType(Qt.TimerType.PreciseTimer)
         self.expiry_timer.timeout.connect(self.recheck)
-        self.setWindowTitle("Аршин · Генератор XML")
+        self.setWindowTitle(APP_NAME)
         self.setMinimumSize(680, 440)
         fit_window(self, 900, 600)
         self.setAcceptDrops(True)
@@ -438,8 +439,13 @@ class MainWindow(QMainWindow):
     def output_folder(self):
         documents = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DocumentsLocation)
         saved = self.storage.setting("output_folder")
-        if saved and Path(saved).is_dir():
-            return Path(saved)
+        if saved:
+            try:
+                folder = Path(saved)
+                if folder.is_dir():
+                    return folder
+            except OSError:
+                pass
         return Path(documents) if documents and Path(documents).is_dir() else Path.home()
 
     def choose_xml_path(self, proposed):
@@ -466,17 +472,19 @@ class MainWindow(QMainWindow):
         elif self.can_refresh_for_export():
             self.start_registry_checks(retry=(self.requests, self.type_numbers), after_check=self.save_xml)
 
-    def save_xml(self, destination=None, *, refresh_after_dialog=True):
+    def save_xml(self, destination=None, *, alternate_folder=None, refresh_after_dialog=True):
         self.expiry_timer.stop()
         try:
-            self.write_xml(destination, refresh_after_dialog=refresh_after_dialog)
+            self.write_xml(destination, alternate_folder=alternate_folder, refresh_after_dialog=refresh_after_dialog)
         finally:
             self.schedule_expiry()
 
-    def choose_destination(self, packet_count):
+    def xml_stem(self):
         name = self.protocols[0].number if len(self.protocols) == 1 else ""
         name = name or date.today().isoformat()
-        stem = "Аршин_" + re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name).rstrip(". ")[:100]
+        return APP_NAME + "_" + re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name).rstrip(". ")[:100]
+
+    def choose_destination(self, stem, packet_count):
         folder = self.output_folder()
         if packet_count == 1:
             path = self.choose_xml_path(folder / f"{stem}.xml")
@@ -484,23 +492,70 @@ class MainWindow(QMainWindow):
         chosen = QFileDialog.getExistingDirectory(self, f"Папка для XML ({packet_count} файлов)", str(folder))
         return (split_paths(Path(chosen), stem, packet_count), None) if chosen else None
 
-    def write_xml(self, destination, *, refresh_after_dialog):
+    def defer_stale_export(self, resume, refresh_after_dialog):
+        if not self.online or not any(self.registry.pending(self.requests, self.type_numbers)):
+            return False
+        if refresh_after_dialog:
+            self.start_registry_checks(after_check=resume)
+        else:
+            self.recheck()
+            self.set_notice("Срок проверки сведений ФИФ ОЕИ истёк. Нажмите «Сформировать XML» ещё раз.")
+        return True
+
+    def write_in_folder(self, packets, stem, folder, *, alternate_folder, refresh_after_dialog):
+        if not folder.is_absolute():
+            raise OSError("Не указана папка автоматического сохранения.")
+        for attempt in range(3):
+            paths = automatic_paths(folder, stem, len(packets))
+            if self.defer_stale_export(
+                lambda: self.save_xml(alternate_folder=alternate_folder, refresh_after_dialog=False),
+                refresh_after_dialog,
+            ):
+                return None
+            try:
+                return export(packets, self.schema, paths, self.storage, f"Сеанс Windows: {getuser()}")
+            except FileExistsError:
+                if attempt == 2:
+                    raise
+
+    def save_automatically(self, packets, stem, configured_folder, alternate_folder, refresh_after_dialog):
+        folder = alternate_folder if alternate_folder is not None else Path(configured_folder)
+        try:
+            return self.write_in_folder(packets, stem, folder, alternate_folder=alternate_folder,
+                                        refresh_after_dialog=refresh_after_dialog)
+        except OSError:
+            if alternate_folder is not None:
+                raise
+            logging.warning("Не удалось сохранить XML в настроенную папку", exc_info=True)
+        if message(self, "Сохранение XML",
+                   f"Не удалось сохранить XML в настроенную папку. Проверьте доступ и свободное место.\n"
+                   f"{configured_folder}\n\nВыбрать другую папку для этой выгрузки?",
+                   ask=True, confirm_text="Выбрать папку…"):
+            chosen = QFileDialog.getExistingDirectory(self, "Папка для этой выгрузки", str(self.output_folder()))
+            if chosen:
+                folder = Path(chosen)
+                return self.write_in_folder(packets, stem, folder, alternate_folder=folder,
+                                            refresh_after_dialog=refresh_after_dialog)
+        self.set_notice("XML не сохранён.")
+        return None
+
+    def write_xml(self, destination, *, alternate_folder, refresh_after_dialog):
         try:
             packets = format_packets(self.results, self.schema)
-            if destination is None or len(destination[0]) != len(packets):
-                destination = self.choose_destination(len(packets))
-            if destination is None:
-                return
-            if self.online and any(self.registry.pending(self.requests, self.type_numbers)):
-                if refresh_after_dialog:
-                    self.start_registry_checks(after_check=lambda: self.save_xml(destination, refresh_after_dialog=False))
-                else:
-                    self.recheck()
-                    self.set_notice("Срок проверки сведений ФИФ ОЕИ истёк. Нажмите «Сформировать XML» ещё раз.")
-                return
-            paths, overwrite = destination
-            files = export(packets, self.schema, paths, self.storage, f"Сеанс Windows: {getuser()}",
-                           overwrite=overwrite)
+            stem = self.xml_stem()
+            automatic, configured_folder = self.storage.xml_output()
+            if automatic:
+                files = self.save_automatically(packets, stem, configured_folder, alternate_folder, refresh_after_dialog)
+            else:
+                if destination is None or len(destination[0]) != len(packets):
+                    destination = self.choose_destination(stem, len(packets))
+                if destination is None or self.defer_stale_export(
+                    lambda: self.save_xml(destination, refresh_after_dialog=False), refresh_after_dialog
+                ):
+                    return
+                paths, overwrite = destination
+                files = export(packets, self.schema, paths, self.storage, f"Сеанс Windows: {getuser()}",
+                               overwrite=overwrite)
         except ValueError as exc:
             logging.exception("Ошибка проверки формата XML")
             message(self, "Проверка формата XML", str(exc), error=True)
@@ -509,9 +564,13 @@ class MainWindow(QMainWindow):
             logging.exception("Ошибка формирования XML")
             message(self, "Сохранение XML", "Не удалось сохранить XML. Проверьте права доступа и свободное место.", error=True)
             return
-        try:
-            self.storage.set_setting("output_folder", str(files[0].parent))
-        except sqlite3.Error:
-            logging.exception("Не удалось запомнить папку выгрузки")
+        if not files:
+            return
+        if not automatic:
+            try:
+                self.storage.set_setting("output_folder", str(files[0].parent))
+            except sqlite3.Error:
+                logging.exception("Не удалось запомнить папку ручного сохранения")
         suffix = f" · файлов {len(files)}" if len(files) > 1 else ""
-        self.set_notice(f"XML сохранён: {len(self.results)} записей{suffix}")
+        location = files[0].parent if len(files) > 1 else files[0]
+        self.set_notice(f"XML сохранён: {len(self.results)} записей{suffix}\n{location}")

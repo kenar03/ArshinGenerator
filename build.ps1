@@ -26,21 +26,27 @@ try {
     $work = Join-Path $root 'build\pyinstaller'
     $appIcon = Join-Path $root 'arshin_generator\assets\app.ico'
     New-Item -ItemType Directory -Force $work,$dist,$out | Out-Null
+    $version = & $Python -c 'from arshin_generator import VERSION; print(VERSION)'
+    if ($LASTEXITCODE -ne 0 -or $version -notmatch '^\d+\.\d+\.\d+$') { throw 'Invalid application version.' }
+    $versionResource = Join-Path $work 'version-info.txt'
+    $versionTemplate = Get-Content -Raw -Encoding utf8 -LiteralPath 'packaging/windows-version.txt'
+    $versionInfo = $versionTemplate.Replace('@VERSION@', $version).Replace('@VERSION_TUPLE@', ($version.Replace('.', ', ') + ', 0'))
+    [IO.File]::WriteAllText($versionResource, $versionInfo)
     $env:PYINSTALLER_CONFIG_DIR = Join-Path $work 'cache'
-    & $Python -m PyInstaller --noconfirm --clean --windowed --onedir --name ArshinGenerator `
+    & $Python -m PyInstaller --noconfirm --clean --windowed --onedir --name SI-Export `
         --paths $root --workpath $work --distpath $dist --specpath $work `
-        --icon $appIcon `
+        --icon $appIcon --version-file $versionResource `
         --add-data "${appIcon}:arshin_generator/assets" `
         --add-data "$root/arshin_generator/schemas/import.2020-06-19.xsd:arshin_generator/schemas" `
         --exclude-module numpy --exclude-module pandas --exclude-module matplotlib `
         'arshin_generator/__main__.py'
     if ($LASTEXITCODE -ne 0) { throw 'PyInstaller failed.' }
-    $portable = Join-Path $dist 'ArshinGenerator'
+    $portable = Join-Path $dist 'SI-Export'
     New-Item -ItemType File -Force (Join-Path $portable 'portable.flag') | Out-Null
     Copy-Item docs/quick_start.md (Join-Path $portable 'Инструкция.md')
     & $Python packaging/collect_licenses.py $portable
     if ($LASTEXITCODE -ne 0) { throw 'Could not collect third-party notices.' }
-    Compress-Archive -LiteralPath $portable -DestinationPath (Join-Path $out 'ArshinGenerator-Portable-x64.zip') -Force
+    Compress-Archive -LiteralPath $portable -DestinationPath (Join-Path $out 'SI-Export-Portable-x64.zip') -Force
 
     if (-not $PortableOnly) {
         if (-not $IsccPath) {
@@ -57,7 +63,6 @@ try {
         if (-not $IsccPath -or -not (Test-Path -LiteralPath $IsccPath)) {
             throw 'Portable build is ready. Set -IsccPath to the Inno Setup 6 ISCC.exe path.'
         }
-        $version = & $Python -c 'from arshin_generator import VERSION; print(VERSION)'
         & $IsccPath "/DPortablePath=$portable" "/DOutputPath=$out" "/DAppVersion=$version" 'packaging/arshin.iss'
         if ($LASTEXITCODE -ne 0) { throw 'Inno Setup failed.' }
     }

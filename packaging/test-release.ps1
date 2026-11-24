@@ -1,5 +1,11 @@
-﻿param([switch] $TestInstaller, [switch] $CheckConnection)
+﻿param(
+    [switch] $TestInstaller,
+    [switch] $CheckConnection,
+    [string] $UpgradeFrom = '',
+    [string] $Python = 'python'
+)
 $ErrorActionPreference = 'Stop'
+if ($UpgradeFrom -and -not $TestInstaller) { throw 'Set -TestInstaller with -UpgradeFrom.' }
 $root = Split-Path $PSScriptRoot
 $release = Join-Path $root 'release'
 $qa = Join-Path $root ('build\qa-' + [guid]::NewGuid().ToString('N').Substring(0,8))
@@ -13,7 +19,7 @@ function Get-WorkbookHash {
 }
 $baseHash = Get-WorkbookHash
 
-function Test-Executable($exe, $report, [switch] $ImportSample) {
+function Test-Executable($exe, $report, [switch] $ImportSample, [switch] $Legacy) {
     $args = @('--smoke-check', ('"' + $report + '"'))
     if ($ImportSample) { $args += ('"' + $sample + '"') }
     $oldPath = $env:PATH
@@ -35,6 +41,16 @@ function Test-Executable($exe, $report, [switch] $ImportSample) {
         }
         if (($check.icon_sizes -join ',') -ne '16,24,32,48,64,128,256') {
             throw 'The packaged Qt window icon is missing or incomplete.'
+        }
+        if ($Legacy) {
+            if ($check.version -ne '2.1.0') { throw 'The upgrade baseline must be 2.1.0.' }
+        }
+        else {
+            $metadata = (Get-Item -LiteralPath $exe).VersionInfo
+            if ($check.name -ne 'СИ-Экспорт' -or $metadata.ProductName -ne $check.name -or
+                $metadata.FileVersion -ne $check.version -or $metadata.OriginalFilename -ne 'SI-Export.exe') {
+                throw 'Unexpected Windows executable or Qt application metadata.'
+            }
         }
         if ($ImportSample -and ($check.protocols -ne 1 -or $check.instruments -ne 25 -or
                 $check.equipment -ne 7 -or $check.ready -ne 0)) {
@@ -65,44 +81,101 @@ function Test-RegistryConnection($exe, $report) {
 
 $result = [ordered]@{ test_path = $qa; excel_unchanged = $false }
 if (-not $TestInstaller) {
-    Expand-Archive -LiteralPath (Join-Path $release 'ArshinGenerator-Portable-x64.zip') -DestinationPath $qa
-    $portable = Join-Path $qa 'ArshinGenerator'
-    $relocated = Join-Path $qa 'Перенесённая папка Аршин'
-    $before = Test-Executable (Join-Path $portable 'ArshinGenerator.exe') (Join-Path $qa 'portable-1.json') -ImportSample
+    Expand-Archive -LiteralPath (Join-Path $release 'SI-Export-Portable-x64.zip') -DestinationPath $qa
+    $portable = Join-Path $qa 'SI-Export'
+    $relocated = Join-Path $qa 'Перенесённая папка СИ-Экспорт'
+    $before = Test-Executable (Join-Path $portable 'SI-Export.exe') (Join-Path $qa 'portable-1.json') -ImportSample
     if ($before.data -ne (Join-Path $portable 'data')) { throw 'Incorrect portable data directory.' }
     Move-Item -LiteralPath $portable -Destination $relocated
-    $after = Test-Executable (Join-Path $relocated 'ArshinGenerator.exe') (Join-Path $qa 'portable-2.json')
+    $after = Test-Executable (Join-Path $relocated 'SI-Export.exe') (Join-Path $qa 'portable-2.json')
     if ($after.previous -ne '1' -or $after.data -ne (Join-Path $relocated 'data') -or
             $after.input_folder -ne $before.input_folder) { throw 'Portable data did not survive the move.' }
     $result.portable = @{ started = $true; relocated = $true; restored_last_folder = $true; sample_results = 25 }
     if ($CheckConnection) {
-        $result.connection = Test-RegistryConnection (Join-Path $relocated 'ArshinGenerator.exe') (Join-Path $qa 'portable-connection.json')
+        $result.connection = Test-RegistryConnection (Join-Path $relocated 'SI-Export.exe') (Join-Path $qa 'portable-connection.json')
     }
 }
 else {
     $installTarget = Join-Path $qa 'Тест установки'
-    $installer = Join-Path $release 'ArshinGenerator-Setup-x64.exe'
+    $installer = Join-Path $release 'SI-Export-Setup-x64.exe'
     $appDataRoot = Join-Path $qa 'UserProfileData'
     $key = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\{6462E024-6818-4B52-AA51-9ED6CCB87EC2}_is1'
-    $menu = Join-Path ([Environment]::GetFolderPath('Programs')) 'Аршин · Генератор XML.lnk'
-    $desktop = Join-Path ([Environment]::GetFolderPath('DesktopDirectory')) 'Аршин · Генератор XML.lnk'
-    if ((Test-Path -LiteralPath $key) -or (Test-Path -LiteralPath $menu) -or (Test-Path -LiteralPath $desktop)) {
-        throw 'An existing installation or shortcut is present. The test leaves it untouched.'
+    $programs = [Environment]::GetFolderPath('Programs')
+    $desktopFolder = [Environment]::GetFolderPath('DesktopDirectory')
+    $menu = Join-Path $programs 'СИ-Экспорт.lnk'
+    $desktop = Join-Path $desktopFolder 'СИ-Экспорт.lnk'
+    $legacyMenu = Join-Path $programs 'Аршин · Генератор XML.lnk'
+    $legacyDesktop = Join-Path $desktopFolder 'Аршин · Генератор XML.lnk'
+    foreach ($item in $key, $menu, $desktop) {
+        if (Test-Path -LiteralPath $item) {
+            throw 'An existing installation or shortcut is present. The test leaves it untouched.'
+        }
     }
-    $installed = $false
+    $existingLegacyLinks = @{}
+    foreach ($link in $legacyMenu, $legacyDesktop) {
+        if (Test-Path -LiteralPath $link) {
+            if ($UpgradeFrom) { throw 'A previous shortcut already exists. The upgrade test leaves it untouched.' }
+            $existingLegacyLinks[$link] = (Get-FileHash -LiteralPath $link).Hash
+        }
+    }
     $uninstaller = Join-Path $installTarget 'unins000.exe'
+    $exe = Join-Path $installTarget 'SI-Export.exe'
+    $legacyExe = Join-Path $installTarget 'ArshinGenerator.exe'
+    $database = Join-Path $appDataRoot 'ArshinGenerator\arshin.sqlite3'
+    $oldLocal = $env:LOCALAPPDATA
+
+    function Install-TestPackage($package, $log, [switch] $SelectDesktop) {
+        $options = @('/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART',
+                     ('/DIR="' + $installTarget + '"'), ('/LOG="' + (Join-Path $qa $log) + '"'))
+        if ($SelectDesktop) { $options += '/TASKS=desktopicon' }
+        $setup = Start-Process -FilePath $package -WindowStyle Hidden -PassThru -Wait -ArgumentList $options
+        if ($setup.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $uninstaller)) {
+            throw "Installation failed ($($setup.ExitCode))."
+        }
+    }
+
     try {
-        $setup = Start-Process -FilePath $installer -WindowStyle Hidden -PassThru -Wait -ArgumentList @(
-            '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/TASKS=desktopicon',
-            ('/DIR="' + $installTarget + '"'), ('/LOG="' + (Join-Path $qa 'install.log') + '"')
-        )
-        $installed = Test-Path -LiteralPath $uninstaller
-        if ($setup.ExitCode -ne 0 -or -not $installed) { throw "Installation failed ($($setup.ExitCode))." }
-        if (-not (Test-Path -LiteralPath $key)) { throw 'No per-user uninstall registration.' }
+        $env:LOCALAPPDATA = $appDataRoot
+        if ($UpgradeFrom) {
+            Install-TestPackage (Get-Item -LiteralPath $UpgradeFrom).FullName 'install-2.1.0.log' -SelectDesktop
+            if (-not (Test-Path -LiteralPath $legacyMenu) -or -not (Test-Path -LiteralPath $legacyDesktop)) {
+                throw 'The previous installer did not make both original shortcuts.'
+            }
+            $initial = Test-Executable $legacyExe (Join-Path $qa 'installed-2.1.0.json') -ImportSample -Legacy
+            if ($initial.data -ne (Split-Path $database)) { throw 'Unexpected legacy data path.' }
+            & $Python -X utf8 (Join-Path $PSScriptRoot 'seed-upgrade.py') $database $qa
+            if ($LASTEXITCODE -ne 0) { throw 'Could not seed the isolated legacy database.' }
+            $legacyDbHash = (Get-FileHash -LiteralPath $database).Hash
+            $legacyXml = Join-Path $qa 'Контрольный XML.xml'
+            $legacyXmlHash = (Get-FileHash -LiteralPath $legacyXml).Hash
+            Install-TestPackage $installer 'upgrade.log'
+            if ((Get-FileHash -LiteralPath $database).Hash -ne $legacyDbHash) {
+                throw 'The update changed the existing database.'
+            }
+            if ((Get-FileHash -LiteralPath $legacyExe).Hash -ne (Get-FileHash -LiteralPath $exe).Hash) {
+                throw 'The legacy executable path did not receive the new application.'
+            }
+            $before = Test-Executable $legacyExe (Join-Path $qa 'upgraded-legacy-path.json')
+            if ($before.previous -ne '1' -or $before.output_folder -ne $qa -or $before.xml_automatic) {
+                throw 'The upgraded app lost legacy settings or changed the default save mode.'
+            }
+            $expectedPrevious = '2'
+        }
+        else {
+            Install-TestPackage $installer 'install.log' -SelectDesktop
+            if (Test-Path -LiteralPath $legacyExe) { throw 'A clean installation contains a legacy executable path.' }
+            $before = Test-Executable $exe (Join-Path $qa 'installed-1.json') -ImportSample
+            $expectedPrevious = '1'
+        }
+        if ((Get-ItemPropertyValue -LiteralPath $key -Name DisplayName) -ne 'СИ-Экспорт') {
+            throw 'Incorrect application name in Installed apps.'
+        }
         if (-not (Test-Path -LiteralPath $menu) -or -not (Test-Path -LiteralPath $desktop)) {
             throw 'Expected Start or opted-in Desktop shortcut not created.'
         }
-        $exe = Join-Path $installTarget 'ArshinGenerator.exe'
+        if ($UpgradeFrom -and ((Test-Path -LiteralPath $legacyMenu) -or (Test-Path -LiteralPath $legacyDesktop))) {
+            throw 'Old shortcuts are still present.'
+        }
         $shortcuts = New-Object -ComObject WScript.Shell
         $shell = New-Object -ComObject Shell.Application
         foreach ($link in $menu, $desktop) {
@@ -117,25 +190,18 @@ else {
             throw 'Unexpected icon for Installed apps.'
         }
         if (Test-Path -LiteralPath (Join-Path $installTarget 'portable.flag')) { throw 'Installed build has portable mode flag.' }
-        $oldLocal = $env:LOCALAPPDATA
-        try {
-            $env:LOCALAPPDATA = $appDataRoot
-            $before = Test-Executable $exe (Join-Path $qa 'installed-1.json') -ImportSample
-            $after = Test-Executable $exe (Join-Path $qa 'installed-2.json')
-            if ($CheckConnection) {
-                $result.connection = Test-RegistryConnection $exe (Join-Path $qa 'installed-connection.json')
-            }
+        $after = Test-Executable $exe (Join-Path $qa 'installed-2.json')
+        if ($CheckConnection) {
+            $result.connection = Test-RegistryConnection $exe (Join-Path $qa 'installed-connection.json')
         }
-        finally {
-            $env:LOCALAPPDATA = $oldLocal
-        }
-        if ($after.previous -ne '1' -or $after.input_folder -ne $before.input_folder -or
-                $after.data -ne (Join-Path $appDataRoot 'ArshinGenerator')) {
+        if ($after.previous -ne $expectedPrevious -or $after.input_folder -ne $before.input_folder -or
+                $after.data -ne (Split-Path $database)) {
             throw 'Installed app settings or per-user data path verification failed.'
         }
     }
     finally {
-        if ($installed -and (Test-Path -LiteralPath $uninstaller)) {
+        $env:LOCALAPPDATA = $oldLocal
+        if (Test-Path -LiteralPath $uninstaller) {
             $rootCheck = [IO.Path]::GetFullPath($uninstaller)
             if (-not $rootCheck.StartsWith($qa + '\', [StringComparison]::OrdinalIgnoreCase)) {
                 throw 'Uninstaller is outside the isolated QA directory.'
@@ -146,15 +212,26 @@ else {
             if ($uninstall.ExitCode -ne 0) { throw "Uninstall failed ($($uninstall.ExitCode))." }
         }
     }
-    if ((Test-Path -LiteralPath $key) -or (Test-Path -LiteralPath $menu) -or
-            (Test-Path -LiteralPath $desktop) -or (Test-Path -LiteralPath (Join-Path $installTarget 'ArshinGenerator.exe'))) {
-        throw 'Uninstall left the application or its shortcuts behind.'
+    foreach ($item in $key, $menu, $desktop, $exe, $legacyExe) {
+        if (Test-Path -LiteralPath $item) { throw "Uninstall left an installed item behind: $item" }
     }
-    if (-not (Test-Path -LiteralPath (Join-Path $appDataRoot 'ArshinGenerator\arshin.sqlite3'))) {
+    foreach ($link in $legacyMenu, $legacyDesktop) {
+        if ($existingLegacyLinks.ContainsKey($link)) {
+            if ((Get-FileHash -LiteralPath $link).Hash -ne $existingLegacyLinks[$link]) {
+                throw 'An existing shortcut was changed during the clean installation test.'
+            }
+        }
+        elseif (Test-Path -LiteralPath $link) { throw "Unexpected legacy shortcut: $link" }
+    }
+    if (-not (Test-Path -LiteralPath $database)) {
         throw 'Uninstall removed application data.'
     }
+    if ($UpgradeFrom -and (Get-FileHash -LiteralPath $legacyXml).Hash -ne $legacyXmlHash) {
+        throw 'The update or uninstaller changed an existing XML file.'
+    }
     $result.installer = @{ started = $true; per_user = $true; start_menu = $true; desktop_opt_in = $true; icons = $true;
-                           settings_restored = $true; uninstall = $true; retained_data = $true; sample_results = 25 }
+                           settings_restored = $true; uninstall = $true; retained_data = $true; sample_results = 25;
+                           upgraded_from_2_1_0 = [bool]$UpgradeFrom }
 }
 
 $result.excel_unchanged = $baseHash -eq (Get-WorkbookHash)

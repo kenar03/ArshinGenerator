@@ -88,6 +88,18 @@ class Storage:
         with self.session() as db:
             db.execute("insert or replace into settings values (?,?)", (key, value))
 
+    def xml_output(self) -> tuple[bool, str]:
+        with self.session() as db:
+            settings = dict(db.execute("select key, value from settings where key in (?, ?)",
+                                       ("xml_output_mode", "xml_auto_folder")))
+        return settings.get("xml_output_mode") == "automatic", settings.get("xml_auto_folder", "")
+
+    def save_xml_output(self, automatic: bool, folder: str) -> None:
+        with self.session() as db:
+            db.executemany("insert or replace into settings values (?,?)",
+                           (("xml_output_mode", "automatic" if automatic else "manual"),
+                            ("xml_auto_folder", folder)))
+
     def laboratory(self) -> dict:
         return json.loads(self.setting(LABORATORY_SETTING) or "{}")
 

@@ -2,6 +2,7 @@ import json
 import os
 from dataclasses import replace
 from datetime import date
+from errno import ENOSPC
 from pathlib import Path
 import sqlite3
 from tempfile import TemporaryDirectory
@@ -14,10 +15,10 @@ from PySide6.QtCore import QEventLoop, QItemSelectionModel, QPoint, QTimer, Qt
 from PySide6.QtGui import QColor, QPalette
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
-    QApplication, QComboBox, QDialog, QFileDialog, QLabel, QLineEdit, QPushButton, QTableView, QTreeWidget,
+    QApplication, QComboBox, QDialog, QFileDialog, QLabel, QLineEdit, QPushButton, QRadioButton, QTableView, QTreeWidget,
 )
 
-from arshin_generator.arshin import NS, SCHEMA_HASH, Schema, format_packets, open_xml, result_element, signature
+from arshin_generator.arshin import NS, SCHEMA_HASH, Schema, export, format_packets, open_xml, result_element, signature
 from arshin_generator.confirmations import protocol_key
 from arshin_generator.domain import PreviewField, RegistryEntry
 from arshin_generator.readers import read_protocol
@@ -155,9 +156,9 @@ class InterfaceTests(unittest.TestCase):
             with patch.object(main, "choose_xml_path", return_value=file) as dialog, \
                     patch("arshin_generator.ui.main.message") as prompt:
                 main.export_btn.click()
-                self.assertEqual(dialog.call_args.args[0].name, "Аршин_П-Т1-з2-1260-26.xml")
+                self.assertEqual(dialog.call_args.args[0].name, "СИ-Экспорт_П-Т1-з2-1260-26.xml")
                 prompt.assert_not_called()
-            self.assertEqual(main.notice.text(), "XML сохранён: 25 записей")
+            self.assertEqual(main.notice.text(), f"XML сохранён: 25 записей\n{file}")
             root, issues, _ = open_xml(file, main.schema)
             self.assertFalse(issues)
             self.assertEqual([signature(r) for r in root], [signature(result_element(r)) for r in main.results])
@@ -192,6 +193,54 @@ class InterfaceTests(unittest.TestCase):
             self.assertEqual(repeated.read_bytes(), file.read_bytes())
             self.assertEqual(len(main.storage.history()), 2)
             main.close()
+
+    def test_open_excel_uses_current_original_without_rechecking(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory)
+            main = self.window(path)
+            first = fixture(path / "Первый файл.xlsx", "ТЕСТ-1", "001B6")
+            second = fixture(path / "Второй файл.xlsm", "ТЕСТ-2", "002B6")
+            main.protocols = [first, second]
+            main.recheck()
+            dialog = ProtocolDialog(main, first)
+            before = {p.path: p.path.read_bytes() for p in (first, second)}
+            with patch("arshin_generator.ui.protocols.QDesktopServices.openUrl", return_value=True) as launch, \
+                    patch("arshin_generator.ui.protocols.message") as error, \
+                    patch.object(main, "recheck") as recheck, \
+                    patch.object(main, "start_registry_checks") as check:
+                dialog.open_excel_btn.click()
+                dialog.selector.setCurrentIndex(1)
+                dialog.open_excel_btn.click()
+                self.assertEqual([Path(call.args[0].toLocalFile()) for call in launch.call_args_list],
+                                 [first.path, second.path])
+                error.assert_not_called()
+                check.assert_not_called()
+                recheck.assert_not_called()
+            self.assertEqual({p: p.read_bytes() for p in before}, before)
+            dialog.close()
+
+    def test_open_excel_reports_missing_file_and_failed_association(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory)
+            main = self.window(path)
+            protocol = fixture(path / "Файл.xltm", "ТЕСТ", "001B6")
+            main.protocols = [protocol]
+            main.recheck()
+            dialog = ProtocolDialog(main)
+            with patch("arshin_generator.ui.protocols.QDesktopServices.openUrl", return_value=False) as launch, \
+                    patch("arshin_generator.ui.protocols.message") as error:
+                dialog.open_excel_btn.click()
+                launch.assert_called_once()
+                error.assert_called_once()
+                protocol.path.rename(path / "Перемещённый.xltm")
+                launch.reset_mock()
+                error.reset_mock()
+                dialog.open_excel_btn.click()
+                launch.assert_not_called()
+                self.assertEqual(error.call_args.args[2],
+                                 "Не удалось открыть исходный протокол. Проверьте, существует ли файл.")
+                error.assert_called_once()
+            dialog.close()
 
     def test_preview_identifies_only_failed_instruments_in_a_separate_section(self):
         with TemporaryDirectory() as directory:
@@ -717,7 +766,7 @@ class InterfaceTests(unittest.TestCase):
                 chooser.assert_called_once()
             [entry] = main.storage.history()
             names = json.loads(entry["files"])
-            stem = f"Аршин_{date.today().isoformat()}"
+            stem = f"СИ-Экспорт_{date.today().isoformat()}"
             self.assertEqual(names, [f"{stem}_001.xml", f"{stem}_002.xml"])
             self.assertEqual(entry["directory"], str(path))
             for name in names:
@@ -725,6 +774,195 @@ class InterfaceTests(unittest.TestCase):
                 self.assertEqual(len(root), 1)
                 self.assertFalse(issues)
             main.close()
+
+    def test_save_settings_reopen_without_lab_audit_or_registry_check(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory)
+            main = self.window(path, online=True)
+            automatic = path / "Автоматическая"
+            automatic.mkdir()
+            previous = path / "Ручная"
+            previous.mkdir()
+            main.storage.set_setting("output_folder", str(previous))
+            self.assertEqual(main.storage.xml_output(), (False, ""))
+            self.assertEqual(main.output_folder(), previous)
+
+            def configure(form):
+                manual, auto = form.findChildren(QRadioButton)
+                self.assertTrue(manual.isChecked())
+                choose = next(widget for widget in form.findChildren(QPushButton) if widget.text() == "Обзор…")
+                self.assertFalse(choose.isEnabled())
+                auto.click()
+                self.assertTrue(choose.isEnabled())
+                choose.click()
+                form._accept()
+                return form.result()
+
+            with patch.object(Form, "exec", new=configure), \
+                    patch.object(QFileDialog, "getExistingDirectory", return_value=str(automatic)) as directory_dialog, \
+                    patch.object(main, "recheck") as recheck, \
+                    patch.object(main, "start_registry_checks") as registry:
+                main.settings_btn.click()
+                directory_dialog.assert_called_once()
+                recheck.assert_not_called()
+                registry.assert_not_called()
+            main.close()
+            reopened = self.window(path)
+            self.assertEqual(reopened.storage.xml_output(), (True, str(automatic)))
+            self.assertEqual(reopened.output_folder(), previous)
+            self.assertEqual(reopened.storage.laboratory(), {})
+            with reopened.storage.session() as db:
+                self.assertEqual(db.execute("select count(*) from audit").fetchone()[0], 0)
+
+            def switch_to_manual(form):
+                manual, auto = form.findChildren(QRadioButton)
+                self.assertTrue(auto.isChecked())
+                manual.click()
+                form._accept()
+                return form.result()
+
+            with patch.object(Form, "exec", new=switch_to_manual):
+                reopened.settings_btn.click()
+            self.assertEqual(reopened.storage.xml_output(), (False, str(automatic)))
+            self.assertEqual(reopened.output_folder(), previous)
+
+    def test_automatic_single_export_uses_next_unused_name_and_keeps_manual_folder(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory)
+            main = self.window(path)
+            seed_lab(main.storage)
+            main.protocols = [fixture(path / "first.xlsx", "ТЕСТ-1", "001B6", sticker="")]
+            self.verify_protocols(main)
+            old_path = path / "СИ-Экспорт_ТЕСТ-1.xml"
+            old_path.write_bytes(b"existing file")
+            main.storage.save_xml_output(True, str(path))
+            manual = path / "Последняя ручная папка"
+            manual.mkdir()
+            main.storage.set_setting("output_folder", str(manual))
+            with patch.object(main, "choose_xml_path") as single_dialog, \
+                    patch.object(QFileDialog, "getExistingDirectory") as folder_dialog, \
+                    patch("arshin_generator.ui.main.message") as prompt:
+                main.export_btn.click()
+                main.export_btn.click()
+                single_dialog.assert_not_called()
+                folder_dialog.assert_not_called()
+                prompt.assert_not_called()
+            for number in (2, 3):
+                xml = path / f"СИ-Экспорт_ТЕСТ-1_{number}.xml"
+                root, issues, _ = open_xml(xml, main.schema)
+                self.assertEqual(len(root), 1)
+                self.assertFalse(issues)
+            self.assertEqual(old_path.read_bytes(), b"existing file")
+            self.assertEqual(len(main.storage.history()), 2)
+            self.assertEqual(main.output_folder(), manual)
+            self.assertIn("СИ-Экспорт_ТЕСТ-1_3.xml", main.notice.text())
+
+    def test_automatic_split_reserves_all_parts_and_retries_atomic_collision(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory)
+            main = self.window(path)
+            seed_lab(main.storage)
+            main.protocols = [fixture(path / f"{i}.xlsx", f"ТЕСТ-{i}", f"00{i}B6", sticker="") for i in (1, 2)]
+            self.verify_protocols(main)
+            main.storage.save_xml_output(True, str(path))
+            stem = f"СИ-Экспорт_{date.today().isoformat()}"
+            old_part = path / f"{stem}_009.xml"
+            old_part.write_bytes(b"existing series")
+            limit = max(len(format_packets([r], main.schema)[0][0]) for r in main.results)
+
+            def collide(packets, schema, paths, storage, confirmer):
+                if paths[0].name == f"{stem}_2_001.xml":
+                    paths[1].write_bytes(b"created meanwhile")
+                return export(packets, schema, paths, storage, confirmer)
+
+            with patch("arshin_generator.ui.main.format_packets", side_effect=lambda r, s: format_packets(r, s, limit)), \
+                    patch("arshin_generator.ui.main.export", side_effect=collide) as write, \
+                    patch.object(QFileDialog, "getExistingDirectory") as dialog:
+                main.export_btn.click()
+                self.assertEqual(write.call_count, 2)
+                dialog.assert_not_called()
+            self.assertEqual(old_part.read_bytes(), b"existing series")
+            self.assertFalse((path / f"{stem}_2_001.xml").exists())
+            self.assertEqual((path / f"{stem}_2_002.xml").read_bytes(), b"created meanwhile")
+            [entry] = main.storage.history()
+            names = json.loads(entry["files"])
+            self.assertEqual(names, [f"{stem}_3_001.xml", f"{stem}_3_002.xml"])
+            for filename in names:
+                root, issues, _ = open_xml(path / filename, main.schema)
+                self.assertEqual(len(root), 1)
+                self.assertFalse(issues)
+            self.assertIn("файлов 2", main.notice.text())
+            self.assertIn(str(path), main.notice.text())
+
+    def test_automatic_folder_fallback_is_explicit_and_does_not_change_settings(self):
+        for failure in ("missing", "no_space", "permission"):
+            with self.subTest(failure=failure), TemporaryDirectory() as directory:
+                path = Path(directory)
+                main = self.window(path)
+                seed_lab(main.storage)
+                main.protocols = [fixture(path / "first.xlsx", "ТЕСТ-1", "001B6", sticker="")]
+                self.verify_protocols(main)
+                unavailable = path / "Постоянная"
+                temporary = path / "Разовая"
+                temporary.mkdir()
+                if failure != "missing":
+                    unavailable.mkdir()
+                main.storage.save_xml_output(True, str(unavailable))
+                main.storage.set_setting("output_folder", str(path))
+
+                def write(packets, schema, paths, storage, confirmer):
+                    if paths[0].parent == unavailable:
+                        if failure == "no_space":
+                            raise OSError(ENOSPC, "Недостаточно места")
+                        raise PermissionError("Папка недоступна на запись")
+                    return export(packets, schema, paths, storage, confirmer)
+
+                with patch("arshin_generator.ui.main.export", side_effect=write), \
+                        patch("arshin_generator.ui.main.message", return_value=False) as prompt, \
+                        patch.object(QFileDialog, "getExistingDirectory", return_value=str(temporary)) as chooser:
+                    main.export_btn.click()
+                    prompt.assert_called_once()
+                    chooser.assert_not_called()
+                    self.assertFalse(main.storage.history())
+                    self.assertEqual(list(temporary.iterdir()), [])
+                    prompt.return_value = True
+                    main.export_btn.click()
+                    chooser.assert_called_once()
+                [entry] = main.storage.history()
+                self.assertEqual(entry["directory"], str(temporary))
+                xml = temporary / "СИ-Экспорт_ТЕСТ-1.xml"
+                _, issues, _ = open_xml(xml, main.schema)
+                self.assertFalse(issues)
+                self.assertEqual(main.storage.xml_output(), (True, str(unavailable)))
+                self.assertEqual(main.storage.setting("output_folder"), str(path))
+
+    def test_automatic_export_continues_after_refreshing_registry(self):
+        with TemporaryDirectory() as directory, registry_http() as server:
+            path = Path(directory)
+            ticks = [0]
+            session = RegistrySession(clock=lambda: ticks[0], opener=server.opener)
+            main = self.window(path, online=True, registry_session=session)
+            seed_lab(main.storage)
+            main.storage.save_xml_output(True, str(path))
+            protocol = fixture(path / "first.xlsx", "ТЕСТ-1", "001B6", sticker="")
+            main.import_paths([protocol.path])
+            self.wait_for_import(main)
+            self.assertEqual(sum(server.calls.values()), 3)
+            ticks[0] += 900
+            xml = path / "СИ-Экспорт_ТЕСТ-1.xml"
+            with patch.object(main, "choose_xml_path") as file_dialog, \
+                    patch.object(QFileDialog, "getExistingDirectory") as folder_dialog:
+                main.export_btn.click()
+                self.assertFalse(xml.exists())
+                self.assertFalse(main.storage.history())
+                self.wait_for_import(main)
+                file_dialog.assert_not_called()
+                folder_dialog.assert_not_called()
+            self.assertEqual(sum(server.calls.values()), 6)
+            root, issues, _ = open_xml(xml, main.schema)
+            self.assertEqual(len(root), 1)
+            self.assertFalse(issues)
+            self.assertEqual(len(main.storage.history()), 1)
 
 
     def test_equipment_candidates_require_an_explicit_selection(self):

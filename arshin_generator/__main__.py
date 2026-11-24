@@ -11,7 +11,7 @@ from PySide6.QtCore import QLibraryInfo, QLocale, QLockFile, Qt, QTimer, QTransl
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication
 
-from arshin_generator import VERSION
+from arshin_generator import APP_NAME, VERSION
 from arshin_generator.arshin import Schema
 from arshin_generator.public_registry import check_connection
 from arshin_generator.storage import Storage, data_directory
@@ -22,7 +22,7 @@ from arshin_generator.ui.style import apply_theme
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Аршин · Генератор XML")
+    parser = argparse.ArgumentParser(description=APP_NAME)
     parser.add_argument("paths", nargs="*", type=Path)
     parser.add_argument("--smoke-check", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--check-connection", type=Path, help=argparse.SUPPRESS)
@@ -42,7 +42,7 @@ def main(argv=None):
         set_app_id.argtypes = [ctypes.c_wchar_p]
         set_app_id("ArshinGenerator.Desktop")
     app = QApplication([sys.argv[0]])
-    app.setApplicationName("Аршин · Генератор XML")
+    app.setApplicationName(APP_NAME)
     app.setApplicationVersion(VERSION)
     apply_theme(app)
     app.setWindowIcon(QIcon(str(files("arshin_generator").joinpath("assets", "app.ico"))))
@@ -89,9 +89,12 @@ def main(argv=None):
                 return
             previous = storage.setting("smoke_check_count")
             storage.set_setting("smoke_check_count", str(int(previous or "0") + 1))
-            report = {"version": VERSION, "data": str(data), "schema": schema.hash,
+            automatic, auto_folder = storage.xml_output()
+            report = {"version": VERSION, "name": app.applicationName(), "data": str(data), "schema": schema.hash,
                       "icon_sizes": sorted(size.width() for size in app.windowIcon().availableSizes()),
                       "previous": previous, "input_folder": storage.setting("input_folder"),
+                      "output_folder": storage.setting("output_folder"), "xml_automatic": automatic,
+                      "xml_auto_folder": auto_folder,
                       "protocols": len(window.protocols),
                       "equipment": sum(len(protocol.equipment) for protocol in window.protocols),
                       "instruments": len(window.results), "ready": sum(not r.blockers for r in window.results)}
