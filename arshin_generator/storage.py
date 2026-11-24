@@ -121,17 +121,31 @@ class Storage:
 
     def migrate_confirmation(self, protocol) -> None:
         """Recover older confirmation records only from their original workbook snapshot."""
+        with self.session() as db:
+            self._migrate_confirmation(db, protocol)
+
+    @staticmethod
+    def _migrate_confirmation(db, protocol):
         keys = [("protocol", protocol_key(protocol), None)]
         keys.extend(("instrument", individual_key(protocol, instrument.serial), instrument)
                     for instrument in protocol.instruments if instrument.serial)
+        for scope, subject, instrument in keys:
+            row = db.execute("select data,evidence,confirmer,confirmed_at from confirmations where scope=? and subject=?",
+                             (scope, legacy_key(protocol, instrument))).fetchone()
+            if row:
+                fields = with_guards(protocol, json.loads(row["data"]), instrument)
+                db.execute("insert or ignore into confirmations values (?,?,?,?,?,?)",
+                           (scope, subject, encode(fields), row["evidence"], row["confirmer"], row["confirmed_at"]))
+
+    def record_imports(self, protocols):
         with self.session() as db:
-            for scope, subject, instrument in keys:
-                row = db.execute("select data,evidence,confirmer,confirmed_at from confirmations where scope=? and subject=?",
-                                 (scope, legacy_key(protocol, instrument))).fetchone()
-                if row:
-                    fields = with_guards(protocol, json.loads(row["data"]), instrument)
-                    db.execute("insert or ignore into confirmations values (?,?,?,?,?,?)",
-                               (scope, subject, encode(fields), row["evidence"], row["confirmer"], row["confirmed_at"]))
+            for protocol in protocols:
+                if not protocol.error:
+                    self._migrate_confirmation(db, protocol)
+                self._audit(db, "Чтение протокола", {
+                    "path": str(protocol.path), "digest": protocol.digest, "reader": protocol.reader,
+                    "number": protocol.number, "error": protocol.error,
+                })
 
     def save_batch_outcome(self, subjects: dict[str, str], evidence: str, confirmer: str) -> None:
         if not subjects or not evidence.strip() or not confirmer.strip():

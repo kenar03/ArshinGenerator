@@ -132,10 +132,6 @@ class ProtocolDialog(QDialog):
                 return self.records[0].value(key)
             return protocol.fields[key].value if key in protocol.fields else None
 
-        number = value("type_number")
-        name = self.window.type_titles.get(number)
-        type_text = " · ".join(filter(None, (str(number or ""), name)))
-        marking = " / ".join(dict.fromkeys(str(item) for item in (value("model"), value("modification")) if item))
         passed = sum(r.value("outcome") == "pass" for r in self.records)
         failed = [serial_text(r.instrument) for r in self.records if r.value("outcome") == "fail"]
         details = QFormLayout()
@@ -144,15 +140,22 @@ class ProtocolDialog(QDialog):
         details.setVerticalSpacing(3)
         details.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
         details.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
-        for title, text in (
-            ("Тип СИ", type_text),
-            ("Модель и модификация", marking),
+        rows = [("Тип протокола", protocol.reader_name)]
+        for field in protocol.preview_fields:
+            text = value(field.key)
+            if field.optional and text in (None, ""):
+                continue
+            if field.key == "type_number" and text and (name := self.window.type_titles.get(text)):
+                text = f"{text} · {name}"
+            rows.append((field.title, text))
+        rows.extend((
             ("Владелец СИ", value("owner")),
             ("Поверитель", value("metrologist")),
             ("Методика поверки", value("method")),
             ("Дата поверки", display_day(value("verification_date"))),
             ("Действительна до", display_day(value("valid_date") if passed else None)),
-        ):
+        ))
+        for title, text in rows:
             caption = label(title)
             caption.setWordWrap(False)
             details.addRow(caption, label(display(text)))

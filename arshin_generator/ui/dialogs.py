@@ -15,7 +15,8 @@ from PySide6.QtWidgets import (
 
 from ..arshin import NS, open_xml
 from ..registry import CATEGORIES, iso_date, lookup_key, resolve_many
-from .common import button, fit_window, label, message, selected, table
+from ..storage import PORTAL_STATES
+from .common import Form, button, fit_window, label, message, selected, table
 
 TAGS = {
     "application": "Пакет поверок", "result": "Результат поверки", "miInfo": "Сведения о СИ",
@@ -362,6 +363,30 @@ class HistoryDialog(QDialog):
         if row:
             paths = [Path(row["directory"]) / name for name in json.loads(row["files"])]
             XmlDialog(self, paths, self.schema, self.storage.export_context(row["id"])).exec()
+
+    def status(self):
+        row = selected(self.table)
+        if not row:
+            return
+        form = Form(self, "Статус пакета", "Укажите фактический статус из личного кабинета.",
+                    size=(540, 300), save="Подтвердить")
+        form.field("status", "Статус", value=row["status"], choices=[(state, state) for state in PORTAL_STATES])
+        form.field("evidence", "Ссылка или номер заявки")
+        form.field("confirmer", "Сотрудник", value=self.storage.setting("confirmer"))
+
+        def validate(values):
+            if not values["evidence"] or not values["confirmer"]:
+                raise ValueError("Укажите подтверждение из личного кабинета и имя сотрудника.")
+
+        form.validate = validate
+        if form.exec():
+            values = form.values()
+            try:
+                self.storage.change_status(row["id"], values["status"], values["evidence"], values["confirmer"])
+            except (ValueError, sqlite3.Error) as exc:
+                message(self, "Статус пакета", str(exc), error=True)
+            else:
+                self.refresh()
 
     def backup(self):
         path, _ = QFileDialog.getSaveFileName(self, "Сохранить резервную копию", "arshin-backup.sqlite3",

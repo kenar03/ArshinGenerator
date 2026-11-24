@@ -6,21 +6,23 @@ from pathlib import Path
 from posixpath import normpath
 import sqlite3
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from zipfile import ZipFile
 
 from lxml import etree
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 
-from arshin_generator.arshin import NS, SCHEMA_HASH, Schema, export, format_packets, open_xml, signature, split_paths
+from arshin_generator.arshin import (
+    NS, PORTAL_BYTES, SCHEMA_HASH, TARGET_BYTES, Schema, export, format_packets, open_xml, signature, split_paths,
+)
 from arshin_generator.confirmations import get_confirmation, individual_key, legacy_key, protocol_key, with_guards
 from arshin_generator.dates import expiry_before_anniversary
-from arshin_generator.domain import Datum, RegistryEntry
+from arshin_generator.domain import Datum, PreviewField, RegistryEntry
 from arshin_generator.normalization import modification_candidate, metrologist, serial_list
 from arshin_generator.public_registry import exact_records
-from arshin_generator.readers import read_protocol
-from arshin_generator.readers.rtd import confirmed_rtd_modification
+from arshin_generator.readers import read_protocol, rtd
 from arshin_generator.registry import iso_date, resolve
 from arshin_generator.storage import Storage
 from arshin_generator.validation import INVALID_STICKER, check, empty_protocol_issues
@@ -76,8 +78,6 @@ class NormalizationTests(unittest.TestCase):
         for value, expected in examples.items():
             with self.subTest(value=value):
                 self.assertEqual(modification_candidate(value), expected)
-        self.assertEqual(confirmed_rtd_modification("56560-14", "ТСП-0193", "17М/РЭД", "Ex"), "ТСП-0193-17М-Ex")
-        self.assertFalse(confirmed_rtd_modification("56560-14", "ТСП-0193", "17M/РЭД", "Ex"))
 
     def test_metrologist(self):
         for value in ("Еремеева Анна Викторовна", "А.В. Еремеева", "Еремеева А. В."):
@@ -98,7 +98,8 @@ class MaterialTests(unittest.TestCase):
         self.assertEqual([r.serial for r in sample.instruments], [f"{i:03d}W6" for i in range(9, 34)])
         self.assertTrue(all(i.elements[0].complete and i.elements[0].status == "СООТВЕТСТВУЕТ"
                             for i in sample.instruments))
-        self.assertEqual(sample.proposed_modification, "ТСМ-0193-01")
+        self.assertEqual(sample.reader_name, "ТСП/ТСМ")
+        self.assertEqual(sample.fields["modification"].value, "ТСМ-0193-01")
         self.assertEqual([(e.serial, e.registration or e.type_number) for e in sample.equipment], [
             ("83046", "4542-74"), ("3342", "32777.06.2Р.01504903"), ("3342", "32777.06.2Р.01504902"),
             ("231024843", "58550-14"), ("10253831", "19973.06.4Р.01149311"),
@@ -149,7 +150,8 @@ class MaterialTests(unittest.TestCase):
 def fixture(path, number, serial, *, dual=False, outcome="СООТВЕТСТВУЕТ", complete=True,
             count=1, print_limit=None, sticker="01234567890", owner="Синтетический владелец", interval=4,
             method="Методика для испытаний XML", day=date(2026, 1, 15), kind="первичной",
-            temperature=21.3, execution="01", ex="", inconsistent=None, positive_report=None):
+            temperature=21.3, model="ТСП-0193", execution="01", ex="", length=None, inconsistent=None,
+            positive_report=None, serial_start=1):
     book = Workbook()
     t = book.active
     t.title = "Таблицы"
@@ -167,7 +169,8 @@ def fixture(path, number, serial, *, dual=False, outcome="СООТВЕТСТВУ
         "B19": f"№{serial}", "C19": f"{conclusion} к применению",
         "B20": sticker, "B21": "-", "B22": "V", "B23": "Тестова Анна Викторовна",
         "B24": day, "H26": "Схема соединения", "J26": "Кол-во",
-        "A27": "ТСП-0193", "B27": execution, "C27": ex, "L27": "56560-14", "H27": "2х4" if dual else "4",
+        "A27": model, "B27": execution, "C27": ex, "D27": length,
+        "L27": "56560-14", "H27": "2х4" if dual else "4",
         "J27": count, "K27": interval, "A34": "Серийный №",
     }
     for cell, value in cells.items():
@@ -187,7 +190,7 @@ def fixture(path, number, serial, *, dual=False, outcome="СООТВЕТСТВУ
         d.cell(1, col, value)
     if print_limit is not None:
         d["L1"] = print_limit
-    names = [serial] if count == 1 else [f"{i + 1:03d}B6" for i in range(count)]
+    names = [serial] if count == 1 else [f"{i:03d}B6" for i in range(serial_start, serial_start + count)]
     t["B19"] = "№" + ", ".join(names)
     per_device = 2 if dual else 1
     for instrument, name in enumerate(names):
@@ -296,15 +299,100 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("ячейку B1", " ".join(result.blockers))
 
     def test_modification_comes_from_structured_excel_values(self):
-        known = fixture(self.root / "known.xlsx", "ТЕСТ-ИСПОЛНЕНИЕ", "011B6", execution="01Б", ex="Ex-")
-        self.assertEqual(known.fields["modification"].value, "ТСП-0193-01Б-Ex")
-        unknown = fixture(self.root / "unknown.xlsx", "ТЕСТ-АЛЬТЕРНАТИВА", "012B6", execution="01Заказ")
+        self.storage.save_equipment(equipment())
+        seed_lab(self.storage)
+        examples = (
+            ("ТСП-0193", "01", "Ex", "ТСП-0193-01-Ex"),
+            ("ТСМ-0193", "М", None, "ТСМ-0193-М"),
+            ("ТСП-0193", "M", None, "ТСП-0193-M"),
+            ("ТСП-0193", None, "Ex", "ТСП-0193-Ex"),
+            ("ТСМ-0193", None, None, "ТСМ-0193"),
+            ("ТСП-0193", "17М", None, "ТСП-0193-17М"),
+            ("ТСП-0193", "17M", None, "ТСП-0193-17M"),
+            ("ТСП-0193", "17Б", None, "ТСП-0193-17Б"),
+            ("ТСП-0193", "  - 01Б - ", " - Ex- ", "ТСП-0193-01Б-Ex"),
+            ("ТСП-0193", "17М/РЭД", "Ex", "ТСП-0193-17М-Ex"),
+            ("ТСП-0193", "17M/РЭД", "Ex", "ТСП-0193-17M-Ex"),
+            ("ТСП-0193", "/8AL/DS", "Ex", "ТСП-0193/8AL/DS-Ex"),
+            ("ТСП-0196", "04/РЭД", "Ех", "ТСП-0196-04/РЭД-Ех"),
+            ("ТСП-0193", "01Заказ", None, "ТСП-0193-01Заказ"),
+        )
+        for model, execution, ex, expected in examples:
+            with self.subTest(model=model, execution=execution, ex=ex):
+                protocol = fixture(self.root / "marking.xlsx", "ТЕСТ-ИСПОЛНЕНИЕ", "011B6", model=model,
+                                   execution=execution, ex=ex, length="987(654)", sticker="")
+                [record] = self.checked(protocol)
+                self.assertEqual(record.value("modification"), expected)
+                self.assertFalse(record.blockers)
+                [(payload, _)] = format_packets([record], self.schema)
+                root, issues, _ = self.schema.inspect(payload)
+                self.assertFalse(issues)
+                self.assertEqual(root.findtext(f".//{{{NS}}}modification"), expected)
+                self.assertNotIn("987", protocol.fields["modification"].raw)
+                self.assertNotIn("100", protocol.fields["modification"].raw)
+
+    def test_invalid_type_and_saved_excel_errors_cannot_be_substituted(self):
+        unknown = fixture(self.root / "unknown.xlsx", "ТЕСТ-АЛЬТЕРНАТИВА", "012B6", model=None)
         self.storage.save_confirmation("protocol", protocol_key(unknown),
             {"modification": "ТСП-0193-Произвольное"}, "Старое значение", "Тест")
         record = self.checked(unknown)[0]
         self.assertFalse(record.value("modification"))
         self.assertIn("Не удалось определить модификацию по данным протокола", " ".join(record.blockers))
-        self.assertIn("A27:C27", " ".join(record.blockers))
+        self.assertIn("ячейку A27", " ".join(record.blockers))
+        for execution, ex, cell in (("#N/A", "", "B27"), ("", "#REF!", "C27"), ("", "неизвестно", "C27")):
+            with self.subTest(execution=execution, ex=ex):
+                invalid = fixture(self.root / "invalid.xlsx", "ТЕСТ-ОШИБКА", "013B6", execution=execution, ex=ex)
+                self.assertIn(cell, " ".join(self.checked(invalid)[0].blockers))
+
+    def test_reader_dispatch_detects_unknown_and_ambiguous_workbooks(self):
+        path = self.root / "ТПР.xlsx"
+        recognized = fixture(path, "ТЕСТ-ФОРМАТ", "012B6")
+        self.assertEqual(recognized.reader_name, rtd.DISPLAY_NAME)
+        self.assertTrue(read_protocol(JOURNAL).unsupported)
+        other = SimpleNamespace(DISPLAY_NAME="Тестовый формат", matches=lambda book: True, read=Mock())
+        with patch("arshin_generator.readers.READERS", (rtd, other)), patch.object(rtd, "read") as read_rtd:
+            rejected = read_protocol(path)
+        self.assertIn("Книга подходит под несколько форматов", rejected.error)
+        self.assertIn("ТСП/ТСМ, Тестовый формат", rejected.error)
+        self.assertFalse(rejected.reader_name)
+        read_rtd.assert_not_called()
+        other.read.assert_not_called()
+
+    def test_mixed_formats_preserve_order_across_the_actual_packet_limit(self):
+        first = fixture(self.root / "first.xlsx", "ТЕСТ-1", "unused", count=450, sticker="")
+        second_path = self.root / "second.xlsx"
+        fixture(second_path, "ТЕСТ-2", "unused", count=450, serial_start=451, sticker="")
+        book = load_workbook(second_path)
+        book["Таблицы"]["A2"] = "Другой формат для теста"
+        book.save(second_path)
+        book.close()
+        other = SimpleNamespace(
+            VERSION="test-other", DISPLAY_NAME="Тестовый формат", PREVIEW_FIELDS=(PreviewField("model", "Обозначение"),),
+            matches=lambda book: book["Таблицы"]["A2"].value == "Другой формат для теста", read=rtd.read,
+        )
+        with patch("arshin_generator.readers.READERS", (other, rtd)):
+            second = read_protocol(second_path)
+        self.assertEqual(second.reader, "test-other")
+        self.assertEqual(second.preview_fields, other.PREVIEW_FIELDS)
+        for protocol in (first, second):
+            for key in ("additional", "structure", "brief"):
+                protocol.fields[key] = Datum("П" * 1000, "Испытание размера")
+        seed_lab(self.storage)
+        self.storage.save_equipment(equipment())
+        ready = self.checked(first, second)
+        packets = format_packets(ready, self.schema)
+        self.assertGreater(len(packets), 1)
+        self.assertTrue(all(len(payload) <= TARGET_BYTES < PORTAL_BYTES for payload, _ in packets))
+        paths = split_paths(self.root, "Аршин", len(packets))
+        export(packets, self.schema, paths, self.storage, "Тест")
+        numbers = []
+        for path in paths:
+            root, issues, _ = open_xml(path, self.schema)
+            self.assertFalse(issues)
+            numbers.extend(root.xpath("g:result/g:miInfo/g:singleMI/g:manufactureNum/text()", namespaces={"g": NS}))
+        self.assertEqual(numbers, [f"{i:03d}B6" for i in range(1, 901)])
+        self.assertEqual([r.protocol.reader for _, items in packets for r, _ in items],
+                         [rtd.VERSION] * 450 + [other.VERSION] * 450)
 
     def test_full_batch_without_stickers_roundtrips_with_method_and_equipment_identity(self):
         protocol = fixture(self.root / "batch.xlsx", "ТЕСТ-ПАКЕТ", "001B6", count=25, dual=True, sticker="",

@@ -8,7 +8,8 @@ from PySide6.QtWidgets import (
     QAbstractItemView, QHeaderView,
 )
 
-from .style import SUCCESS, WARNING
+from ..domain import ERROR, READY, REVIEW, UNSUPPORTED
+from .style import ERROR_TEXT, SUCCESS, WARNING
 
 
 def button(label, slot=None, primary=False):
@@ -82,10 +83,12 @@ class TableModel(QAbstractTableModel):
         if role in (Qt.ItemDataRole.DisplayRole, Qt.ItemDataRole.ToolTipRole):
             return display(value)
         if role == Qt.ItemDataRole.ForegroundRole:
-            if value == "Готов":
+            if value == READY:
                 return QColor(SUCCESS)
-            if value in ("Требует проверки", "Ошибка", "Формат не поддерживается"):
+            if value == REVIEW:
                 return QColor(WARNING)
+            if value in (ERROR, UNSUPPORTED):
+                return QColor(ERROR_TEXT)
         return None
 
 
@@ -98,7 +101,7 @@ def table(headers, widths):
     view.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
     view.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
     view.verticalHeader().hide()
-    view.verticalHeader().setDefaultSectionSize(32)
+    view.verticalHeader().setDefaultSectionSize(30)
     view.horizontalHeader().setStretchLastSection(True)
     view.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
     for column, width in enumerate(widths):

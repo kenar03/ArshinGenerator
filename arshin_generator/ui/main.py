@@ -10,11 +10,12 @@ import sqlite3
 from PySide6.QtCore import QItemSelectionModel, QStandardPaths, QThread, QTimer, Qt, Signal
 from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (
-    QAbstractItemView, QDialog, QFileDialog, QFrame, QHBoxLayout, QHeaderView, QMainWindow, QMenu, QToolButton,
+    QAbstractItemView, QDialog, QFileDialog, QHBoxLayout, QHeaderView, QMainWindow, QMenu, QToolButton,
     QVBoxLayout, QWidget,
 )
 
 from ..arshin import export, format_packets, split_paths
+from ..domain import CHECKING, ERROR, READY, REVIEW
 from ..readers import EXTENSIONS, read_protocol
 from ..registry import iso_date, lookup_key
 from ..validation import check, empty_protocol_issues
@@ -27,12 +28,21 @@ from .workflow import laboratory_settings
 class ImportThread(QThread):
     imported = Signal(object)
 
-    def __init__(self, paths, parent):
+    def __init__(self, paths, storage, parent):
         super().__init__(parent)
         self.paths = paths
+        self.storage = storage
+        self.audit_failed = False
 
     def run(self):
-        self.imported.emit([read_protocol(path) for path in self.paths])
+        protocols = [read_protocol(path) for path in self.paths]
+        try:
+            self.storage.record_imports(protocols)
+        except (sqlite3.Error, ValueError):
+            self.audit_failed = True
+            logging.exception("Ошибка записи истории импорта")
+            return
+        self.imported.emit(protocols)
 
 
 class RegistryCheckThread(QThread):
@@ -70,13 +80,13 @@ class MainWindow(QMainWindow):
         self.expiry_timer.timeout.connect(self.start_registry_checks)
         self.setWindowTitle("Аршин · Генератор XML")
         self.setMinimumSize(680, 440)
-        fit_window(self, 940, 620)
+        fit_window(self, 900, 600)
         self.setAcceptDrops(True)
         central = QWidget()
         self.setCentralWidget(central)
         layout = QVBoxLayout(central)
-        layout.setContentsMargins(26, 22, 26, 19)
-        layout.setSpacing(14)
+        layout.setContentsMargins(16, 12, 16, 12)
+        layout.setSpacing(8)
 
         header = QHBoxLayout()
         title = QVBoxLayout()
@@ -107,32 +117,23 @@ class MainWindow(QMainWindow):
         actions.addWidget(self.export_btn)
         layout.addLayout(actions)
 
-        self.empty = QFrame(objectName="emptyQueue")
-        empty_layout = QVBoxLayout(self.empty)
-        empty_layout.setContentsMargins(26, 26, 26, 26)
-        empty_layout.addStretch()
-        for item in (label("Выберите протоколы Excel", "heading"),
-                     label("Можно перетащить файлы сюда. Проверка начнётся автоматически.")):
-            item.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            empty_layout.addWidget(item)
-        empty_layout.addStretch()
+        self.empty = label("Добавьте протоколы Excel или перетащите их сюда.")
+        self.empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self.empty, 1)
 
-        self.source, self.source_model = table(("Протокол", "Приборов", "Состояние"), (214, 85, 235))
+        self.source, self.source_model = table(("Протокол", "Тип протокола", "Приборов", "Состояние"),
+                                               (250, 140, 80, 152))
         self.source.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         sizes = self.source.horizontalHeader()
         sizes.setStretchLastSection(False)
         sizes.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        sizes.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
-        self.source.verticalHeader().setDefaultSectionSize(46)
+        self.source.verticalHeader().setDefaultSectionSize(36)
         layout.addWidget(self.source, 1)
         self.source.doubleClicked.connect(lambda index: self.open_protocol(self.source_model.rows[index.row()][0]))
         self.source.selectionModel().selectionChanged.connect(self.update_remove_button)
 
-        footer = QHBoxLayout()
         self.notice = label("")
-        footer.addWidget(self.notice, 1)
-        layout.addLayout(footer)
+        layout.addWidget(self.notice)
         QShortcut(QKeySequence("Ctrl+O"), self, activated=self.pick_files)
         QShortcut(QKeySequence(Qt.Key.Key_Delete), self, activated=self.remove_protocols)
         self.recheck()
@@ -141,9 +142,13 @@ class MainWindow(QMainWindow):
     def busy(self):
         return self.thread is not None or self.lookup_thread is not None
 
+    def set_notice(self, text):
+        self.notice.setText(text)
+        self.notice.setVisible(bool(text))
+
     def closeEvent(self, event):
         if self.busy:
-            self.notice.setText("Дождитесь окончания проверки.")
+            self.set_notice("Дождитесь окончания проверки.")
             if self.lookup_thread:
                 self.lookup_thread.requestInterruption()
             event.ignore()
@@ -184,36 +189,42 @@ class MainWindow(QMainWindow):
             elif not path.name.startswith("~$"):
                 files.append(path)
         if not files:
-            self.notice.setText("В выбранной папке нет книг Excel.")
+            self.set_notice("В выбранной папке нет книг Excel.")
             return
         self.storage.set_setting("input_folder", str(files[0].parent))
-        self.notice.setText("Читаем протоколы…")
-        self.thread = ImportThread(list(dict.fromkeys(path.resolve() for path in files)), self)
+        self.set_notice("Читаем протоколы…")
+        self.thread = ImportThread(list(dict.fromkeys(path.resolve() for path in files)), self.storage, self)
         self.thread.imported.connect(self.append_protocols)
         self.thread.finished.connect(self.import_finished)
         self.render()
         self.thread.start()
 
     def append_protocols(self, incoming):
+        paths = {protocol.path: index for index, protocol in enumerate(self.protocols)}
+        digests = {protocol.digest: index for index, protocol in enumerate(self.protocols) if protocol.digest}
         for protocol in incoming:
-            if not protocol.error:
-                self.storage.migrate_confirmation(protocol)
-            self.storage.audit("Чтение протокола", {
-                "path": str(protocol.path), "digest": protocol.digest, "reader": protocol.reader,
-                "number": protocol.number, "error": protocol.error,
-            })
-            existing = next((p for p in self.protocols if p.path == protocol.path), None)
-            if any(p.digest == protocol.digest and protocol.digest and p is not existing for p in self.protocols):
+            index = paths.get(protocol.path)
+            if protocol.digest in digests and digests[protocol.digest] != index:
                 continue
-            if existing:
-                self.protocols[self.protocols.index(existing)] = protocol
-            else:
+            if index is None:
+                index = len(self.protocols)
+                paths[protocol.path] = index
                 self.protocols.append(protocol)
+            else:
+                digests.pop(self.protocols[index].digest, None)
+                self.protocols[index] = protocol
+            if protocol.digest:
+                digests[protocol.digest] = index
 
     def import_finished(self):
+        audit_failed = self.thread.audit_failed
         self.thread.deleteLater()
         self.thread = None
-        self.start_registry_checks()
+        if audit_failed:
+            self.recheck()
+            self.set_notice("Не удалось записать историю импорта. Проверьте доступ к папке данных.")
+        else:
+            self.start_registry_checks()
 
     def check_inputs(self):
         self.entries = self.storage.entries()
@@ -265,13 +276,13 @@ class MainWindow(QMainWindow):
         self.check_inputs()
         requests, type_numbers = self.registry.pending(self.requests, self.type_numbers, retry)
         if not self.online or not (requests or type_numbers):
-            self.recheck()
+            self.recheck(inputs_checked=True)
             return
         self.expiry_timer.stop()
         self.lookup_thread = RegistryCheckThread(self.registry, requests, type_numbers, self)
         self.lookup_thread.assessed.connect(self.accept_registry_checks)
         self.lookup_thread.finished.connect(self.registry_checks_finished)
-        self.notice.setText("Проверяем сведения в государственном реестре…")
+        self.set_notice("Проверяем сведения в ФИФ ОЕИ…")
         self.render()
         self.checked.emit()
         self.lookup_thread.start()
@@ -288,11 +299,11 @@ class MainWindow(QMainWindow):
     def registry_checks_finished(self):
         self.lookup_thread.deleteLater()
         self.lookup_thread = None
-        self.notice.clear()
         self.recheck()
 
-    def recheck(self):
-        self.check_inputs()
+    def recheck(self, *, inputs_checked=False):
+        if not inputs_checked:
+            self.check_inputs()
         if self.online:
             self.lookups, types = self.registry.snapshot(self.requests, self.type_numbers)
             self.type_titles = {number: result.title for number, result in types.items() if result.title}
@@ -323,11 +334,12 @@ class MainWindow(QMainWindow):
 
     def state(self, protocol, records):
         if self.busy:
-            return "Проверяем…"
+            return CHECKING
+        if not self.complete(protocol, self.local_group[id(protocol)]):
+            return ERROR
         if self.complete(protocol, records):
-            return "Готов к выгрузке"
-        issue = next((issue for record in records for issue in record.blockers), "")
-        return issue or next(iter(self.source_issues.get(id(protocol), ())), "Нет отдельных СИ")
+            return READY
+        return REVIEW
 
     def selected_protocols(self):
         return [self.source_model.rows[index.row()][0] for index in self.source.selectionModel().selectedRows()]
@@ -352,7 +364,8 @@ class MainWindow(QMainWindow):
         rows = []
         for protocol in self.protocols:
             records = self.group[id(protocol)]
-            rows.append((protocol, (protocol.number or protocol.path.name, protocol.declared or len(records),
+            rows.append((protocol, (protocol.number or protocol.path.name, protocol.reader_name,
+                                    protocol.declared or len(records),
                                     self.state(protocol, records))))
         self.source_model.update(rows)
         selection = self.source.selectionModel()
@@ -362,8 +375,8 @@ class MainWindow(QMainWindow):
                                  QItemSelectionModel.SelectionFlag.Rows)
         screened = {id(protocol) for protocol in self.registry_protocols}
         ready = sum(not record.blockers and id(record.protocol) in screened for record in self.results)
-        total = sum(values[1] for _, values in rows)
-        self.summary.setText(f"Протоколов {len(rows)}    ·    Приборов {total}    ·    Готово {ready}")
+        total = sum(values[2] for _, values in rows)
+        self.summary.setText(f"Протоколов {len(rows)}  ·  Приборов {total}  ·  Готово {ready}")
         self.empty.setVisible(not rows)
         self.source.setVisible(bool(rows))
         self.add_btn.setEnabled(not self.busy)
@@ -373,16 +386,7 @@ class MainWindow(QMainWindow):
         self.export_btn.setEnabled(self.can_export)
         self.export_btn.setToolTip("" if self.can_export else "Для выгрузки должны быть готовы все протоколы.")
         if not self.busy:
-            if self.can_export:
-                self.notice.setText(f"В пакет войдёт записей: {ready}")
-            elif rows:
-                blocked = sum(not self.complete(p, self.group[id(p)]) for p, _ in rows)
-                problem_records = sum(sum(bool(r.blockers) for r in self.group[id(p)]) +
-                                      max(0, values[1] - len(self.group[id(p)])) for p, values in rows)
-                self.notice.setText(f"Требуют внимания: протоколов {blocked}, приборов {problem_records}. "
-                                    "Просмотрите сведения.")
-            else:
-                self.notice.clear()
+            self.set_notice("")
 
     def open_protocol(self, protocol):
         if not self.busy:
@@ -480,4 +484,4 @@ class MainWindow(QMainWindow):
         except sqlite3.Error:
             logging.exception("Не удалось запомнить папку выгрузки")
         suffix = f" · файлов {len(files)}" if len(files) > 1 else ""
-        self.notice.setText(f"XML сохранён: {len(self.results)} записей{suffix}")
+        self.set_notice(f"XML сохранён: {len(self.results)} записей{suffix}")

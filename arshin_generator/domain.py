@@ -4,6 +4,7 @@ from typing import TypeAlias
 
 Scalar: TypeAlias = str | int | bool | None
 READY = "Готов"
+CHECKING = "Проверяется"
 REVIEW = "Требует проверки"
 ERROR = "Ошибка"
 UNSUPPORTED = "Формат не поддерживается"
@@ -49,6 +50,13 @@ class Instrument:
     outcome: str = ""
 
 
+@dataclass(frozen=True)
+class PreviewField:
+    key: str
+    title: str
+    optional: bool = False
+
+
 @dataclass
 class Protocol:
     path: Path
@@ -65,13 +73,13 @@ class Protocol:
     unsupported: bool = False
     elements: int = 0
     conclusion: str = ""
-    proposed_modification: str = ""
-    modification_parts: tuple[str, ...] = ()
     measurement_hint: str = ""
     evidence: str = ""
     report_outcome: str = ""
     conclusion_outcome: str = ""
     notices: list[str] = field(default_factory=list)
+    reader_name: str = ""
+    preview_fields: tuple[PreviewField, ...] = ()
 
 
 @dataclass(frozen=True)

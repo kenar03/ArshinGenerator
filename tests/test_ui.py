@@ -3,6 +3,7 @@ import os
 from dataclasses import replace
 from datetime import date
 from pathlib import Path
+import sqlite3
 from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
@@ -17,11 +18,12 @@ from PySide6.QtWidgets import (
 
 from arshin_generator.arshin import NS, SCHEMA_HASH, Schema, format_packets, open_xml, result_element, signature
 from arshin_generator.confirmations import protocol_key
-from arshin_generator.domain import RegistryEntry
+from arshin_generator.domain import PreviewField, RegistryEntry
 from arshin_generator.readers import read_protocol
 from arshin_generator.storage import Storage
 from arshin_generator.registry import EquipmentCandidate, EquipmentLookup, lookup_equipment, lookup_key, resolve_many
-from arshin_generator.ui.dialogs import EquipmentReviewPanel, XmlDialog
+from arshin_generator.ui.common import Form
+from arshin_generator.ui.dialogs import EquipmentReviewPanel, HistoryDialog, XmlDialog
 from arshin_generator.ui.main import MainWindow
 from arshin_generator.ui.style import apply_theme
 from arshin_generator.ui.protocols import ProtocolDialog, serial_summary
@@ -113,14 +115,20 @@ class InterfaceTests(unittest.TestCase):
             main.storage.save_confirmation("protocol", protocol_key(protocol), {
                 "verification_type": "2", "sign_cipher": "ТСТ", "calibration": False, "valid_date": "2027-01-14",
             }, "Сохранившиеся реквизиты", "Тест")
-            self.assertEqual(main.source_model.headers, ("Протокол", "Приборов", "Состояние"))
+            self.assertEqual(main.source_model.headers, ("Протокол", "Тип протокола", "Приборов", "Состояние"))
+            self.assertEqual(main.source.verticalHeader().defaultSectionSize(), 36)
             self.verify_protocols(main)
             self.assertTrue(main.export_btn.isEnabled())
+            self.assertEqual(main.source_model.rows[0][1][1:], ("ТСП/ТСМ", 25, "Готов"))
+            self.assertFalse(main.notice.text())
             overview = ProtocolDialog(main, protocol)
             self.assertEqual(overview.equipment_panel.checked, 7)
             self.assertFalse(overview.findChildren(QLineEdit))
             texts = "\n".join(label.text() for label in overview.findChildren(QLabel))
             self.assertIn("56560-14 · Термопреобразователи сопротивления", texts)
+            self.assertIn("Регистрационный номер типа СИ", texts)
+            self.assertIn("Исполнение", texts)
+            self.assertNotIn("Модель и модификация", texts)
             self.assertIn("Готов к выгрузке", texts)
             self.assertIn('ООО "ЧТП"', texts)
             self.assertIn("Еремеева А.В.", texts)
@@ -344,17 +352,21 @@ class InterfaceTests(unittest.TestCase):
             main.type_titles.clear()
             main.type_issues["56560-14"] = "В реестре не найден точный тип СИ 56560-14."
             main.recheck()
-            self.assertIn("не найден точный тип СИ", main.source_model.rows[0][1][2])
+            self.assertEqual(main.source_model.rows[0][1][-1], "Требует проверки")
+            type_dialog = ProtocolDialog(main, p)
+            self.assertIn("не найден точный тип СИ", "\n".join(label.text() for label in type_dialog.findChildren(QLabel)))
+            type_dialog.close()
             self.assertFalse(main.can_export)
             item = p.equipment[0]
             key = lookup_key(item, p.fields["verification_date"].value)
             main.type_titles["56560-14"] = "Термопреобразователи сопротивления"
             main.lookups[key] = EquipmentLookup("unavailable", "Не удалось подключиться к реестру")
             main.recheck()
-            self.assertIn("Не удалось подключиться к реестру", main.source_model.rows[0][1][2])
+            self.assertEqual(main.source_model.rows[0][1][-1], "Требует проверки")
             self.assertFalse(main.can_export)
             dialog = ProtocolDialog(main, p)
             self.assertEqual(dialog.equipment_panel.checked, 0)
+            self.assertIn("Не удалось подключиться к реестру", dialog.equipment_panel.item_model.rows[0][1][-1])
             self.assertIn("Повторить проверку", [btn.text() for btn in dialog.findChildren(QPushButton)])
             dialog.close()
             main.close()
@@ -424,8 +436,11 @@ class InterfaceTests(unittest.TestCase):
             self.wait_for_import(main)
             self.assertEqual(sum(server.calls.values()), 4)
             self.assertFalse(main.can_export)
-            self.assertIn("Срок поверки средства истёк", main.source_model.rows[0][1][2])
-            self.assertEqual(main.source_model.rows[1][1][2], "Готов к выгрузке")
+            self.assertEqual(main.source_model.rows[0][1][-1], "Требует проверки")
+            self.assertEqual(main.source_model.rows[1][1][-1], "Готов")
+            details = ProtocolDialog(main, main.protocols[0])
+            self.assertIn("Срок поверки средства истёк", details.equipment_panel.item_model.rows[0][1][-1])
+            details.close()
 
     def test_single_missing_excel_fields_block_before_any_http(self):
         with TemporaryDirectory() as directory, registry_http() as server:
@@ -438,9 +453,81 @@ class InterfaceTests(unittest.TestCase):
                     fixture(file, "ТЕСТ-ПОЛЕ", "001B6", sticker="", **fields)
                     main.import_paths([file])
                     self.wait_for_import(main)
-                    self.assertIn(f"ячейку {cell}", main.source_model.rows[0][1][2])
+                    self.assertEqual(main.source_model.rows[0][1][-1], "Ошибка")
+                    details = ProtocolDialog(main, main.protocols[0])
+                    self.assertIn(f"ячейку {cell}", "\n".join(label.text() for label in details.findChildren(QLabel)))
+                    details.close()
                     self.assertFalse(main.can_export)
                     self.assertFalse(server.calls)
+
+    def test_preview_uses_reader_labels_and_hides_empty_marking_fields(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory)
+            main = self.window(path)
+            seed_lab(main.storage)
+            first = fixture(path / "rtd.xlsx", "ТЕСТ-ТСП", "001B6", execution=None, ex=None, sticker="")
+            second = fixture(path / "other.xlsx", "ТЕСТ-ДРУГОЙ", "002B6", sticker="")
+            second.reader_name = "Тестовый формат"
+            second.preview_fields = (PreviewField("model", "Обозначение испытаний"),)
+            main.protocols = [first, second]
+            self.verify_protocols(main)
+            self.assertEqual([row[1][1] for row in main.source_model.rows], ["ТСП/ТСМ", "Тестовый формат"])
+            preview = ProtocolDialog(main, first)
+            texts = [label.text() for label in preview.scroll.widget().findChildren(QLabel)]
+            self.assertIn("ТСП/ТСМ", texts)
+            self.assertIn("ТСП-0193", texts)
+            self.assertNotIn("Исполнение", texts)
+            self.assertNotIn("Взрывозащита", texts)
+            preview.selector.setCurrentIndex(1)
+            texts = [label.text() for label in preview.scroll.widget().findChildren(QLabel)]
+            self.assertIn("Тестовый формат", texts)
+            self.assertIn("Обозначение испытаний", texts)
+            self.assertNotIn("Модель и модификация", texts)
+            preview.close()
+
+    def test_existing_history_status_action_keeps_documentary_confirmation(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory)
+            main = self.window(path)
+            main.storage.record_export("batch", path, ["test.xml"], SCHEMA_HASH, "Тест", [], "Тест", [])
+            history = HistoryDialog(main, main.storage, main.schema)
+            confirm = next(widget for widget in history.findChildren(QPushButton)
+                           if widget.text() == "Подтвердить статус в кабинете")
+
+            def submit(form):
+                form.editor.controls["status"].setCurrentText("Загружен")
+                with self.assertRaises(ValueError):
+                    form.validate(form.values())
+                form.editor.controls["evidence"].setText("Заявка 123")
+                form.editor.controls["confirmer"].setText("Сотрудник")
+                form.validate(form.values())
+                return QDialog.DialogCode.Accepted
+
+            with patch.object(Form, "exec", new=submit):
+                confirm.click()
+            self.assertEqual(main.storage.history()[0]["status"], "Загружен")
+            history.close()
+
+    def test_import_audit_failure_keeps_queue_and_database_consistent(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory)
+            main = self.window(path)
+            first = fixture(path / "first.xlsx", "ТЕСТ-1", "001B6")
+            second = fixture(path / "second.xlsx", "ТЕСТ-2", "002B6")
+            original = main.storage._audit
+
+            def audit(db, event, data):
+                if data["number"] == second.number:
+                    raise sqlite3.OperationalError("Испытание сбоя записи")
+                original(db, event, data)
+
+            with patch.object(main.storage, "_audit", side_effect=audit):
+                main.import_paths([first.path, second.path])
+                self.wait_for_import(main)
+            self.assertFalse(main.protocols)
+            self.assertIn("Не удалось записать историю импорта", main.notice.text())
+            with main.storage.session() as db:
+                self.assertEqual(db.execute("select count(*) from audit").fetchone()[0], 0)
 
     def test_native_save_configuration_and_split_path(self):
         with TemporaryDirectory() as directory:
