@@ -72,6 +72,7 @@ QHeaderView::section {{
     border-bottom: 1px solid {BORDER}; font-weight: 600;
 }}
 QHeaderView#protocolHeader::section {{ padding-left: 2px; padding-right: 2px; }}
+QHeaderView#previewHeader::section {{ padding-left: 4px; padding-right: 4px; }}
 QTableCornerButton::section {{ background: {HEADER}; border: 0; }}
 QTabBar::tab {{
     color: {MUTED}; background: {HEADER}; padding: 5px 10px; margin-right: 2px;

@@ -2,17 +2,19 @@ import re
 import sqlite3
 from getpass import getuser
 
-from PySide6.QtCore import Qt, QUrl
+from PySide6.QtCore import Qt, QTimer, QUrl
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
-    QComboBox, QDialog, QFormLayout, QFrame, QHBoxLayout, QLineEdit, QScrollArea, QVBoxLayout, QWidget,
+    QComboBox, QDialog, QFormLayout, QFrame, QHBoxLayout, QHeaderView, QLineEdit, QScrollArea, QSizePolicy,
+    QVBoxLayout, QWidget,
 )
 
+from ..arshin import result_values
 from ..confirmations import YEAR_SCOPE, individual_key, manufacture_year, protocol_key
 from ..domain import READY, RECHECK, UNVERIFIED
-from ..registry import iso_date
-from .common import apply_dialog_icon, button, display, fit_window, label, message
-from .dialogs import EquipmentReviewPanel
+from ..registry import CATEGORIES, iso_date
+from .common import apply_dialog_icon, button, display, fit_window, label, message, table
+from .dialogs import TAGS, field_text
 
 SERIES_NUMBER = re.compile(r"([0-9]+)([A-Za-zА-Яа-яЁё][A-Za-zА-Яа-яЁё0-9]*)?")
 SERIAL_PREVIEW_COUNT = 3
@@ -20,7 +22,7 @@ SERIAL_PREVIEW_COUNT = 3
 
 def display_day(value):
     day = iso_date(value)
-    return day.strftime("%d.%m.%Y") if day else "—"
+    return day.strftime("%d.%m.%Y") if day else value
 
 
 def examples(serials, limit=4):
@@ -57,12 +59,62 @@ def section_label(text):
     return widget
 
 
+def show_fields(box, rows):
+    rows = [(title, value) for title, value in rows if value not in (None, "")]
+    if not rows:
+        return
+    details = QFormLayout()
+    details.setHorizontalSpacing(14)
+    details.setVerticalSpacing(3)
+    details.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
+    details.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+    for title, value in rows:
+        caption = label(title)
+        caption.setWordWrap(False)
+        widget = label(display(value))
+        widget.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        widget.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        details.addRow(caption, widget)
+    box.addLayout(details)
+
+
+def compact_table(box, headers, rows):
+    view, model = table(headers, ())
+    view.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+    view.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+    view.setWordWrap(True)
+    header = view.horizontalHeader()
+    header.setObjectName("previewHeader")
+    header.setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+    header.setStretchLastSection(False)
+    header.setSectionResizeMode(QHeaderView.ResizeMode.Fixed)
+    view.verticalHeader().setMinimumSectionSize(view.fontMetrics().height() + 10)
+
+    def adjust_table():
+        minimums = [header.sectionSizeHint(column) for column in range(len(headers))]
+        share, extra = divmod(max(0, view.viewport().width() - sum(minimums)), len(headers))
+        for column, width in enumerate(minimums):
+            view.setColumnWidth(column, width + share + (column < extra))
+        view.resizeRowsToContents()
+        view.setFixedHeight(header.sizeHint().height() + view.verticalHeader().length() + 2 * view.frameWidth())
+
+    timer = QTimer(view)
+    timer.setSingleShot(True)
+    timer.timeout.connect(adjust_table)
+    header.geometriesChanged.connect(timer.start)
+    model.modelReset.connect(adjust_table)
+    model.update(rows)
+    box.addWidget(view)
+    return model
+
+
 class ProtocolDialog(QDialog):
     def __init__(self, window, protocol=None):
         super().__init__(window)
         apply_dialog_icon(self)
         self.window = window
         self.setWindowTitle("Сведения о поверке")
+        self.setMinimumWidth(min(510, self.screen().availableGeometry().width() - 24))
         fit_window(self, 835, 600)
         self.protocol = None
         self.serial_toggle = None
@@ -70,6 +122,7 @@ class ProtocolDialog(QDialog):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(18, 12, 18, 12)
         self.selector = QComboBox()
+        self.selector.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         for item in window.protocols:
             self.selector.addItem(item.number or item.path.name, item.path)
         if protocol is not None:
@@ -110,22 +163,28 @@ class ProtocolDialog(QDialog):
         path = self.selector.currentData()
         protocol = next((p for p in self.window.protocols if p.path == path), None)
         same = self.protocol is protocol
-        expanded = same and self.serial_toggle is not None and self.serial_toggle.isChecked()
-        target = self.year_selector.currentData() if same and self.year_selector else None
+        same_path = protocol is not None and self.protocol is not None and self.protocol.path == protocol.path
+        expanded = same_path and self.serial_toggle is not None and self.serial_toggle.isChecked()
+        target = self.year_selector.currentData() if same_path and self.year_selector else None
         draft = self.year_input.text() if same and self.year_input and self.year_input.isModified() else None
+        scroll_position = self.scroll.verticalScrollBar().value() if same_path else 0
         self.protocol = protocol
         self.open_excel_btn.setEnabled(protocol is not None)
         self.serial_toggle = None
         self.year_selector = self.year_input = None
         self.records = self.window.group.get(id(protocol), [])
-        self.equipment_panel = None
+        self.equipment_models = {}
+        self.instrument_model = None
         page = QWidget()
         box = QVBoxLayout(page)
         box.setContentsMargins(6, 6, 10, 8)
         box.setSpacing(8)
         if protocol:
             self.selector.setItemText(self.selector.currentIndex(), protocol.number or protocol.path.name)
-            box.addWidget(section_label(f"Протокол {protocol.number or protocol.path.name}"))
+            heading = f"Протокол {protocol.number or protocol.path.name}"
+            if protocol.reader_name:
+                heading += f" · {protocol.reader_name}"
+            box.addWidget(section_label(heading))
             state = self.window.state(protocol, self.records)
             if self.window.busy:
                 box.addWidget(label("Проверяем сведения…"))
@@ -135,113 +194,152 @@ class ProtocolDialog(QDialog):
                 box.addWidget(label(state))
                 box.addWidget(label("Проверьте связь с ФИФ ОЕИ и нажмите «Перепроверить»." if state == UNVERIFIED
                                     else "Сведения ФИФ ОЕИ будут проверены перед выгрузкой."))
-            if not protocol.error:
-                self.show_records(box, protocol, expanded)
-                self.show_year_editor(box, protocol, target, draft)
-            in_registry_stage = any(item is protocol for item in self.window.registry_protocols)
             self.show_issues(box, protocol)
-            if protocol.equipment:
-                self.equipment_panel = EquipmentReviewPanel(self, self.window.storage, protocol,
-                    self.window.lookups if in_registry_stage else {}, checked_inputs=in_registry_stage)
-                self.equipment_panel.changed.connect(self.window.recheck)
-                self.equipment_panel.setEnabled(not self.window.busy)
-                box.addWidget(self.equipment_panel)
-            if in_registry_stage or protocol in self.window.type_only_protocols:
-                requests, number = self.window.registry_keys(protocol)
-                retry = number in self.window.retryable_types or (in_registry_stage and any(
-                    self.window.lookups[key].retryable for key in requests if key in self.window.lookups
-                ))
-                if retry and not self.window.busy:
-                    box.addWidget(button("Повторить проверку", lambda: self.window.retry_registry(protocol)))
+            if not protocol.error:
+                values = [result_values(record) for record in self.records]
+                self.show_instruments(box, protocol, values, expanded, target, draft)
+                if values:
+                    self.show_verification(box, values)
+                self.show_equipment(box, protocol)
+                if values:
+                    self.show_other(box, values[0])
         box.addStretch()
         old = self.scroll.takeWidget()
         self.scroll.setWidget(page)
         if old:
             old.deleteLater()
+        if scroll_position:
+            QTimer.singleShot(0, page, lambda: self.scroll.verticalScrollBar().setValue(scroll_position))
 
-    def show_records(self, box, protocol, expanded):
-        def value(key):
-            if self.records:
-                return self.records[0].value(key)
-            return protocol.fields[key].value if key in protocol.fields else None
+    def show_instruments(self, box, protocol, values, expanded, target, draft):
+        box.addWidget(section_label("Сведения о СИ"))
+        first = values[0] if values else {}
+        number = first.get("mitypeNumber")
+        if not values and "type_number" in protocol.fields:
+            number = protocol.fields["type_number"].value
+        if number and (name := self.window.type_titles.get(number)):
+            number = f"{number} · {name}"
+        show_fields(box, ((TAGS["mitypeNumber"], number), (TAGS["modification"], first.get("modification"))))
 
-        passed = sum(r.value("outcome") == "pass" for r in self.records)
-        failed = [serial_text(r.instrument) for r in self.records if r.value("outcome") == "fail"]
-        details = QFormLayout()
-        details.setContentsMargins(0, 0, 0, 0)
-        details.setHorizontalSpacing(14)
-        details.setVerticalSpacing(3)
-        details.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
-        details.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
-        rows = [("Тип протокола", protocol.reader_name)]
-        for field in protocol.preview_fields:
-            text = value(field.key)
-            if field.optional and text in (None, ""):
-                continue
-            if field.key == "type_number" and text and (name := self.window.type_titles.get(text)):
-                text = f"{text} · {name}"
-            if field.key == "modification" and not text:
-                text = " / ".join(
-                    part for key in ("model", "execution", "explosion_protection") if (part := value(key))
-                )
-            rows.append((field.title, text))
-        rows.append(("Дата поверки", display_day(value("verification_date"))))
-        for title, text in rows:
-            caption = label(title)
-            caption.setWordWrap(False)
-            details.addRow(caption, label(display(text)))
-        box.addLayout(details)
-
+        passed = sum("signPass" in value for value in values)
+        failed = sum("reasons" in value for value in values)
         total = max(protocol.declared or 0, len(self.records))
         problems = total - len(self.records) + sum(bool(r.data_issues) for r in self.records)
-        totals = f"Приборов: {total} · Пригодны: {passed} · Непригодны: {len(failed)}"
+        totals = f"Приборов: {total} · Пригодны: {passed} · Непригодны: {failed}"
         if problems:
             totals += f" · Проблемных: {problems}"
         box.addWidget(section_label(totals))
-
-        serials = [text for r in self.records if (text := serial_text(r.instrument))]
-        self.show_serials(box, serials, expanded)
-        if failed:
-            box.addWidget(section_label("Непригодные приборы"))
-            box.addWidget(label(", ".join(filter(None, failed)) or "Заводские номера не прочитаны"))
-
-    def show_serials(self, box, serials, expanded):
-        box.addWidget(section_label("Заводские номера"))
-        row = QHBoxLayout()
-        summary = label(serial_summary(serials) or "Номера не прочитаны")
-        summary.ensurePolished()
-        summary.setMaximumWidth(summary.fontMetrics().horizontalAdvance(summary.text()) + 2)
-        row.addWidget(summary, 1)
-        box.addLayout(row)
-        row.addStretch()
-        if len(serials) <= SERIAL_PREVIEW_COUNT:
+        if not values:
             return
-        toggle = button("Показать все")
-        toggle.setStyleSheet("padding: 2px 8px;")
-        toggle.setCheckable(True)
-        row.insertWidget(1, toggle, alignment=Qt.AlignmentFlag.AlignTop)
-        full = label(", ".join(serials))
-        full.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        full.hide()
-        box.addWidget(full)
 
-        def show_full(visible):
-            full.setVisible(visible)
-            toggle.setText("Свернуть" if visible else "Показать все")
+        sticker_column = len(values) > 1 and any("stickerNum" in value for value in values)
+        headers = (TAGS["manufactureNum"], TAGS["manufactureYear"], "Результат поверки")
+        if sticker_column:
+            headers += (TAGS["stickerNum"],)
+        rows = []
+        for record, value in zip(self.records, values):
+            outcome = TAGS["applicable"] if "signPass" in value else TAGS["inapplicable"] if "reasons" in value else ""
+            row = (value["manufactureNum"], value.get("manufactureYear"), outcome)
+            if sticker_column:
+                row += (value.get("stickerNum"),)
+            rows.append((record, row))
 
-        toggle.toggled.connect(show_full)
-        toggle.setChecked(expanded)
-        self.serial_toggle = toggle
+        if len(rows) > SERIAL_PREVIEW_COUNT:
+            row = QHBoxLayout()
+            row.addWidget(label(serial_summary([value["manufactureNum"] for value in values])), 1)
+            toggle = button("Показать все")
+            toggle.setStyleSheet("padding: 2px 8px;")
+            toggle.setCheckable(True)
+            toggle.setChecked(expanded)
+            if expanded:
+                toggle.setText("Свернуть")
+            row.addWidget(toggle, alignment=Qt.AlignmentFlag.AlignTop)
+            box.addLayout(row)
+            self.serial_toggle = toggle
+
+        model = compact_table(box, headers, rows if expanded else rows[:SERIAL_PREVIEW_COUNT])
+        self.instrument_model = model
+        if self.serial_toggle:
+            def show_all(visible):
+                model.update(rows if visible else rows[:SERIAL_PREVIEW_COUNT])
+                toggle.setText("Свернуть" if visible else "Показать все")
+
+            toggle.toggled.connect(show_all)
+        self.show_year_editor(box, protocol, target, draft)
+
+    def show_verification(self, box, values):
+        box.addWidget(section_label("Сведения о поверке"))
+        fields = values[0]
+        show_fields(box, ((TAGS[tag], display_day(fields[tag]) if tag == "vrfDate" else field_text(tag, fields[tag]))
+                          for tag in ("signCipher", "miOwner", "vrfDate", "docTitle", "type", "calibration", "metrologist")
+                          if tag in fields))
+
+        if applicable := next((value for value in values if "signPass" in value), None):
+            box.addWidget(section_label(TAGS["applicable"]))
+            show_fields(box, ((TAGS["validDate"], display_day(applicable.get("validDate"))),
+                              (TAGS["stickerNum"], applicable.get("stickerNum") if len(values) == 1 else None),
+                              (TAGS["signPass"], applicable.get("signPass")), (TAGS["signMi"], applicable.get("signMi"))))
+        if inapplicable := [value for value in values if "reasons" in value]:
+            box.addWidget(section_label(TAGS["inapplicable"]))
+            show_fields(box, ((TAGS["reasons"], value["reasons"]) for value in inapplicable))
+
+    def show_equipment(self, box, protocol):
+        if not protocol.equipment:
+            return
+        resolutions = self.records[0].equipment_resolutions if self.records else {}
+        checked = sum(bool(resolutions.get(item)) for item in protocol.equipment)
+        summary = (f"Средства поверки: проверено {checked} из {len(protocol.equipment)}" if
+                   resolutions or protocol in self.window.registry_protocols else "Средства поверки")
+        box.addWidget(section_label(summary))
+        grouped = {}
+        for item in protocol.equipment:
+            if entries := resolutions.get(item):
+                for entry in entries:
+                    number = entry.type_number if entry.category == "mis" else entry.identifier
+                    inventory = entry.registry_serial if entry.category == "mis" and entry.identity_kind == "inventoryNum" else ""
+                    row = (entry.name or item.name, "" if inventory else entry.registry_serial, number, inventory, "Проверено")
+                    grouped.setdefault(entry.category, []).append((entry, row))
+            else:
+                status = "Не подтверждено" if item in resolutions or not item.category else "Не проверено"
+                number = item.registration if item.category == "mieta" else item.type_number
+                row = (item.name or item.description, item.serial, number, "", status)
+                grouped.setdefault(item.category, []).append((item, row))
+        for category in ("npe", "uve", "mieta", "mis", ""):
+            if not (rows := grouped.get(category)):
+                continue
+            box.addWidget(section_label(CATEGORIES.get(category, "Категория не подтверждена")))
+            number_label = {"mieta": "№ СИ по перечню", "mis": "Регистрационный\n№ типа СИ"}.get(category, "Номер эталона")
+            headers = ("Наименование", "Заводской\nномер", number_label)
+            if any(row[3] for _, row in rows):
+                headers += ("Буквенно-\nцифровое\nобозначение",)
+            else:
+                rows = [(item, row[:3] + row[4:]) for item, row in rows]
+            self.equipment_models[category] = compact_table(box, headers + ("Состояние",), rows)
+
+    def show_other(self, box, values):
+        condition_tags = ("temperature", "pressure", "hymidity", "other")
+        other_tags = ("structure", "characteristics", "additional_info")
+        has_conditions = any(values.get(tag) for tag in condition_tags)
+        if not has_conditions and not any(tag in values for tag in other_tags):
+            return
+        box.addWidget(section_label("Прочие сведения"))
+        if has_conditions:
+            box.addWidget(label(TAGS["conditions"]))
+            show_fields(box, ((TAGS[tag], values.get(tag)) for tag in condition_tags))
+        show_fields(box, ((TAGS["structure"], values.get("structure")),
+                          (TAGS["brief_procedure"], True if "characteristics" in values else None),
+                          (TAGS["characteristics"], values.get("characteristics")),
+                          (TAGS["additional_info"], values.get("additional_info"))))
 
     def show_year_editor(self, box, protocol, target, draft):
         if not self.records or not protocol.number or not all(
             protocol.fields.get(key) and protocol.fields[key].value for key in ("verification_date", "type_number")
         ):
             return
-        box.addWidget(section_label("Год изготовления"))
         row = QHBoxLayout()
         self.year_selector = QComboBox()
-        self.year_selector.setAccessibleName("К какому прибору относится год изготовления")
+        self.year_selector.setAccessibleName("К какому прибору относится год выпуска")
+        self.year_selector.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         self.year_selector.addItem("Вся партия", None)
         instruments = {r.instrument.serial: r.instrument for r in self.records if r.instrument.serial}
         for serial in instruments:
@@ -250,7 +348,7 @@ class ProtocolDialog(QDialog):
                         for serial in instruments)
         self.year_selector.setCurrentIndex(max(0, self.year_selector.findData(target)))
         self.year_input = QLineEdit()
-        self.year_input.setAccessibleName("Год изготовления")
+        self.year_input.setAccessibleName("Год выпуска")
         self.year_input.setPlaceholderText("ГГГГ")
         self.year_input.setMaxLength(32)
         self.year_input.setMaximumWidth(105)
@@ -293,9 +391,7 @@ class ProtocolDialog(QDialog):
             self.year_input.setModified(True)
 
     def show_issues(self, box, protocol):
-        registry = dict.fromkeys(issue for record in self.records for issue in record.registry_issues)
-        equipment = {issue for record in self.records for issue in record.equipment_issues}
-        issues = dict.fromkeys(issue for record in self.records for issue in record.shared_issues if issue not in registry)
+        issues = dict.fromkeys(issue for record in self.records for issue in record.shared_issues)
         group = {}
         incomplete = []
         for record in self.records:
@@ -324,14 +420,8 @@ class ProtocolDialog(QDialog):
             issues[" ".join((f"{title.rstrip('.')}{detail}.", *hints))] = None
         if not self.records:
             issues.update(dict.fromkeys(self.window.source_issues.get(id(protocol), ())))
-        registry_only = [issue for issue in registry if issue not in equipment]
-        if issues or registry_only:
-            box.addWidget(section_label("Что нужно исправить"))
         if issues:
+            box.addWidget(section_label("Что нужно исправить"))
             box.addWidget(label("\n".join(f"• {issue}" for issue in issues)))
-        if registry_only:
-            box.addWidget(section_label("ФИФ ОЕИ"))
-            box.addWidget(label("\n".join(f"• {issue}" for issue in registry_only)))
         if protocol.notices:
-            box.addWidget(section_label("Информационные замечания"))
             box.addWidget(label("\n".join(dict.fromkeys(protocol.notices))))

@@ -298,12 +298,6 @@ class MainWindow(QMainWindow):
         return ({lookup_key(item, when.isoformat()): (item, when) for item in protocol.equipment},
                 protocol.fields["type_number"].value)
 
-    def retry_registry(self, protocol):
-        requests, number = self.registry_keys(protocol) if protocol in self.registry_protocols else (
-            {}, protocol.fields["type_number"].value
-        )
-        self.start_registry_checks(retry=(requests, {number}))
-
     def schedule_expiry(self):
         self.expiry_timer.stop()
         if self.online and not self.busy:
@@ -493,7 +487,7 @@ class MainWindow(QMainWindow):
 
     def laboratory_settings(self):
         if laboratory_settings(self, self.storage):
-            self.recheck()
+            self.start_registry_checks()
 
     def output_folder(self):
         documents = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DocumentsLocation)

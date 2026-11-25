@@ -3,7 +3,7 @@ from pathlib import Path
 
 from PySide6.QtWidgets import QFileDialog, QHBoxLayout, QLineEdit, QRadioButton, QWidget
 
-from ..laboratory import DEFAULT_FIELDS, validate_defaults
+from ..laboratory import DEFAULT_FIELDS, LABORATORY_DEFAULTS, validate_defaults
 from .common import Form, button, label
 
 
@@ -15,7 +15,9 @@ def laboratory_settings(parent, storage):
     fields.addRow(label("Реквизиты лаборатории", "heading"))
     fields.addRow(label("Программа использует эти сведения, когда соответствующее поле в Excel пустое."))
     for key, title, kind in DEFAULT_FIELDS:
-        control = form.field(key, title, kind, laboratory.get(key))
+        value = laboratory.get(key, LABORATORY_DEFAULTS[key])
+        choices = [("Да", True), ("Нет", False)] if kind == "bool" and type(value) is bool else None
+        control = form.field(key, title, kind, value, choices=choices)
         if key == "sign_cipher":
             control.setPlaceholderText("Например, ВЦЯ")
     initial_fields = form.values()
@@ -58,6 +60,7 @@ def laboratory_settings(parent, storage):
             storage.save_xml_output(*output)
         values = form.values()
         if values != initial_fields:
-            storage.save_laboratory({**laboratory, **values}, getuser())
+            changed = {key: value for key, value in values.items() if value != initial_fields[key]}
+            storage.save_laboratory({**laboratory, **changed}, getuser())
             return True
     return False

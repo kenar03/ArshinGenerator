@@ -5,16 +5,12 @@ from math import isfinite
 import re
 
 from ..dates import expiry_before_anniversary
-from ..domain import Datum, ElementReading, Equipment, Instrument, PreviewField, Protocol
+from ..domain import Datum, ElementReading, Equipment, Instrument, Protocol
 from ..normalization import DASHES, family_prefix, serial, serial_list
 from ..public_registry import TYPE_NUMBER
 
 VERSION = "rtd-v1"
 DISPLAY_NAME = "ТСП/ТСМ"
-PREVIEW_FIELDS = (
-    PreviewField("type_number", "Регистрационный номер типа СИ"),
-    PreviewField("modification", "Обозначение СИ"),
-)
 PASS = "СООТВЕТСТВУЕТ"
 FAIL = "НЕ СООТВЕТСТВУЕТ"
 DATA_LAST_ROW = 1001
@@ -159,6 +155,7 @@ def _equipment(protocol, t, catalog, etalons) -> list[Equipment]:
         identities = {entry[:4] for entry in matches}
         source = f"Таблицы!A{r}"
         category, type_number, registration = "", "", ""
+        input_issue = ""
         if len(identities) == 1:
             local_id, factory, name, kind = next(iter(identities))
             catalog_rows = sorted(k for *_, k in matches)
@@ -173,8 +170,8 @@ def _equipment(protocol, t, catalog, etalons) -> list[Equipment]:
                     registration = local_id
             else:
                 cells = ", ".join(f"Оборудование!D{k}" for k in catalog_rows)
-                protocol.issues.append(f"Для средства «{name or text}» проверьте тип прибора в {cells}. "
-                                       "Выберите «СИ» или «Эталон». В старом шаблоне используйте «г/р», «ФИФ» или «ФИФ без №».")
+                input_issue = f"Для средства «{name or text}» не указан допустимый тип прибора. Проверьте {cells}."
+                protocol.issues.append(input_issue)
         else:
             local_id, name, factory = "", "", ""
         hints = {
@@ -183,7 +180,7 @@ def _equipment(protocol, t, catalog, etalons) -> list[Equipment]:
             if factory and _text(row[0]) == _text(t[30][7]) and _text(row[0]).endswith(f"№{factory}")
         }
         result.append(Equipment(text, source, local_id, factory, name, "; ".join(sorted(hints)),
-                                category, type_number, registration))
+                                category, type_number, registration, input_issue))
     return result
 
 

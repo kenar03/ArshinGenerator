@@ -6,7 +6,7 @@ from typing import Protocol as ReaderContract
 
 from openpyxl import Workbook, load_workbook
 
-from ..domain import PreviewField, Protocol
+from ..domain import Protocol
 from . import rtd
 
 EXTENSIONS = {".xlsx", ".xlsm", ".xltm", ".xltx"}
@@ -15,7 +15,6 @@ EXTENSIONS = {".xlsx", ".xlsm", ".xltm", ".xltx"}
 class ProtocolReader(ReaderContract):
     VERSION: str
     DISPLAY_NAME: str
-    PREVIEW_FIELDS: tuple[PreviewField, ...]
 
     def matches(self, book: Workbook) -> bool: ...
 
@@ -45,7 +44,6 @@ def read_protocol(path: Path) -> Protocol:
                 reader = matches[0]
                 protocol.reader = reader.VERSION
                 protocol.reader_name = reader.DISPLAY_NAME
-                protocol.preview_fields = reader.PREVIEW_FIELDS
                 reader.read(workbook, protocol)
                 return protocol
         finally:

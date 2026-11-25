@@ -43,34 +43,51 @@ def _add(parent, tag, value=None):
     return child
 
 
-def result_element(result: Result) -> etree._Element:
+def result_values(result: Result) -> dict:
+    """Values used by the XML writer and the protocol preview."""
     v = result.value
+    values = {
+        "mitypeNumber": v("type_number"), "manufactureNum": result.instrument.serial,
+        "modification": v("modification"), "signCipher": v("sign_cipher"), "vrfDate": v("verification_date"),
+        "type": v("verification_type"), "calibration": v("calibration"), "docTitle": v("method"),
+        "metrologist": v("metrologist"), "temperature": v("temperature"), "pressure": v("pressure"),
+        "hymidity": v("humidity"),
+    }
+    for tag, key in (("manufactureYear", "manufacture_year"), ("miOwner", "owner"), ("other", "other"),
+                     ("structure", "structure"), ("characteristics", "brief"), ("additional_info", "additional")):
+        if value := v(key):
+            values[tag] = value
+    if v("outcome") == "pass":
+        if value := v("valid_date"):
+            values["validDate"] = value
+        if sticker := str(v("sticker") or "").strip():
+            values["stickerNum"] = sticker
+        values["signPass"] = v("sign_pass")
+        values["signMi"] = v("sign_mi")
+    elif v("outcome") == "fail":
+        values["reasons"] = v("reasons")
+    return values
+
+
+def result_element(result: Result) -> etree._Element:
+    values = result_values(result)
     result_tag = etree.Element(f"{{{NS}}}result", nsmap={"gost": NS})
     mi = _add(_add(result_tag, "miInfo"), "singleMI")
-    _add(mi, "mitypeNumber", v("type_number"))
-    _add(mi, "manufactureNum", result.instrument.serial)
-    if v("manufacture_year"):
-        _add(mi, "manufactureYear", v("manufacture_year"))
-    _add(mi, "modification", v("modification"))
-    _add(result_tag, "signCipher", v("sign_cipher"))
-    if v("owner"):
-        _add(result_tag, "miOwner", v("owner"))
-    _add(result_tag, "vrfDate", v("verification_date"))
-    if v("outcome") == "pass" and v("valid_date"):
-        _add(result_tag, "validDate", v("valid_date"))
-    _add(result_tag, "type", v("verification_type"))
-    _add(result_tag, "calibration", v("calibration"))
-    if v("outcome") == "pass":
+    for tag in ("mitypeNumber", "manufactureNum", "manufactureYear", "modification"):
+        if tag in values:
+            _add(mi, tag, values[tag])
+    for tag in ("signCipher", "miOwner", "vrfDate", "validDate", "type", "calibration"):
+        if tag in values:
+            _add(result_tag, tag, values[tag])
+    if "signPass" in values:
         outcome = _add(result_tag, "applicable")
-        sticker = str(v("sticker") or "").strip()
-        if sticker:
-            _add(outcome, "stickerNum", sticker)
-        _add(outcome, "signPass", v("sign_pass"))
-        _add(outcome, "signMi", v("sign_mi"))
-    elif v("outcome") == "fail":
-        _add(_add(result_tag, "inapplicable"), "reasons", v("reasons"))
-    _add(result_tag, "docTitle", v("method"))
-    _add(result_tag, "metrologist", v("metrologist"))
+        for tag in ("stickerNum", "signPass", "signMi"):
+            if tag in values:
+                _add(outcome, tag, values[tag])
+    elif "reasons" in values:
+        _add(_add(result_tag, "inapplicable"), "reasons", values["reasons"])
+    _add(result_tag, "docTitle", values["docTitle"])
+    _add(result_tag, "metrologist", values["metrologist"])
     means = _add(result_tag, "means")
     for category in ("npe", "uve", "mieta", "mis"):
         entries = [e for e in result.equipment if e.category == category]
@@ -85,16 +102,15 @@ def result_element(result: Result) -> etree._Element:
             else:
                 _add(group, "number", e.identifier)
     conditions = _add(result_tag, "conditions")
-    for tag, key in (("temperature", "temperature"), ("pressure", "pressure"), ("hymidity", "humidity")):
-        _add(conditions, tag, v(key))
-    if v("other"):
-        _add(conditions, "other", v("other"))
-    if v("structure"):
-        _add(result_tag, "structure", v("structure"))
-    if v("brief"):
-        _add(_add(result_tag, "brief_procedure"), "characteristics", v("brief"))
-    if v("additional"):
-        _add(result_tag, "additional_info", v("additional"))
+    for tag in ("temperature", "pressure", "hymidity", "other"):
+        if tag in values:
+            _add(conditions, tag, values[tag])
+    if "structure" in values:
+        _add(result_tag, "structure", values["structure"])
+    if "characteristics" in values:
+        _add(_add(result_tag, "brief_procedure"), "characteristics", values["characteristics"])
+    if "additional_info" in values:
+        _add(result_tag, "additional_info", values["additional_info"])
     return result_tag
 
 

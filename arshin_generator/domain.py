@@ -32,6 +32,7 @@ class Equipment:
     category: str = ""
     type_number: str = ""
     registration: str = ""
+    input_issue: str = ""
 
 
 @dataclass(frozen=True)
@@ -51,13 +52,6 @@ class Instrument:
     elements: tuple[ElementReading, ...] = ()
     problem: str = ""
     outcome: str = ""
-
-
-@dataclass(frozen=True)
-class PreviewField:
-    key: str
-    title: str
-    optional: bool = False
 
 
 @dataclass
@@ -82,7 +76,6 @@ class Protocol:
     conclusion_outcome: str = ""
     notices: list[str] = field(default_factory=list)
     reader_name: str = ""
-    preview_fields: tuple[PreviewField, ...] = ()
     modification_issue: str = ""
 
 
@@ -124,6 +117,7 @@ class Result:
     equipment_conflict: bool = False
     incomplete_measurements: bool = False
     registry_pending: bool = False
+    equipment_resolutions: dict[Equipment, tuple[RegistryEntry, ...]] = field(default_factory=dict)
 
     def value(self, name: str) -> Scalar:
         return self.fields[name].value if name in self.fields else None

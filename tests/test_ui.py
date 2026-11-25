@@ -11,21 +11,22 @@ from unittest.mock import patch
 from urllib.error import URLError
 
 from openpyxl import load_workbook
-from PySide6.QtCore import QEventLoop, QItemSelectionModel, QTimer, Qt
+from PySide6.QtCore import QEventLoop, QTimer, Qt
 from PySide6.QtGui import QColor, QPalette
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
-    QApplication, QComboBox, QDialog, QFileDialog, QLabel, QLineEdit, QPushButton, QRadioButton, QTableView, QTreeWidget,
+    QApplication, QComboBox, QDialog, QFileDialog, QFormLayout, QLabel, QLineEdit, QPushButton, QRadioButton, QTableView,
+    QTreeWidget,
 )
 
 from arshin_generator.arshin import NS, SCHEMA_HASH, Schema, export, format_packets, open_xml, result_element, signature
 from arshin_generator.confirmations import protocol_key
-from arshin_generator.domain import PreviewField, RegistryEntry
+from arshin_generator.domain import Datum, RegistryEntry
 from arshin_generator.readers import read_protocol
 from arshin_generator.storage import Storage
-from arshin_generator.registry import EquipmentCandidate, EquipmentLookup, lookup_equipment, lookup_key, resolve_many
+from arshin_generator.registry import EquipmentCandidate, EquipmentLookup, lookup_equipment, lookup_key
 from arshin_generator.ui.common import Form
-from arshin_generator.ui.dialogs import EquipmentReviewPanel, HistoryDialog, XmlDialog
+from arshin_generator.ui.dialogs import HistoryDialog, XmlDialog
 from arshin_generator.ui.main import MainWindow
 from arshin_generator.ui.style import apply_theme
 from arshin_generator.ui.protocols import ProtocolDialog, serial_summary
@@ -43,6 +44,16 @@ def contrast(foreground, background):
 
     lower, upper = sorted([luminance(foreground), luminance(background)])
     return (upper + 0.05) / (lower + 0.05)
+
+
+def preview_fields(dialog):
+    rows = {}
+    for form in dialog.scroll.widget().findChildren(QFormLayout):
+        for index in range(form.rowCount()):
+            caption = form.itemAt(index, QFormLayout.ItemRole.LabelRole).widget()
+            field = form.itemAt(index, QFormLayout.ItemRole.FieldRole).widget()
+            rows[caption.text()] = field.text()
+    return rows
 
 
 class InterfaceTests(unittest.TestCase):
@@ -124,33 +135,31 @@ class InterfaceTests(unittest.TestCase):
             self.assertEqual(main.source_model.rows[0][1][2:], ("ТСП/ТСМ", 25, "Готов"))
             self.assertFalse(main.notice.text())
             overview = ProtocolDialog(main, protocol)
-            self.assertEqual(overview.equipment_panel.checked, 7)
             self.assertEqual(overview.findChildren(QLineEdit), [overview.year_input])
             self.assertEqual(overview.year_input.text(), "")
             texts = "\n".join(label.text() for label in overview.findChildren(QLabel))
             self.assertIn("56560-14 · Термопреобразователи сопротивления", texts)
-            self.assertIn("Регистрационный номер типа СИ", texts)
+            self.assertIn("Тип СИ в реестре ФИФ ОЕИ", texts)
             self.assertIn("ТСМ-0193-01", texts)
-            self.assertIn("Обозначение СИ", texts)
+            self.assertIn("Модификация СИ", texts)
             self.assertNotIn("Модель и модификация", texts)
             self.assertIn("Готов к выгрузке", texts)
-            self.assertNotIn("Владелец СИ", texts)
-            self.assertNotIn("Поверитель", texts)
-            self.assertNotIn("Методика поверки", texts)
+            self.assertIn("Владелец СИ", texts)
+            self.assertIn("ФИО поверителя", texts)
+            self.assertIn("Документ на методику поверки", texts)
             self.assertIn("22.11.2026", texts)
             self.assertIn("Приборов: 25 · Пригодны: 25 · Непригодны: 0", texts)
             self.assertIn("009W6–033W6 (25 приборов)", texts)
-            self.assertNotIn("Непригодные приборы", texts)
+            self.assertNotIn("Причины непригодности", texts)
             self.assertIn("Средства поверки: проверено 7 из 7", texts)
-            self.assertEqual(len([v for v in overview.findChildren(QTableView) if not v.isHidden()]), 1)
+            self.assertEqual(set(overview.equipment_models), {"mieta", "mis"})
+            self.assertEqual(overview.instrument_model.rowCount(), 3)
             overview.serial_toggle.click()
             self.assertEqual(overview.serial_toggle.text(), "Свернуть")
-            full = next(label for label in overview.findChildren(QLabel) if label.text().startswith("009W6, "))
-            self.assertFalse(full.isHidden())
-            preview_serials = full.text().split(", ")
+            preview_serials = [row[1][0] for row in overview.instrument_model.rows]
             overview.serial_toggle.click()
-            self.assertTrue(full.isHidden())
-            reviewed_equipment = [row[1][2] for row in overview.equipment_panel.item_model.rows]
+            self.assertEqual(overview.instrument_model.rowCount(), 3)
+            reviewed_equipment = [row[1][2] for model in overview.equipment_models.values() for row in model.rows]
             self.assertIn("32777.06.2Р.01504903", reviewed_equipment)
             overview.close()
 
@@ -265,9 +274,9 @@ class InterfaceTests(unittest.TestCase):
             dialog = ProtocolDialog(main, protocol)
             texts = [label.text() for label in dialog.findChildren(QLabel)]
             self.assertIn("Приборов: 2 · Пригодны: 1 · Непригодны: 1", texts)
-            index = texts.index("Непригодные приборы")
-            self.assertEqual(texts[index + 1], "002B6")
-            self.assertIn("001B6, 002B6", texts)
+            self.assertEqual([row[1] for row in dialog.instrument_model.rows],
+                             [("001B6", "2026", "Пригодно"), ("002B6", "2026", "Непригодно")])
+            self.assertEqual(preview_fields(dialog)["Причины непригодности"], "Отклонение за пределами допуска")
             self.assertIsNone(dialog.serial_toggle)
             payload, _ = format_packets(main.results, main.schema)[0]
             root, issues, _ = main.schema.inspect(payload)
@@ -293,13 +302,12 @@ class InterfaceTests(unittest.TestCase):
             dialog.show()
             self.app.processEvents()
             labels = dialog.findChildren(QLabel)
-            self.assertLess(len(labels), 40)
+            self.assertEqual(dialog.instrument_model.rowCount(), 3)
             self.assertIn("003412, 005412, 1548-3-1 и ещё 497", [label.text() for label in labels])
             dialog.serial_toggle.click()
             self.app.processEvents()
-            full = next(label for label in labels if label.text().startswith("003412, 005412, 1548-3-1, "))
-            self.assertTrue(full.isVisible())
-            numbers = full.text().split(", ")
+            self.assertEqual(len(dialog.findChildren(QLabel)), len(labels))
+            numbers = [row[1][0] for row in dialog.instrument_model.rows]
             self.assertEqual(len(numbers), 500)
             self.assertEqual(numbers[3], "900B6")
             self.assertEqual(numbers[-1], "500B6")
@@ -441,9 +449,10 @@ class InterfaceTests(unittest.TestCase):
             self.assertFalse(main.results[0].data_issues)
             self.assertFalse(main.can_export)
             dialog = ProtocolDialog(main, p)
-            self.assertEqual(dialog.equipment_panel.checked, 0)
-            self.assertIn("Не удалось подключиться к реестру", dialog.equipment_panel.note.text())
-            self.assertIn("Повторить проверку", [btn.text() for btn in dialog.findChildren(QPushButton)])
+            texts = "\n".join(label.text() for label in dialog.findChildren(QLabel))
+            self.assertIn("Средства поверки: проверено 0 из 1", texts)
+            self.assertIn("Проверьте связь с ФИФ ОЕИ и нажмите «Перепроверить»", texts)
+            self.assertNotIn("Что нужно исправить", texts)
             dialog.close()
             main.close()
 
@@ -511,8 +520,8 @@ class InterfaceTests(unittest.TestCase):
             self.assertEqual(texts.count("Сохранённый результат ЧЭ расходится с допусками"), 1)
             self.assertIn("Для № 001B6 проверьте Данные!I2, Таблицы!C35:J36", texts)
             self.assertIn("Для № 002B6 проверьте Данные!I3, Таблицы!C37:J38", texts)
-            self.assertIn("Информационные замечания", texts)
             self.assertIn("Печатная вместимость", texts)
+            self.assertEqual(texts.count("Что нужно исправить"), 1)
             self.assertFalse(main.can_export)
             preview.close()
 
@@ -536,9 +545,10 @@ class InterfaceTests(unittest.TestCase):
             preview = ProtocolDialog(main)
             texts = "\n".join(label.text() for label in preview.findChildren(QLabel))
             self.assertEqual(texts.count("Модификация средства поверки расходится"), 1)
-            for value in ("Учебное средство (№ 001", "Другое исполнение А1", "VRI", "Оборудование!A2:E2"):
-                self.assertIn(value, preview.equipment_panel.note.text())
-            self.assertNotIn("mi_modification", texts)
+            for value in ("Учебное средство:", "Другое исполнение А1", "Оборудование!A2:E2"):
+                self.assertIn(value, texts)
+            self.assertNotIn("(VRI", texts)
+            self.assertEqual(preview.equipment_models["mis"].rows[0][1][-1], "Не подтверждено")
             self.assertFalse(main.can_export)
             preview.close()
 
@@ -570,12 +580,11 @@ class InterfaceTests(unittest.TestCase):
                 main.show_results()
                 main.source.doubleClicked.emit(main.source_model.index(1, 1))
             dialog = ProtocolDialog(main)
-            self.assertIn("001B6", [label.text() for label in dialog.scroll.widget().findChildren(QLabel)])
+            self.assertEqual(dialog.instrument_model.rows[0][1][0], "001B6")
             dialog.selector.setCurrentIndex(1)
             texts = [label.text() for label in dialog.scroll.widget().findChildren(QLabel)]
-            self.assertIn("002B6", texts)
-            self.assertIn("Протокол ТЕСТ-ВТОРОЙ", texts)
-            self.assertNotIn("001B6", texts)
+            self.assertEqual(dialog.instrument_model.rows[0][1][0], "002B6")
+            self.assertIn("Протокол ТЕСТ-ВТОРОЙ · ТСП/ТСМ", texts)
             dialog.close()
             apply_theme(self.app)
             with patch("arshin_generator.ui.main.laboratory_settings", return_value=False):
@@ -601,7 +610,8 @@ class InterfaceTests(unittest.TestCase):
             self.assertEqual(main.source_model.rows[0][1][-1], "Требуется исправление")
             self.assertEqual(main.source_model.rows[1][1][-1], "Готов")
             details = ProtocolDialog(main, main.protocols[0])
-            self.assertIn("Срок поверки средства истёк", details.equipment_panel.item_model.rows[0][1][-1])
+            self.assertIn("Срок поверки средства истёк", "\n".join(label.text() for label in details.findChildren(QLabel)))
+            self.assertEqual(details.equipment_models["mis"].rows[0][1][-1], "Не подтверждено")
             details.close()
 
     def test_expiry_is_passive_and_export_renews_only_stale_entries(self):
@@ -848,7 +858,7 @@ class InterfaceTests(unittest.TestCase):
                     self.assertFalse(main.can_export)
                     self.assertFalse(server.calls)
 
-    def test_preview_uses_reader_labels_and_hides_empty_marking_fields(self):
+    def test_preview_keeps_reader_name_and_uses_exported_modification(self):
         with TemporaryDirectory() as directory:
             path = Path(directory)
             main = self.window(path)
@@ -856,20 +866,19 @@ class InterfaceTests(unittest.TestCase):
             first = fixture(path / "rtd.xlsx", "ТЕСТ-ТСП", "001B6", execution=None, ex=None, sticker="")
             second = fixture(path / "other.xlsx", "ТЕСТ-ДРУГОЙ", "002B6", sticker="")
             second.reader_name = "Тестовый формат"
-            second.preview_fields = (PreviewField("model", "Обозначение испытаний"),)
             main.protocols = [first, second]
             self.verify_protocols(main)
             self.assertEqual([row[1][2] for row in main.source_model.rows], ["ТСП/ТСМ", "Тестовый формат"])
             preview = ProtocolDialog(main, first)
             texts = [label.text() for label in preview.scroll.widget().findChildren(QLabel)]
-            self.assertIn("ТСП/ТСМ", texts)
+            self.assertIn("Протокол ТЕСТ-ТСП · ТСП/ТСМ", texts)
             self.assertIn("ТСП-0193", texts)
             self.assertNotIn("Исполнение", texts)
             self.assertNotIn("Взрывозащита", texts)
             preview.selector.setCurrentIndex(1)
             texts = [label.text() for label in preview.scroll.widget().findChildren(QLabel)]
-            self.assertIn("Тестовый формат", texts)
-            self.assertIn("Обозначение испытаний", texts)
+            self.assertIn("Протокол ТЕСТ-ДРУГОЙ · Тестовый формат", texts)
+            self.assertIn("Модификация СИ", texts)
             self.assertNotIn("Модель и модификация", texts)
             preview.close()
 
@@ -1151,13 +1160,15 @@ class InterfaceTests(unittest.TestCase):
             self.assertEqual(len(main.storage.history()), 1)
 
 
-    def test_equipment_candidates_require_an_explicit_selection(self):
+    def test_ambiguous_mieta_can_only_be_corrected_in_excel(self):
         with TemporaryDirectory() as directory:
             path = Path(directory)
-            storage = Storage(path / "ui.sqlite3")
+            main = self.window(path)
             protocol = fixture(path / "ui.xlsx", "ТЕСТ-КАРТОЧКИ", "001B6")
             item = etalon()
             protocol.equipment = [item]
+            main.protocols = [protocol]
+            main.type_titles["56560-14"] = "Термопреобразователи сопротивления"
             day = date.fromisoformat(protocol.fields["verification_date"].value)
             first = ("41", "32777.06.2Р.01000001", "ГПС 1")
             second = ("42", "32777.06.2Р.01000002", "ГПС 2")
@@ -1168,22 +1179,135 @@ class InterfaceTests(unittest.TestCase):
                 cases.append((row, detail))
             found = lookup_equipment(item, day, FixtureClient(cases))
             self.assertEqual(found.state, "choice")
-            dialog = EquipmentReviewPanel(None, storage, protocol, {lookup_key(item, day.isoformat()): found})
-            self.assertEqual(dialog.candidate_model.rowCount(), 2)
-            self.assertFalse(dialog.select_btn.isEnabled())
-            for i in range(2):
-                dialog.candidates.selectionModel().select(
-                    dialog.candidate_model.index(i, 0), QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows
-                )
-            self.assertTrue(dialog.select_btn.isEnabled())
-            self.assertEqual(len(dialog.selected_candidates()), 2)
-            dialog.choose()
-            entries, issue = resolve_many(item, Storage(path / "ui.sqlite3").entries(), day, found)
-            self.assertEqual(len(entries), 2)
-            self.assertFalse(issue)
-            only_one = type(found)("found", "", (found.candidates[0],))
-            self.assertFalse(resolve_many(item, storage.entries(), day, only_one)[0])
+            key = lookup_key(item, day.isoformat())
+            main.lookups[key] = found
+            main.recheck()
+            dialog = ProtocolDialog(main, protocol)
+            texts = "\n".join(label.text() for label in dialog.scroll.widget().findChildren(QLabel))
+            self.assertEqual(texts.count("Не удалось однозначно подтвердить запись"), 1)
+            self.assertIn(item.source, texts)
+            self.assertNotIn(first[1], texts)
+            self.assertNotIn(second[1], texts)
+            self.assertNotIn("Выбрать запись", [button.text() for button in dialog.findChildren(QPushButton)])
+            self.assertEqual(len(dialog.scroll.widget().findChildren(QTableView)), 2)
+            self.assertEqual(dialog.equipment_models["mieta"].rows[0][1][-1], "Не подтверждено")
+            self.assertFalse(main.can_export)
+            self.assertFalse(main.storage.entries())
+            main.lookups[key] = EquipmentLookup("choice", "В номере эталона из Excel латинская P. Сверьте карточку с кириллической Р",
+                                                (found.candidates[0],))
+            main.recheck()
+            texts = "\n".join(label.text() for label in dialog.scroll.widget().findChildren(QLabel))
+            self.assertEqual(texts.count("латинская P вместо кириллической Р"), 1)
+            self.assertFalse(main.can_export)
             dialog.close()
+
+    def test_protocol_preview_shows_all_values_emitted_to_xml(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory)
+            main = self.window(path)
+            method = "ГОСТ 8.461-2009 ГСИ. Термопреобразователи сопротивления. Методика поверки для испытаний"
+            good = fixture(path / "good.xlsx", "Первичный", "001B6", method=method)
+            bad = fixture(path / "bad.xlsx", "Периодический", "002B6", outcome="НЕ СООТВЕТСТВУЕТ", kind="периодической")
+            for key, value in (("structure", "Три части"), ("brief", "Проверен указанный диапазон"),
+                               ("additional", "Контрольные сведения")):
+                good.fields[key] = Datum(value, "Данные испытания")
+            main.protocols = [good, bad]
+            self.verify_protocols(main)
+            self.assertTrue(main.can_export)
+            dialog = ProtocolDialog(main, good)
+            [good_xml, bad_xml], errors, _ = main.schema.inspect(format_packets(main.results, main.schema)[0][0])
+            self.assertFalse(errors)
+            fields = preview_fields(dialog)
+            tags = {
+                "Модификация СИ": "modification", "Условный шифр знака поверки": "signCipher",
+                "Владелец СИ": "miOwner", "Документ на методику поверки": "docTitle", "ФИО поверителя": "metrologist",
+                "Номер наклейки": "stickerNum", "Температура": "temperature", "Атмосферное давление": "pressure",
+                "Относительная влажность": "hymidity", "Другие факторы": "other",
+                "Состав СИ, представленного на поверку": "structure", "Краткая характеристика объема поверки": "characteristics",
+                "Прочие сведения": "additional_info",
+            }
+            for title, tag in tags.items():
+                with self.subTest(field=title):
+                    self.assertEqual(fields[title], good_xml.findtext(f".//{{{NS}}}{tag}"))
+            for title, tag in (("Использование результатов калибровки", "calibration"),
+                               ("Знак поверки в паспорте", "signPass"), ("Знак поверки на СИ", "signMi")):
+                self.assertEqual(fields[title], {"false": "Нет", "true": "Да"}[good_xml.findtext(f".//{{{NS}}}{tag}")])
+            for title, tag in (("Дата поверки", "vrfDate"), ("Действительна до", "validDate")):
+                self.assertEqual(fields[title], date.fromisoformat(good_xml.findtext(f"{{{NS}}}{tag}")).strftime("%d.%m.%Y"))
+            self.assertEqual(fields["Поверка в сокращенном объеме"], "Да")
+            self.assertEqual(fields["Тип поверки"], "Первичная")
+            self.assertEqual(good_xml.findtext(f"{{{NS}}}type"), "1")
+            self.assertEqual(fields["Условный шифр знака поверки"], "ВЦЯ")
+            self.assertEqual(fields["ФИО поверителя"], "Тестова А.В.")
+            self.assertEqual(fields["Тип СИ в реестре ФИФ ОЕИ"], "56560-14 · Термопреобразователи сопротивления")
+            self.assertEqual(dialog.instrument_model.headers, ("Заводской №", "Год выпуска", "Результат поверки"))
+            self.assertEqual(dialog.instrument_model.rows[0][1], (good_xml.findtext(f".//{{{NS}}}manufactureNum"),
+                             good_xml.findtext(f".//{{{NS}}}manufactureYear"), "Пригодно"))
+
+            dialog.selector.setCurrentIndex(1)
+            fields = preview_fields(dialog)
+            self.assertEqual(fields["Тип поверки"], "Периодическая")
+            self.assertEqual(bad_xml.findtext(f"{{{NS}}}type"), "2")
+            self.assertEqual(fields["Причины непригодности"], bad_xml.findtext(f".//{{{NS}}}reasons"))
+            self.assertEqual(dialog.instrument_model.rows[0][1], ("002B6", None, "Непригодно"))
+            for title in ("Действительна до", "Номер наклейки", "Знак поверки в паспорте", "Знак поверки на СИ",
+                          "Поверка в сокращенном объеме", "Состав СИ, представленного на поверку", "Прочие сведения"):
+                self.assertNotIn(title, fields)
+            self.assertIsNone(bad_xml.find(f"{{{NS}}}validDate"))
+            for record in (good_xml, bad_xml):
+                self.assertFalse(any("certificate" in node.tag.lower() for node in record.iter()))
+            texts = [widget.text() for widget in dialog.scroll.widget().findChildren(QLabel)]
+            self.assertNotIn("№ свидетельства", texts)
+            dialog.close()
+
+    def test_settings_default_edit_restart_and_preserve_saved_values(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory)
+            main = self.window(path)
+            p = fixture(path / "original.xlsx", "Один", "001B6", sticker="")
+            main.protocols = [p]
+            self.verify_protocols(main)
+            dialog = ProtocolDialog(main, p)
+
+            def edit(form):
+                self.assertEqual(form.values(), {"sign_cipher": "ВЦЯ", "calibration": False})
+                cipher = form.editor.controls["sign_cipher"]
+                calibration = form.editor.controls["calibration"]
+                self.assertEqual(calibration.currentText(), "Нет")
+                cipher.setText("ТСТ")
+                calibration.setCurrentText("Да")
+                form._accept()
+                return form.result()
+
+            with patch.object(Form, "exec", new=edit):
+                main.settings_btn.click()
+            self.assertEqual(preview_fields(dialog)["Условный шифр знака поверки"], "ТСТ")
+            self.assertEqual(preview_fields(dialog)["Использование результатов калибровки"], "Да")
+            xml = result_element(main.results[0])
+            self.assertEqual(xml.findtext(f"{{{NS}}}signCipher"), "ТСТ")
+            self.assertEqual(xml.findtext(f"{{{NS}}}calibration"), "true")
+            dialog.close()
+            main.close()
+
+            reopened = self.window(path)
+            self.assertEqual(reopened.storage.laboratory(), {"sign_cipher": "ТСТ", "calibration": True})
+            p.fields["sign_cipher"] = Datum("ЛАБ", "Таблицы!F22")
+            p.fields["calibration"] = Datum(False, "Таблицы!F21")
+            reopened.protocols = [p]
+            self.verify_protocols(reopened)
+            xml = result_element(reopened.results[0])
+            self.assertEqual(xml.findtext(f"{{{NS}}}signCipher"), "ЛАБ")
+            self.assertEqual(xml.findtext(f"{{{NS}}}calibration"), "false")
+
+            # A pre-existing database with only one saved field receives the new fallback for the other.
+            reopened.storage.save_laboratory({"sign_cipher": "МВ"}, "Тест")
+            for key in ("sign_cipher", "calibration"):
+                p.fields.pop(key)
+            reopened.recheck()
+            self.assertEqual(reopened.storage.laboratory(), {"sign_cipher": "МВ"})
+            xml = result_element(reopened.results[0])
+            self.assertEqual(xml.findtext(f"{{{NS}}}signCipher"), "МВ")
+            self.assertEqual(xml.findtext(f"{{{NS}}}calibration"), "false")
 
 
 if __name__ == "__main__":

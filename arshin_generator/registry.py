@@ -10,10 +10,10 @@ from .normalization import VISUAL
 from .public_registry import API, PublicClient, PublicDataError, TYPE_NUMBER, exact_type, public_date
 
 CATEGORIES = {
-    "mieta": "СИ, применяемое в качестве эталона",
+    "mieta": "СИ, применяемые в качестве эталона",
     "uve": "Эталон единицы величины",
     "npe": "Государственный первичный эталон",
-    "mis": "СИ, применяемое при поверке",
+    "mis": "СИ, применяемые при поверке",
 }
 MIETA_NUMBER = re.compile(r"[0-9]+\.[0-9]+\.[\w]+\.[0-9]+")
 UNSPECIFIED_MODIFICATIONS = {"", "-", "нет", "нет данных", "нет модификации", "без модификации", "не указано"}
@@ -101,11 +101,19 @@ def _model_issue(item: Equipment, model: str, source: str) -> str:
 def equipment_diagnostic(item: Equipment, issue: str) -> str:
     if not issue:
         return ""
-    number = item.registration or item.type_number
-    identity = ", ".join(filter(None, (f"№ {item.serial}" if item.serial else "", number)))
     name = item.name or item.description
-    name = f"{name} ({identity})" if identity else name
-    return f"{name} · {issue.rstrip('.')}. Источник в Excel: {item.source}."
+    source = item.source
+    if issue.startswith("В номере эталона из Excel латинская P"):
+        issue = "В номере эталона использована латинская P вместо кириллической Р"
+        source = source.split(" / ", 1)[0]
+    elif "Требуется выбор" in issue or "ранее выбранные карточки" in issue:
+        issue = "Не удалось однозначно подтвердить запись ФИФ ОЕИ. Уточните реквизиты в Excel"
+    else:
+        issue = re.sub(r"\s*\((?:связанная )?(?:MIT|VRI|MIETA)(?:,[^)]*)?\)", "", issue)
+        issue = (issue.replace("в MIT", "в ФИФ ОЕИ").replace("Карточка MIETA", "Запись ФИФ ОЕИ")
+                 .replace("MIETA:", "Запись эталона:").replace("Связанная VRI:", "Связанная поверка:")
+                 .replace("VRI:", "Результат поверки:"))
+    return f"{name}: {issue.rstrip('.')}. Проверьте {source}."
 
 
 def lookup_key(item: Equipment, day: str) -> tuple:

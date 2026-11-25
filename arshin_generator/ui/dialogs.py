@@ -1,44 +1,43 @@
-from dataclasses import replace
-from getpass import getuser
 import json
 import logging
 from pathlib import Path
 import sqlite3
 
 from lxml import etree
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt
 from PySide6.QtGui import QFontDatabase, QTextCursor
 from PySide6.QtWidgets import (
-    QAbstractItemView, QComboBox, QDialog, QFileDialog, QHBoxLayout, QHeaderView, QLineEdit, QPlainTextEdit, QTabWidget,
-    QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
+    QComboBox, QDialog, QFileDialog, QHBoxLayout, QLineEdit, QPlainTextEdit, QTabWidget, QTreeWidget,
+    QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
 from ..arshin import NS, open_xml
-from ..domain import RECHECK, UNVERIFIED
-from ..registry import CATEGORIES, equipment_diagnostic, iso_date, lookup_key, resolve_many
+from ..registry import CATEGORIES
 from ..storage import PORTAL_STATES
 from .common import Form, apply_dialog_icon, button, fit_window, label, message, selected, table
 
 TAGS = {
     "application": "Пакет поверок", "result": "Результат поверки", "miInfo": "Сведения о СИ",
-    "singleMI": "СИ", "etaMI": "СИ в качестве эталона", "mitypeNumber": "Регистрационный номер типа",
-    "manufactureNum": "Заводской номер", "typeNum": "Тип по реестру", "inventoryNum": "Обозначение",
-    "manufactureYear": "Год выпуска", "modification": "Модификация", "signCipher": "Шифр знака",
-    "miOwner": "Владелец", "vrfDate": "Дата поверки", "validDate": "Действительна до",
-    "type": "Вид поверки", "calibration": "Использование калибровки",
-    "applicable": "Пригоден", "inapplicable": "Непригоден", "reasons": "Причина",
-    "docTitle": "Методика поверки", "metrologist": "Поверитель", "stickerNum": "Наклейка",
-    "signPass": "Знак в паспорте", "signMi": "Знак на приборе", "means": "Средства поверки",
-    "mi": "Средство измерений", "number": "Номер записи", "conditions": "Условия поверки",
-    "temperature": "Температура", "pressure": "Атмосферное давление", "hymidity": "Влажность",
-    "other": "Другие факторы", "structure": "Состав СИ", "brief_procedure": "Сокращённый объём",
-    "characteristics": "Характеристика", "additional_info": "Прочие сведения", "protocol": "Протокол",
+    "singleMI": "СИ", "etaMI": "СИ в качестве эталона", "mitypeNumber": "Тип СИ в реестре ФИФ ОЕИ",
+    "manufactureNum": "Заводской №", "typeNum": "Регистрационный № типа СИ",
+    "inventoryNum": "Буквенно-цифровое обозначение", "manufactureYear": "Год выпуска",
+    "modification": "Модификация СИ", "signCipher": "Условный шифр знака поверки",
+    "miOwner": "Владелец СИ", "vrfDate": "Дата поверки", "validDate": "Действительна до",
+    "type": "Тип поверки", "calibration": "Использование результатов калибровки",
+    "applicable": "Пригодно", "inapplicable": "Непригодно", "reasons": "Причины непригодности",
+    "docTitle": "Документ на методику поверки", "metrologist": "ФИО поверителя", "stickerNum": "Номер наклейки",
+    "signPass": "Знак поверки в паспорте", "signMi": "Знак поверки на СИ", "means": "Средства поверки",
+    "mi": "Средство измерений", "number": "Номер записи", "conditions": "Условия проведения поверки",
+    "temperature": "Температура", "pressure": "Атмосферное давление", "hymidity": "Относительная влажность",
+    "other": "Другие факторы", "structure": "Состав СИ, представленного на поверку",
+    "brief_procedure": "Поверка в сокращенном объеме", "characteristics": "Краткая характеристика объема поверки",
+    "additional_info": "Прочие сведения", "protocol": "Протокол",
     "content": "Содержимое вложения", "ses": "Стандартные образцы", "se": "Стандартный образец",
     "oMethod": "Метод без средств поверки", "reagent": "Вещество или материал", **CATEGORIES,
 }
 
 
-def _value(tag, text):
+def field_text(tag, text):
     if tag in {"calibration", "signPass", "signMi", "isOwner"}:
         return {"true": "Да", "1": "Да", "false": "Нет", "0": "Нет"}.get(text, text)
     if tag == "type":
@@ -52,7 +51,7 @@ def tree_items(element, parent):
     value = (element.text or "").strip()
     if tag == "content" and value:
         value = f"Вложение Base64 ({len(value)} символов)"
-    node = QTreeWidgetItem(parent, [title, _value(tag, value)])
+    node = QTreeWidgetItem(parent, [title, field_text(tag, value)])
     for key, text in element.attrib.items():
         QTreeWidgetItem(node, [key, text])
     for child in element:
@@ -192,149 +191,6 @@ class XmlDialog(QDialog):
             self.raw.moveCursor(QTextCursor.MoveOperation.Start)
             if not self.raw.find(term):
                 message(self, "Поиск по XML", "Фраза не найдена в тексте файла.")
-
-
-class EquipmentReviewPanel(QWidget):
-    changed = Signal()
-
-    def __init__(self, parent, storage, protocol, lookups, *, checked_inputs=True):
-        super().__init__(parent)
-        self.storage = storage
-        self.protocol = protocol
-        self.lookups = lookups
-        self.checked_inputs = checked_inputs
-        day = protocol.fields.get("verification_date")
-        self.day = iso_date(day.value if day else None)
-        box = QVBoxLayout(self)
-        box.setContentsMargins(0, 0, 0, 0)
-        self.summary = label("")
-        box.addWidget(self.summary)
-        self.items, self.item_model = table(
-            ("Средство поверки", "Заводской №", "Номер ФИФ ОЕИ", "Состояние"), ()
-        )
-        box.addWidget(self.items)
-        self.note = label("")
-        box.addWidget(self.note)
-        self.candidates, self.candidate_model = table(
-            ("Номер записи", "Модель", "Зав. №", "Поверена", "Действует до", "Схема / состояние"), ()
-        )
-        box.addWidget(self.candidates)
-        for view in (self.items, self.candidates):
-            view.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-            view.verticalHeader().setDefaultSectionSize(view.fontMetrics().height() + 10)
-            view.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
-            view.horizontalScrollBar().rangeChanged.connect(lambda *_args, view=view: self.fit_table(view))
-        self.items.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
-        self.items.verticalHeader().setMinimumSectionSize(self.items.verticalHeader().defaultSectionSize())
-        actions = QHBoxLayout()
-        self.select_btn = button("Выбрать запись", self.choose, primary=True)
-        actions.addWidget(self.select_btn)
-        actions.addStretch()
-        box.addLayout(actions)
-        self.items.selectionModel().currentChanged.connect(self.refresh_candidates)
-        self.candidates.selectionModel().selectionChanged.connect(self.refresh_button)
-        self.refresh_items()
-
-    @staticmethod
-    def fit_table(view):
-        height = view.horizontalHeader().sizeHint().height() + 2 * view.frameWidth()
-        height += sum(view.rowHeight(row) for row in range(view.model().rowCount()))
-        scrollbar = view.horizontalScrollBar()
-        if scrollbar.maximum():
-            height += scrollbar.sizeHint().height()
-        view.setFixedHeight(height)
-
-    def lookup(self, item):
-        return self.lookups.get(lookup_key(item, self.day.isoformat())) if item and self.day else None
-
-    def refresh_items(self, current=None):
-        entries = self.storage.entries()
-        rows = []
-        self.assessments = {}
-        for item in self.protocol.equipment:
-            live = self.lookup(item)
-            resolved, issue = resolve_many(item, entries, self.day, live, require_public=True) if self.checked_inputs else ([], "")
-            self.assessments[item] = bool(resolved), issue
-            numbers = ", ".join(entry.identifier or entry.type_number for entry in resolved)
-            status = "Проверено" if resolved else issue
-            if self.checked_inputs and live is None:
-                status = RECHECK
-            elif live and live.retryable:
-                status = UNVERIFIED
-            elif not resolved and live and live.state == "conflict":
-                status = "Сведения не подтверждены"
-            rows.append((item, (item.name or item.description, item.serial, numbers, status)))
-        self.pending = [item for item, (ready, _) in self.assessments.items() if not ready]
-        self.checked = sum(self.assessments[item][0] for item, _ in rows)
-        suffix = f": проверено {self.checked} из {len(rows)}" if self.checked_inputs else ""
-        self.summary.setText("Средства поверки" + suffix)
-        self.item_model.update(rows)
-        name_width = max(self.items.horizontalHeader().sectionSizeHint(0), self.items.sizeHintForColumn(0))
-        self.items.setColumnWidth(0, min(390, name_width))
-        self.items.resizeRowsToContents()
-        self.fit_table(self.items)
-        if rows:
-            focus = current or (self.pending[0] if self.pending else None)
-            index = next((i for i, row in enumerate(rows) if row[0] == focus), 0)
-            self.items.selectRow(index)
-        self.refresh_candidates()
-
-    def refresh_candidates(self, *_):
-        item = selected(self.items)
-        live = self.lookup(item)
-        resolved, issue = self.assessments.get(item, (False, ""))
-        candidates = live.candidates if live else ()
-        several = bool(item and item.category == "mieta" and sum(c.eligible for c in candidates) > 1)
-        self.candidates.setSelectionMode(QAbstractItemView.SelectionMode.MultiSelection if several else
-                                         QAbstractItemView.SelectionMode.SingleSelection)
-        note = issue
-        if several and not resolved:
-            note += ". Нажмите на каждую запись, которая действительно использовалась."
-        if live and live.state == "expired" and len(candidates) == 1 and candidates[0].entry.valid_until:
-            end = iso_date(candidates[0].entry.valid_until)
-            if end:
-                note += f". Поверка действовала до {end:%d.%m.%Y}."
-            if candidates[0].status.startswith(("Модель", "Заводской номер")):
-                note += f" {candidates[0].status}."
-        self.note.setText(equipment_diagnostic(item, note) if item and live and not resolved else "")
-        self.note.setVisible(bool(self.note.text()))
-        eligible = [candidate for candidate in candidates if candidate.eligible]
-        self.candidate_model.update([
-            (c, (c.entry.identifier or c.entry.type_number, c.entry.model, c.entry.registry_serial, c.entry.valid_from,
-                 c.entry.valid_until, " · ".join(filter(None, (c.status, c.entry.scheme)))))
-            for c in eligible
-        ])
-        self.fit_table(self.candidates)
-        self.candidates.setVisible(bool(not resolved and live and live.state in {"found", "choice"} and eligible))
-        self.refresh_button()
-
-    def refresh_button(self, *_):
-        candidates = self.selected_candidates()
-        item = selected(self.items)
-        live = self.lookup(item)
-        resolved, _ = self.assessments.get(item, (False, ""))
-        choosing = bool(not resolved and live and live.state in {"found", "choice"} and self.candidate_model.rows)
-        self.select_btn.setVisible(choosing)
-        self.select_btn.setEnabled(bool(choosing and candidates and all(c.eligible for c in candidates)))
-
-    def selected_candidates(self):
-        indexes = self.candidates.selectionModel().selectedRows()
-        return [self.candidate_model.rows[index.row()][0] for index in sorted(indexes, key=lambda i: i.row())]
-
-    def choose(self):
-        candidates = self.selected_candidates()
-        if not candidates or not all(candidate.eligible for candidate in candidates):
-            return
-        try:
-            self.storage.save_equipment_choices([
-                replace(c.entry, evidence=f"{c.entry.evidence} · Выбрано по протоколу", confirmer=getuser())
-                for c in candidates
-            ])
-        except (ValueError, sqlite3.Error) as exc:
-            self.note.setText(str(exc) if isinstance(exc, ValueError) else "Не удалось сохранить выбор.")
-            self.note.show()
-            return
-        self.changed.emit()
 
 
 class HistoryDialog(QDialog):

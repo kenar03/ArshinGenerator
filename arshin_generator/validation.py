@@ -4,7 +4,7 @@ import re
 from . import VERSION
 from .confirmations import get_confirmation, manufacture_year
 from .domain import Datum, Protocol, RegistryEntry, Result
-from .laboratory import apply_defaults
+from .laboratory import LABORATORY_DEFAULTS, apply_defaults
 from .normalization import metrologist
 from .public_registry import TYPE_NUMBER
 from .registry import equipment_diagnostic, has_registry_identity, iso_date, lookup_key, resolve_many
@@ -46,9 +46,12 @@ def _prepare(protocol, laboratory, confirmations):
     # Settings replace an older per-protocol entry only when a laboratory value was actually supplied.
     apply_defaults(fields, laboratory)
     previous = get_confirmation(confirmations, "protocol", protocol)
+    legacy = {}
     if previous:
         legacy = {key: value for key, value in previous[0].items() if key not in laboratory}
         apply_defaults(fields, legacy, source="Реквизиты лаборатории, сохранённые для протокола")
+    apply_defaults(fields, {key: value for key, value in LABORATORY_DEFAULTS.items()
+                            if key not in laboratory and key not in legacy}, source="Значение по умолчанию")
     issues = [*protocol.issues]
     if protocol.serial_issue:
         issues.append(protocol.serial_issue)
@@ -137,6 +140,7 @@ def check(protocols: list[Protocol], confirmations: dict, registry: list[Registr
             continue
         shared, issues = _prepare(protocol, laboratory or {}, confirmations)
         equipment = []
+        equipment_resolutions = {}
         equipment_issues = []
         shared_registry_issues = []
         equipment_conflict = False
@@ -145,13 +149,15 @@ def check(protocols: list[Protocol], confirmations: dict, registry: list[Registr
         for item in protocol.equipment:
             if not check_registry:
                 if not has_registry_identity(item):
-                    issues.append(f"Уточните реквизиты средства «{item.name or item.description}» в Excel ({item.source}).")
+                    issues.append(item.input_issue or
+                                  f"Уточните реквизиты средства «{item.name or item.description}». Проверьте {item.source}.")
                 continue
             online = lookups.get(lookup_key(item, when.isoformat() if when else ""))
             if require_public and (online is None or online.retryable):
                 registry_pending = True
                 continue
             entries, error = resolve_many(item, registry, when, online, require_public=require_public)
+            equipment_resolutions[item] = tuple(entries)
             if entries:
                 equipment.extend(entries)
             else:
@@ -192,7 +198,8 @@ def check(protocols: list[Protocol], confirmations: dict, registry: list[Registr
             result = Result(protocol, instrument, fields, equipment,
                             shared_issues=tuple(dict.fromkeys(issues + list(registry_issues))),
                             equipment_issues=tuple(dict.fromkeys(equipment_issues)), registry_issues=registry_issues,
-                            equipment_conflict=equipment_conflict, registry_pending=registry_pending)
+                            equipment_conflict=equipment_conflict, registry_pending=registry_pending,
+                            equipment_resolutions=equipment_resolutions)
             if fields["manufacture_year"] != shared["manufacture_year"] and not valid_manufacture_year(
                 result.value("manufacture_year"), when
             ):

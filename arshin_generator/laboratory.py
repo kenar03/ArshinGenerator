@@ -3,8 +3,9 @@ import re
 from .domain import Datum
 
 SETTING = "laboratory"
+LABORATORY_DEFAULTS = {"sign_cipher": "ВЦЯ", "calibration": False}
 DEFAULT_FIELDS = (
-    ("sign_cipher", "Шифр знака поверки", "text"),
+    ("sign_cipher", "Условный шифр знака поверки", "text"),
     ("calibration", "Использование результатов калибровки", "bool"),
 )
 

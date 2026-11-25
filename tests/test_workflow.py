@@ -19,7 +19,7 @@ from arshin_generator.arshin import (
 )
 from arshin_generator.confirmations import YEAR_SCOPE, get_confirmation, individual_key, legacy_key, protocol_key, with_guards
 from arshin_generator.dates import expiry_before_anniversary
-from arshin_generator.domain import Datum, PreviewField, RegistryEntry
+from arshin_generator.domain import Datum, RegistryEntry
 from arshin_generator.normalization import modification_candidate, metrologist, serial_list
 from arshin_generator.public_registry import exact_records
 from arshin_generator.readers import read_protocol, rtd
@@ -575,13 +575,13 @@ class WorkflowTests(unittest.TestCase):
         book.save(second_path)
         book.close()
         other = SimpleNamespace(
-            VERSION="test-other", DISPLAY_NAME="Тестовый формат", PREVIEW_FIELDS=(PreviewField("model", "Обозначение"),),
+            VERSION="test-other", DISPLAY_NAME="Тестовый формат",
             matches=lambda book: book["Таблицы"]["A2"].value == "Другой формат для теста", read=rtd.read,
         )
         with patch("arshin_generator.readers.READERS", (other, rtd)):
             second = read_protocol(second_path)
         self.assertEqual(second.reader, "test-other")
-        self.assertEqual(second.preview_fields, other.PREVIEW_FIELDS)
+        self.assertEqual(second.reader_name, other.DISPLAY_NAME)
         for protocol in (first, second):
             for key in ("additional", "structure", "brief"):
                 protocol.fields[key] = Datum("П" * 1000, "Испытание размера")
