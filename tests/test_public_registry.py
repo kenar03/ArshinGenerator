@@ -333,6 +333,95 @@ class RegistryLookupTests(unittest.TestCase):
             self.assertEqual(found.state, "conflict")
             self.assertFalse(found.candidates[0].eligible)
 
+    def test_vri_barometer_uses_exact_identity_without_generic_model_error(self):
+        item = Equipment("3745-73 Барометр-анероид метеорологический М-110 № 42", "Оборудование!A10:E10",
+                         "3745-73", "42", "Барометр-анероид метеорологический М-110",
+                         category="mis", type_number="3745-73")
+        row = {"vri_id": "1-572553788", "mit_number": "3745-73", "mi_number": "42",
+               "mit_title": "Барометры-анероиды", "mit_notation": "М-110",
+               "verification_date": "10.11.2026", "valid_date": "09.11.2027", "applicability": True}
+        for modification in (None, "Нет модификации", "нет данных", "Барометры-анероиды,",
+                             "М-110 (принадлежит 102)", "M – 110"):
+            with self.subTest(modification=modification):
+                found = lookup_equipment(item, DAY, FixtureClient(verifications=[{**row, "mi_modification": modification}]))
+                self.assertEqual(found.state, "found")
+                self.assertEqual(found.candidates[0].entry.registry_serial, "42")
+                self.assertEqual(found.candidates[0].entry.category, "mis")
+        for changes, state in (({"mi_number": "042"}, "missing"), ({"mit_number": "3745-74"}, "missing"),
+                               ({"valid_date": "13.11.2026"}, "expired"), ({"applicability": False}, "conflict")):
+            with self.subTest(changes=changes):
+                result = lookup_equipment(item, DAY, FixtureClient(verifications=[{**row, **changes}]))
+                self.assertEqual(result.state, state)
+
+    def test_vri_reports_real_model_differences_with_source(self):
+        item = replace(etalon(), category="mis", name="Термометр ПТСВ-1-2Б")
+        row = {"vri_id": "1-111", "mit_number": "32777-06", "mi_number": "003342",
+               "verification_date": "14.04.2026", "valid_date": "13.04.2027", "applicability": True}
+        for model in ("ПТСВ-1-2", "ПТСВ-1-2А", "ПТСВ-1-3", "ПТСВ-1-2Б/1"):
+            with self.subTest(model=model):
+                result = lookup_equipment(item, DAY, FixtureClient(verifications=[{**row, "mi_modification": model}]))
+                self.assertEqual(result.state, "conflict")
+                self.assertIn("Excel: «Термометр ПТСВ-1-2Б»", result.message)
+                self.assertIn(f"ФИФ ОЕИ: «{model}»", result.message)
+                self.assertIn("VRI, поле «Модификация»", result.message)
+        conflict = {**row, "mi_modification": "ПТСВ-1-2А"}
+        generic = {**row, "vri_id": "1-222", "mi_modification": "Нет модификации"}
+        result = lookup_equipment(item, DAY, FixtureClient(verifications=[conflict, generic]))
+        self.assertEqual(result.state, "conflict")
+        self.assertFalse(any(candidate.eligible for candidate in result.candidates))
+
+    def test_mieta_uses_explicit_modification_from_linked_record(self):
+        class LinkedModel(FixtureClient):
+            def detail(self, resource, record_id):
+                result = super().detail(resource, record_id)
+                if resource == "mieta":
+                    result = {**result, "modification": "Нет данных", "minotation": "Термометры сопротивления"}
+                if resource == "vri":
+                    result["miInfo"]["etaMI"]["modification"] = "ПТСВ-1-3"
+                return result
+
+        result = lookup_equipment(etalon(), DAY, LinkedModel((self.first,)))
+        self.assertEqual(result.state, "conflict")
+        self.assertIn("Excel: «Термометр ПТСВ-1-2»", result.message)
+        self.assertIn("ФИФ ОЕИ: «ПТСВ-1-3»", result.message)
+        self.assertIn("связанная VRI", result.message)
+
+    def test_selected_new_template_standards_are_verified_and_exported(self):
+        second = mieta("100002", "32777.06.2Р.01000002", "ГПС 2", serial="003343")
+        cards = (self.first, second)
+
+        def customize(book):
+            table, catalog = book["Таблицы"], book["Оборудование"]
+            catalog["D1"] = "Тип прибора"
+            for index, (number, factory) in enumerate((("32777-06", "003342"), (second[0]["number"], "003343")), 2):
+                label = f"{number} Термометр ПТСВ-1-2 № {factory}"
+                for column, value in enumerate((number, "Термометр ПТСВ-1-2", factory, "Эталон", label), 1):
+                    catalog.cell(index, column, value)
+                table[f"A{8 + index}"] = label
+            table["L34"] = "Эталон для измерения"
+            table["H30"] = "ПТСВ-1-2 №003342"
+            table["H31"] = "Другой, неиспользованный эталон №123"
+            table["L36"] = "ПТСВ-1-2 №003343"
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            protocol = fixture(root / "source.xlsx", "ТЕСТ-ЭТАЛОНЫ", "012B6", day=DAY, customize=customize)
+            storage = Storage(root / "database.sqlite3")
+            seed_lab(storage)
+            client = FixtureClient(cards)
+            lookups = {lookup_key(item, DAY.isoformat()): lookup_equipment(item, DAY, client)
+                       for item in protocol.equipment}
+            self.assertIn(("mieta", {"mitype_num": "32777-06", "factory_num": "003342"}), client.requests)
+            self.assertIn(("mieta", {"number": second[0]["number"]}), client.requests)
+            result = check([protocol], {}, [], lookups, laboratory=storage.laboratory(), require_public=True)
+            self.assertFalse(result[0].blockers)
+            schema = Schema()
+            payload = format_packets(result, schema)[0][0]
+            parsed, issues, _ = schema.inspect(payload)
+            self.assertFalse(issues)
+            self.assertEqual([node.text for node in parsed.findall(f".//{{{NS}}}mieta/{{{NS}}}number")],
+                             [card[0]["number"] for card in cards])
+
     def test_vri_later_negative_blocks_an_older_positive_and_offline_has_fallback(self):
         item = replace(etalon(), category="mis", name="Термометр ПТСВ-1-2")
         row = {"vri_id": "1-111", "mit_number": "32777-06", "mi_number": "003342", "mi_modification": "ПТСВ-1-2",

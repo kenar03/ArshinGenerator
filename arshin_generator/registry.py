@@ -6,6 +6,7 @@ import re
 import unicodedata
 
 from .domain import Equipment, RegistryEntry
+from .normalization import VISUAL
 from .public_registry import API, PublicClient, PublicDataError, TYPE_NUMBER, exact_type, public_date
 
 CATEGORIES = {
@@ -15,6 +16,7 @@ CATEGORIES = {
     "mis": "СИ, применяемое при поверке",
 }
 MIETA_NUMBER = re.compile(r"[0-9]+\.[0-9]+\.[\w]+\.[0-9]+")
+UNSPECIFIED_MODIFICATIONS = {"", "-", "нет", "нет данных", "нет модификации", "без модификации", "не указано"}
 
 
 @dataclass(frozen=True)
@@ -69,10 +71,31 @@ def _notation(value: str) -> str:
     return " ".join(re.sub("[‑–—−]", "-", value).split())
 
 
+def _model_text(value: str) -> str:
+    return re.sub(r"\s*([/-])\s*", r"\1", _notation(value)).translate(VISUAL)
+
+
 def _has_model(name: str, model: str) -> bool:
     # Keep model characters significant: a published suffix is a different model.
-    return bool(model and re.search(r"(?<![\w/.-])" + re.escape(_notation(model)) + r"(?![\w/.-])",
-                                    _notation(name)))
+    return bool(model and re.search(r"(?<![\w/.-])" + re.escape(_model_text(model)) + r"(?![\w/.-])",
+                                    _model_text(name)))
+
+
+def _reported_model(value, *type_titles) -> str:
+    label = str(value or "").strip()
+    # VRI can include an ownership remark within the modification field.
+    model = re.sub(r"\s*\(принадлежит\s+[^()]+\)\s*$", "", label, flags=re.I)
+    key = _notation(model).strip(" ,;.")
+    titles = {_model_text(str(title or "")).strip(" ,;.") for title in type_titles}
+    if key in UNSPECIFIED_MODIFICATIONS or _model_text(model).strip(" ,;.") in titles:
+        return ""
+    return model
+
+
+def _model_issue(item: Equipment, model: str, source: str) -> str:
+    if model and not _has_model(item.name, model):
+        return f"Модель расходится с протоколом. Excel: «{item.name}» ({item.source}). ФИФ ОЕИ: «{model}» ({source})"
+    return ""
 
 
 def lookup_key(item: Equipment, day: str) -> tuple:
@@ -213,18 +236,23 @@ def _ordinary(item: Equipment, when: date, client: PublicClient) -> tuple[list[E
     latest = _latest(rows, when) or rows
     status_conflict = len({row.get("applicability") is True for row in latest}) > 1
     unknown_dates = any(not public_date(row.get("verification_date")) for row in rows)
-    for row in latest:
-        model = str(row.get("mi_modification") or row.get("mit_notation") or reference.get("notation") or "")
+    modifications = [_reported_model(row.get("mi_modification"), row.get("mit_title"), reference.get("title"))
+                     for row in latest]
+    model_issues = [_model_issue(item, model, "VRI, поле «Модификация»") for model in modifications]
+    conflicting_model = next((issue for issue in model_issues if issue), "")
+    for row, modification, model_issue in zip(latest, modifications, model_issues):
+        model = modification or str(row.get("mit_notation") or reference.get("notation") or "")
         record_id = str(row.get("vri_id") or "")
+        # A same-day card with the model unspecified cannot settle a known conflict.
         problem = ("Поверки на одну дату дают разные результаты" if status_conflict else
                    "В выдаче не указана дата одной из поверок" if unknown_dates else
-                   "" if _has_model(item.name, model) else "Модель расходится с протоколом")
+                   model_issue if modification else conflicting_model)
         result.append(_candidate(item, "mis", record_id, "", item.type_number, item.serial, model, "",
                                  row, when, problem))
     return result, False
 
 
-def _linked_verification(client, proof, official_id, number, serial, model):
+def _linked_verification(client, proof, official_id, number, serial, item, model, type_title):
     detail = client.detail("vri", proof["vri_id"])
     mi = detail.get("miInfo")
     eta = mi.get("etaMI") if isinstance(mi, dict) else None
@@ -233,8 +261,14 @@ def _linked_verification(client, proof, official_id, number, serial, model):
         return "Связанная поверка не подтверждает категорию эталона"
     if (eta.get("regNumber"), eta.get("mitypeNumber"), eta.get("manufactureNum")) != (official_id, number, serial):
         return "Реквизиты эталона расходятся со связанной поверкой"
-    if _notation(str(eta.get("modification") or eta.get("mitypeType") or "")) != _notation(model):
-        return "Модель расходится со связанной поверкой"
+    linked_model = _reported_model(eta.get("modification"), eta.get("mitypeTitle"), type_title)
+    if linked_model:
+        problem = _model_issue(item, linked_model, "связанная VRI, поле «Модификация»")
+        if problem:
+            return problem
+        if model and _model_text(linked_model) != _model_text(model):
+            return (f"Модели в ФИФ ОЕИ расходятся. Excel: «{item.name}» ({item.source}). "
+                    f"MIETA: «{model}». Связанная VRI: «{linked_model}»")
     if (not isinstance(info.get("applicable"), dict) or info.get("inapplicable") is not None or
             public_date(info.get("vrfDate")) != public_date(proof.get("verification_date")) or
             public_date(info.get("validDate")) != public_date(proof.get("valid_date"))):
@@ -265,10 +299,12 @@ def _standards(item: Equipment, when: date, client: PublicClient) -> tuple[list[
         number = str(detail.get("mitype_num") or "")
         official_id = str(detail.get("number") or "")
         serial = str(detail.get("factory_num") or "")
-        model = str(detail.get("modification") or detail.get("minotation") or "")
         scheme = " · ".join(str(detail[key]) for key in ("npenumber", "rankcode", "schematitle") if detail.get(key))
         if number not in types:
             types[number] = exact_type(client, number) if TYPE_NUMBER.fullmatch(number) else None
+        type_title = (types[number] or {}).get("title")
+        modification = _reported_model(detail.get("modification"), detail.get("mititle"), type_title)
+        model = modification or str(detail.get("minotation") or "")
         problem = ""
         if (not MIETA_NUMBER.fullmatch(official_id) or official_id != row.get("number") or
                 number != row.get("mitype_num") or serial != row.get("factory_num")):
@@ -277,9 +313,9 @@ def _standards(item: Equipment, when: date, client: PublicClient) -> tuple[list[
             problem = "Не подтверждён регистрационный номер типа в MIT"
         elif serial != item.serial:
             problem = "Заводской номер расходится с протоколом"
-        elif not _has_model(item.name, model):
-            problem = "Модель расходится с протоколом"
-        elif row.get("applicability") is not True or detail.get("applicability") is not True:
+        elif modification:
+            problem = _model_issue(item, modification, "MIETA, поле «Модификация»")
+        if not problem and (row.get("applicability") is not True or detail.get("applicability") is not True):
             problem = "Карточка MIETA не подтверждает пригодность"
         linked = detail.get("cresults")
         if not isinstance(linked, list) or not all(isinstance(r, dict) for r in linked):
@@ -289,7 +325,7 @@ def _standards(item: Equipment, when: date, client: PublicClient) -> tuple[list[
             problem = "Несколько связанных поверок на одну дату"
         proof = latest[0] if latest else {}
         if not problem and proof.get("vri_id") and not _interval(proof, when)[2]:
-            problem = _linked_verification(client, proof, official_id, number, serial, model)
+            problem = _linked_verification(client, proof, official_id, number, serial, item, modification, type_title)
         candidates.append(_candidate(item, "mieta", record_id, official_id, number, serial, model, scheme,
                                      proof, when, problem or ("Нет связанной поверки на дату протокола" if not latest else "")))
     return candidates, corrected
@@ -330,4 +366,7 @@ def lookup_equipment(item: Equipment, when: date, client: PublicClient | None = 
         candidate = candidates[0]
         hint = f" · до {candidate.entry.valid_until}" if candidate.entry.valid_until else ""
         return EquipmentLookup("conflict", f"{candidate.status}{hint}", tuple(candidates))
+    model_issues = list(dict.fromkeys(c.status for c in candidates if c.status.startswith("Модел")))
+    if model_issues:
+        return EquipmentLookup("conflict", " · ".join(model_issues[:3]), tuple(candidates))
     return EquipmentLookup("conflict", "Ошибка: публичные карточки не подтверждают реквизиты или срок", tuple(candidates))

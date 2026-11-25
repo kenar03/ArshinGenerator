@@ -20,6 +20,7 @@ FAIL = "НЕ СООТВЕТСТВУЕТ"
 DATA_LAST_ROW = 1001
 MEASUREMENT_LAST_ROW = 2034
 MEASUREMENT_COLUMNS = (2, 3, 6, 7, 8, 9)
+EQUIPMENT_CATEGORIES = {"си": "mis", "г/р": "mis", "эталон": "mieta", "фиф": "mieta", "фиф без №": "mieta"}
 
 
 RTD_MODELS = {
@@ -112,18 +113,29 @@ def _sign(value) -> bool | None:
 def _catalog_label(text: str) -> str:
     # Old saved dropdown text can retain Latin P after the catalog has been corrected.
     # This key is only used to join labels. API requests use the untouched column A.
-    return re.sub(r"^([0-9]+\.[0-9]+\.[0-9]+)[PР](\.[0-9]+)(?=\s|$)", r"\1Р\2", text)
+    text = re.sub(r"^([0-9]+\.[0-9]+\.[0-9]+)[PР](\.[0-9]+)(?=\s|$)", r"\1Р\2", text)
+    return " ".join(re.sub(r"\s*№\s*", " № ", text).split())
 
 
-def _equipment(t, catalog, etalons) -> list[Equipment]:
+def _equipment_labels(number, name, factory):
+    if number and name and factory:
+        return (f"{number} {name} № {factory}", f"г/р № {number} {name} № {factory}", f"{number} {name} {factory}")
+    return ()
+
+
+def _equipment(protocol, t, catalog, etalons) -> list[Equipment]:
     lookup = defaultdict(set)
     labels = defaultdict(set)
     for r, row in enumerate(catalog[2:], 2):
+        local_id, name, factory, kind = (_text(value) for value in row[:4])
+        entry = (local_id, factory, name, " ".join(kind.casefold().split()), r)
         if _present(row[4]):
             label = _text(row[4])
-            entry = (_text(row[0]), _text(row[2]), _text(row[1]), _text(row[3]), r)
             lookup[label].add(entry)
             labels[_catalog_label(label)].add(entry)
+        # Saved selections may still contain the display text from before the catalog was updated.
+        for alias in _equipment_labels(local_id, name, factory):
+            labels[_catalog_label(alias)].add(entry)
     result = []
     for r in range(10, 19):
         text = _present(t[r][0])
@@ -134,18 +146,21 @@ def _equipment(t, catalog, etalons) -> list[Equipment]:
         source = f"Таблицы!A{r}"
         category, type_number, registration = "", "", ""
         if len(identities) == 1:
-            local_id, factory, name, registry_format = next(iter(identities))
-            source += " / " + ", ".join(f"Оборудование!A{k}:E{k}" for *_, k in sorted(matches))
-            if registry_format.casefold() == "г/р":
-                category, type_number = "mis", local_id
-            elif registry_format.casefold() == "фиф" or registry_format.casefold().startswith("фиф без"):
-                category = "mieta"
+            local_id, factory, name, kind = next(iter(identities))
+            catalog_rows = sorted(k for *_, k in matches)
+            source += " / " + ", ".join(f"Оборудование!A{k}:E{k}" for k in catalog_rows)
+            category = EQUIPMENT_CATEGORIES.get(kind, "mieta" if kind.startswith("фиф без") else "")
+            if category == "mis":
+                type_number = local_id
+            elif category == "mieta":
                 if re.fullmatch(r"[0-9]+-[0-9]+", local_id):
                     type_number = local_id
                 elif re.fullmatch(r"[0-9]+\.[0-9]+\.[\w]+\.[0-9]+", local_id):
                     registration = local_id
-                else:
-                    category = ""
+            else:
+                cells = ", ".join(f"Оборудование!D{k}" for k in catalog_rows)
+                protocol.issues.append(f"Для средства «{name or text}» проверьте тип прибора в {cells}. "
+                                       "Выберите «СИ» или «Эталон». В старом шаблоне используйте «г/р», «ФИФ» или «ФИФ без №».")
         else:
             local_id, name, factory = "", "", ""
         hints = {
@@ -156,6 +171,51 @@ def _equipment(t, catalog, etalons) -> list[Equipment]:
         result.append(Equipment(text, source, local_id, factory, name, "; ".join(sorted(hints)),
                                 category, type_number, registration))
     return result
+
+
+def _check_standard_selections(protocol, t, measurement_rows):
+    selections = {}
+    if _text(t[34][11]).casefold() == "эталон для измерения":
+        for row, default in measurement_rows:
+            override = _text(t[row][11])
+            if override:
+                selections[f"Таблицы!L{row}"] = override
+            else:
+                selections[f"Таблицы!H{default}"] = _text(t[default][7])
+    elif standard := _present(t[30][7]):
+        selections["Таблицы!H30"] = standard
+
+    references = defaultdict(list)
+    for cell, label in selections.items():
+        references[label].append(cell)
+    for label, cells in references.items():
+        where = ", ".join(cells[:4])
+        if len(cells) > 4:
+            where += f" и ещё {len(cells) - 4}"
+        if not label or label.startswith("#"):
+            protocol.issues.append(f"Укажите эталон в {where}. Проверьте выбор и сохраните книгу в Excel.")
+            continue
+        key = _catalog_label(label)
+        matches = [item for item in protocol.equipment if _catalog_label(item.description) == key]
+        if not matches:
+            matches = [item for item in protocol.equipment if any(
+                _catalog_label(alias) == key for alias in _equipment_labels(item.source_id, item.name, item.serial)
+            )]
+        if not matches:
+            # The «Эталоны» dropdown can contain the shortened designation, without the registry number.
+            model, marker, factory = key.rpartition(" № ")
+            if marker and model and factory:
+                designation = re.compile(r"(?<![\w/.-])" + re.escape(model) + r"(?![\w/.-])", re.I)
+                matches = [item for item in protocol.equipment
+                           if item.serial == factory and designation.search(" ".join(item.name.split()))]
+        if not matches:
+            protocol.issues.append(f"Эталон «{label}» из {where} отсутствует в Таблицы!A10:A18. "
+                                   "Добавьте его в перечень средств поверки.")
+        elif any(item.category != "mieta" for item in matches):
+            sources = ", ".join(item.source for item in matches if item.category != "mieta")
+            protocol.issues.append(f"Для эталона «{label}» из {where} проверьте тип прибора "
+                                   f"в столбце D листа «Оборудование» ({sources}). Требуется категория «Эталон» "
+                                   "(в старом шаблоне — «ФИФ» или «ФИФ без №»).")
 
 
 def read(book, protocol: Protocol) -> None:
@@ -243,16 +303,13 @@ def read(book, protocol: Protocol) -> None:
     if not modification:
         source = "Таблицы!C27" if _approved_model(type_number, _component(model)) else "Таблицы!A27"
     put("modification", modification, source, " / ".join(part for part in (model, execution, ex) if part))
-    protocol.equipment = _equipment(t, _matrix(book["Оборудование"], 301, 5), _matrix(book["Эталоны"], 301, 7))
+    catalog = _matrix(book["Оборудование"], 301, 5)
+    protocol.equipment = _equipment(protocol, t, catalog, _matrix(book["Эталоны"], 301, 7))
     for row in range(10, 19):
         if _text(t[row][0]).startswith("#"):
             protocol.issues.append(f"Ошибка Excel в строке средства поверки Таблицы!A{row}.")
-    standard = _present(t[30][7])
-    model_text, _, factory = standard.rpartition("№")
-    if standard and not any(factory.strip() == item.serial and model_text.strip() and
-                            model_text.strip().casefold() in item.description.casefold() for item in protocol.equipment):
-        protocol.issues.append("Выбранный эталон из Таблицы!H30 не идентифицирован среди средств поверки A10:A18.")
-    _instruments(protocol, t, data)
+    measurement_rows = _instruments(protocol, t, data)
+    _check_standard_selections(protocol, t, measurement_rows)
     if not protocol.report_outcome or not protocol.conclusion_outcome:
         protocol.issues.append("Не заполнено итоговое заключение. Проверьте Таблицы!C19 и Отчёт!A45.")
     elif protocol.report_outcome != protocol.conclusion_outcome:
@@ -263,29 +320,33 @@ def read(book, protocol: Protocol) -> None:
             protocol.issues.append("Итоговое заключение расходится с измерениями. Проверьте Таблицы!C19 и Отчёт!A45.")
 
 
-def _source_ranges(t):
+def _source_ranges(t, declared):
     zero = _text(t[2][8]).casefold()
-    if zero not in {"да", "нет"}:
+    single = declared == 1 and _text(t[2][3]) and not _text(t[2][5])
+    if not single and zero not in {"да", "нет"}:
         return None
     names, ranges = [], []
-    for row in t[2:5]:
+    width = 3 if zero == "да" else 0
+    for index, row in enumerate(t[2:5]):
         start, end, suffix = row[3], row[5], _text(row[6])
         if start is None and end is None and not suffix:
             continue
+        if single and index == 0:
+            end = start  # The template stores the numeric part in D2 and the suffix in G2.
         if type(start) is not int or type(end) is not int or not 0 <= start <= end:
             raise ValueError("Уточните границы диапазонов заводских номеров в протоколе.")
         if len(names) + end - start + 1 > DATA_LAST_ROW - 1:
             raise ValueError("Диапазоны заводских номеров превышают вместимость протокола.")
-        width = 3 if zero == "да" else 0
         formatted = [f"{number:0{width}d}{suffix}" for number in range(start, end + 1)]
         ranges.append(formatted[0] if start == end else f"{formatted[0]}-{formatted[-1]}")
         names.extend(serial(number) for number in formatted)
     return (names, ", ".join(ranges)) if names else None
 
 
-def _instruments(protocol: Protocol, t: list, data: list) -> None:
+def _instruments(protocol: Protocol, t: list, data: list) -> list[tuple[int, int]]:
     by_index = defaultdict(list)
     malformed = []
+    measurement_rows = []
     for r, row in enumerate(data[2:], 2):
         _, index, part, entry, suffix, padded, combined, _, status = row[:9]
         if entry in ("", None) and combined in ("", None):
@@ -298,10 +359,14 @@ def _instruments(protocol: Protocol, t: list, data: list) -> None:
             number = serial(raw) if isinstance(combined, str) else ""
         except ValueError:
             number = ""
-        if not number or raw != _text(padded) + _text(suffix):
-            malformed.append(r)
         first = 35 + (r - 2) * 2
         rows = t[first:first + 2]
+        if not number or raw != _text(padded) + _text(suffix):
+            malformed.append(r)
+        elif 0 <= index < (protocol.declared or 0) and 1 <= part <= protocol.elements:
+            # Each saved block maps to two rows with defaults H30 and H31 in the template.
+            measurement_rows.extend((first + offset, 30 + offset) for offset, line in enumerate(rows)
+                                    if type(line[6]) in (int, float) and isfinite(line[6]))
         values = tuple(tuple(line[c] for c in MEASUREMENT_COLUMNS) for line in rows)
         measured = len(values) == 2 and all(
             type(value) in (int, float) and isfinite(value) for line in values for value in line
@@ -334,7 +399,7 @@ def _instruments(protocol: Protocol, t: list, data: list) -> None:
         source = ", ".join(item.source.split(", ", 1)[0] for item in elements) + " / Таблицы!B19"
         protocol.instruments.append(Instrument(number, parts[0][1], source, elements, problem, outcome))
     try:
-        source = _source_ranges(t)
+        source = _source_ranges(t, protocol.declared)
         raw_list = _text(t[19][1])
         if source and re.sub(r"\s+", "", raw_list.lstrip("№")) == re.sub(r"\s+", "", source[1]):
             batch = source[0]
@@ -353,6 +418,7 @@ def _instruments(protocol: Protocol, t: list, data: list) -> None:
                 protocol.instruments = [Instrument(n, _text(t[19][1]), "Таблицы!B19") for n in serial_list(_text(t[19][1]))]
             except ValueError:
                 pass
+    return measurement_rows
 
 
 def _status_disagrees(reading: ElementReading) -> bool:

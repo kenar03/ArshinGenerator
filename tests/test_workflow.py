@@ -151,7 +151,7 @@ def fixture(path, number, serial, *, dual=False, outcome="СООТВЕТСТВУ
             count=1, print_limit=None, sticker="01234567890", owner="Синтетический владелец", interval=4,
             method="Методика для испытаний XML", day=date(2026, 1, 15), kind="первичной",
             temperature=21.3, model="ТСП-0193", execution="01", ex="", length=None, inconsistent=None,
-            positive_report=None, serial_start=1, equipment_serial="001"):
+            positive_report=None, serial_start=1, equipment_serial="001", customize=None):
     book = Workbook()
     t = book.active
     t.title = "Таблицы"
@@ -204,9 +204,157 @@ def fixture(path, number, serial, *, dual=False, outcome="СООТВЕТСТВУ
                     if complete or col != 7:
                         outside = (fail and part == per_device) != (inconsistent == (instrument, part))
                         t.cell(row, col, 101 if col == 8 and outside else 100)
+    if customize:
+        customize(book)
     book.save(path)
     book.close()
     return read_protocol(path)
+
+
+class RtdTemplateTests(unittest.TestCase):
+    def setUp(self):
+        folder = TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.root = Path(folder.name)
+
+    def test_equipment_category_comes_from_column_d_for_both_label_formats(self):
+        rows = [
+            ("10000-10", "Эталонный прибор", "001", "СИ", "10000-10 Эталонный прибор № 001"),
+            ("32777-06", "ПТСВ-1-2", "3342", "Эталон", "г/р № 32777-06 ПТСВ-1-2 № 3342"),
+            ("4542-74", "Ф4101", "83046", "г/р", "4542-74 Ф4101 № 83046"),
+            ("32777.06.2Р.01504902", "ПТСВ-1-2", "3343", "ФИФ", "32777.06.2Р.01504902 ПТСВ-1-2 № 3343"),
+            ("80030.20.3Р.01538249", "КТ-200К", "21-5558L", "ФИФ без №", "80030.20.3Р.01538249 КТ-200К 21-5558L"),
+            ("3745-73", "Барометр-анероид M-110", "42", "Прибор", "3745-73 Барометр-анероид M-110 № 42"),
+        ]
+
+        def customize(book):
+            catalog, table = book["Оборудование"], book["Таблицы"]
+            catalog["D1"] = "Тип прибора"
+            for index, row in enumerate(rows):
+                number, name, factory, kind, label = row
+                for column, value in enumerate((number, name, factory, kind, f"{number} {name} № {factory}"), 1):
+                    catalog.cell(2 + index, column, value)
+                table[f"A{10 + index}"] = label
+
+        protocol = fixture(self.root / "equipment.xlsx", "ТЕСТ", "009B6", customize=customize)
+        self.assertEqual([(item.category, item.type_number, item.registration) for item in protocol.equipment], [
+            ("mis", "10000-10", ""), ("mieta", "32777-06", ""), ("mis", "4542-74", ""),
+            ("mieta", "", rows[3][0]), ("mieta", "", rows[4][0]), ("", "", ""),
+        ])
+        self.assertIn("Барометр-анероид M-110", " ".join(protocol.issues))
+        self.assertIn("Оборудование!D7", " ".join(protocol.issues))
+
+    def test_new_template_checks_both_points_and_used_overrides_in_dual_batches(self):
+        def customize(book):
+            table, catalog = book["Таблицы"], book["Оборудование"]
+            table["L34"] = "Эталон для измерения"
+            catalog["D1"] = "Тип прибора"
+            for index, (factory, kind) in enumerate((("10", "Эталон"), ("20", "ФИФ"), ("30", "ФИФ без №")), 3):
+                number = f"32777.06.2Р.015049{index:02}"
+                label = f"{number} Термометр ПТСВ-1-2 № {factory}"
+                catalog.append([number, "Термометр ПТСВ-1-2", factory, kind, label])
+                table[f"A{8 + index}"] = label
+            table["H30"] = "ПТСВ-1-2 №10"
+            table["H31"] = "ПТСВ-1-2 №20"
+            table["L35"] = "ПТСВ-1-2 №30"
+            table["L42"] = "ПТСВ-1-2 №30"
+            table["L43"] = "Чужой эталон №999"
+
+        protocol = fixture(self.root / "dual.xlsx", "ТЕСТ", "", count=2, dual=True, customize=customize)
+        self.assertEqual([(item.serial, item.category) for item in protocol.equipment],
+                         [("001", "mis"), ("10", "mieta"), ("20", "mieta"), ("30", "mieta")])
+        self.assertEqual([len(item.elements) for item in protocol.instruments], [2, 2])
+        self.assertEqual(protocol.issues, [])
+        self.assertFalse(protocol.serial_issue)
+
+    def test_standard_errors_report_selected_label_and_exact_cell(self):
+        def customize(book):
+            table, catalog = book["Таблицы"], book["Оборудование"]
+            table["L34"] = "Эталон для измерения"
+            table["H30"] = "Неиспользованный эталон № 10"
+            table["H31"] = "Отсутствующий эталон № 20"
+            table["L35"] = "Учебное средство №001"
+            catalog["D2"] = "СИ"
+
+        protocol = fixture(self.root / "errors.xlsx", "ТЕСТ", "009B6", customize=customize)
+        issues = "\n".join(protocol.issues)
+        self.assertIn("«Отсутствующий эталон № 20» из Таблицы!H31 отсутствует в Таблицы!A10:A18", issues)
+        self.assertIn("«Учебное средство №001» из Таблицы!L35", issues)
+        self.assertIn("Оборудование!A2:E2", issues)
+        self.assertIn("Требуется категория «Эталон»", issues)
+        self.assertNotIn("Таблицы!H30", issues)
+
+    def test_only_saved_measurement_rows_check_individual_selection(self):
+        def customize(book):
+            table = book["Таблицы"]
+            table["L34"] = "Эталон для измерения"
+            table["G35"] = 100
+            table["L35"] = "Нет в перечне №1"
+            table["L36"] = "Строка ещё не измерена №2"
+
+        protocol = fixture(self.root / "partial.xlsx", "ТЕСТ", "009B6", complete=False, customize=customize)
+        issues = "\n".join(protocol.issues)
+        self.assertIn("«Нет в перечне №1» из Таблицы!L35 отсутствует в Таблицы!A10:A18", issues)
+        self.assertNotIn("Таблицы!L36", issues)
+        self.assertFalse(protocol.instruments[0].elements[0].complete)
+
+    def test_individual_choices_replace_unused_defaults_and_ignore_legacy_l(self):
+        def customize(book):
+            table, catalog = book["Таблицы"], book["Оборудование"]
+            catalog["D1"] = "Формат идентификатора"
+            catalog["D2"] = "Эталон"
+            table["H30"] = "Учебное средство №001"
+            table["H31"] = "Неиспользованный эталон № 2"
+            table["L35"] = "ЧЭ1"
+            table["L36"] = "ЧЭ2"
+
+        legacy = fixture(self.root / "legacy.xlsx", "ТЕСТ-СТАРЫЙ", "009B6", customize=customize)
+        self.assertFalse(legacy.issues)
+
+        def new_layout(book):
+            customize(book)
+            table = book["Таблицы"]
+            table["L34"] = "Эталон для измерения"
+            table["H30"] = "Неиспользованный эталон № 1"
+            table["L35"] = table["L36"] = "Учебное средство №001"
+
+        modern = fixture(self.root / "modern.xlsx", "ТЕСТ-НОВЫЙ", "010B6", customize=new_layout)
+        self.assertFalse(modern.issues)
+        self.assertEqual(read_protocol(legacy.path).equipment, legacy.equipment)
+        self.assertEqual([legacy.reader, modern.reader], [rtd.VERSION, rtd.VERSION])
+
+    def test_single_start_number_retains_zeroes_and_suffix(self):
+        for leading_zeroes, input_serial, expected in (("Да", "009В6", "009B6"), ("Нет", "9B6", "9B6")):
+            with self.subTest(leading_zeroes=leading_zeroes):
+                def customize(book):
+                    table = book["Таблицы"]
+                    table["D2"] = 9
+                    table["G2"] = input_serial[-2:]
+                    table["I2"] = leading_zeroes
+
+                protocol = fixture(self.root / "single.xlsx", "ТЕСТ", input_serial, customize=customize)
+                self.assertFalse(protocol.serial_issue)
+                self.assertEqual([item.serial for item in protocol.instruments], [expected])
+
+    def test_single_start_still_requires_match_with_b19_and_measurement_cache(self):
+        def customize(book):
+            table, data = book["Таблицы"], book["Данные"]
+            table["D2"], table["G2"], table["I2"] = 9, "B6", "Да"
+            data["F2"] = data["G2"] = "010B6"
+
+        protocol = fixture(self.root / "cache.xlsx", "ТЕСТ", "009B6", customize=customize)
+        self.assertIn("номера в сохранённых строках измерений различаются", protocol.serial_issue)
+        protocol = fixture(self.root / "b19.xlsx", "ТЕСТ", "010B6", customize=customize)
+        self.assertIn("Диапазоны и итоговый список заводских номеров", protocol.serial_issue)
+
+        def range_end(book):
+            customize(book)
+            book["Таблицы"]["F2"] = 10
+
+        protocol = fixture(self.root / "range.xlsx", "ТЕСТ", "009B6", customize=range_end)
+        self.assertTrue(protocol.serial_issue)
+        protocol = fixture(self.root / "batch.xlsx", "ТЕСТ", "", count=2, customize=customize)
+        self.assertIn("Уточните границы диапазонов", protocol.serial_issue)
 
 
 def sample_copy_with_kind(path, kind):
