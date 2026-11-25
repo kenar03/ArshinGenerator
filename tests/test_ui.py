@@ -468,6 +468,78 @@ class InterfaceTests(unittest.TestCase):
             dialog.close()
             main.close()
 
+    def test_other_registered_type_is_verified_separately_and_export_stays_blocked(self):
+        def customize(book):
+            book["Таблицы"]["L27"] = "34039-07"
+
+        with TemporaryDirectory() as directory, registry_http() as server:
+            path = Path(directory)
+            main = self.window(path, online=True, registry_session=RegistrySession(opener=server.opener))
+            seed_lab(main.storage)
+            p = fixture(path / "other.xlsx", "ТЕСТ-ТИП", "009B6", model="ТСП-9204", sticker="", customize=customize)
+            main.import_paths([p.path])
+            self.wait_for_import(main)
+            [url] = server.calls
+            self.assertIn("/mit?number=34039-07", url)
+            self.assertEqual(sum(server.calls.values()), 1)
+            self.assertEqual(main.type_titles, {"34039-07": "Тип 34039-07"})
+            self.assertFalse(main.export_btn.isEnabled())
+            preview = ProtocolDialog(main)
+            texts = "\n".join(label.text() for label in preview.findChildren(QLabel))
+            self.assertIn("34039-07 · Тип 34039-07", texts)
+            self.assertEqual(texts.count("нет подтверждённого правила"), 1)
+            self.assertNotIn("не найден", texts)
+            self.assertNotIn("имеет неверный формат", texts)
+            preview.close()
+
+    def test_preview_groups_instrument_errors_with_each_location_and_separates_notices(self):
+        def customize(book):
+            table = book["Таблицы"]
+            table["H35"] = table["H37"] = 101
+
+        with TemporaryDirectory() as directory:
+            path = Path(directory)
+            main = self.window(path)
+            p = fixture(path / "rows.xlsx", "ТЕСТ-ГРУППА", "", count=2, print_limit=1, customize=customize)
+            seed_lab(main.storage)
+            main.protocols = [p]
+            main.recheck()
+            preview = ProtocolDialog(main)
+            texts = "\n".join(label.text() for label in preview.findChildren(QLabel))
+            self.assertEqual(texts.count("Сохранённый результат ЧЭ расходится с допусками"), 1)
+            self.assertIn("Для № 001B6 проверьте Данные!I2, Таблицы!C35:J36", texts)
+            self.assertIn("Для № 002B6 проверьте Данные!I3, Таблицы!C37:J38", texts)
+            self.assertIn("Информационные замечания", texts)
+            self.assertIn("Печатная вместимость", texts)
+            self.assertFalse(main.can_export)
+            preview.close()
+
+    def test_equipment_preview_shows_real_modification_mismatch_and_workbook_location(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory)
+            main = self.window(path)
+            seed_lab(main.storage)
+            p = fixture(path / "equipment.xlsx", "ТЕСТ-СРЕДСТВО", "009B6", sticker="")
+            main.protocols = [p]
+            self.verify_protocols(main)
+            item, = p.equipment
+            day = date.fromisoformat(p.fields["verification_date"].value)
+            client = FixtureClient(verifications=[{
+                "vri_id": "1-111", "mit_number": item.type_number, "mi_number": item.serial,
+                "mi_modification": "Другое исполнение А1", "verification_date": "2025-01-01",
+                "valid_date": "2027-01-01", "applicability": True,
+            }])
+            main.lookups[lookup_key(item, day.isoformat())] = lookup_equipment(item, day, client)
+            main.recheck()
+            preview = ProtocolDialog(main)
+            texts = "\n".join(label.text() for label in preview.findChildren(QLabel))
+            self.assertEqual(texts.count("Модификация средства поверки расходится"), 1)
+            for value in ("Учебное средство (№ 001", "Другое исполнение А1", "VRI", "Оборудование!A2:E2"):
+                self.assertIn(value, preview.equipment_panel.note.text())
+            self.assertNotIn("mi_modification", texts)
+            self.assertFalse(main.can_export)
+            preview.close()
+
     def test_http_counts_for_reimport_settings_and_shared_equipment(self):
         with TemporaryDirectory() as directory, registry_http() as server:
             path = Path(directory)

@@ -485,12 +485,44 @@ class WorkflowTests(unittest.TestCase):
             {"modification": "ТСП-0193-Произвольное"}, "Старое значение", "Тест")
         record = self.checked(unknown)[0]
         self.assertFalse(record.value("modification"))
-        self.assertIn("Не удалось определить модификацию по данным протокола", " ".join(record.blockers))
-        self.assertIn("ячейку A27", " ".join(record.blockers))
-        for execution, ex, cell in (("#N/A", "", "B27"), ("", "#REF!", "C27"), ("", "неизвестно", "C27")):
+        self.assertIn("Укажите модель", " ".join(record.blockers))
+        self.assertIn("A27", " ".join(record.blockers))
+        for execution, ex, cell, expected in (("#N/A", "", "B27", "Исполнение"), ("", "#REF!", "C27", "Взрывозащита"),
+                                               ("", "неизвестно", "C27", "не распознана")):
             with self.subTest(execution=execution, ex=ex):
                 invalid = fixture(self.root / "invalid.xlsx", "ТЕСТ-ОШИБКА", "013B6", execution=execution, ex=ex)
-                self.assertIn(cell, " ".join(self.checked(invalid)[0].blockers))
+                result = self.checked(invalid)[0]
+                self.assertFalse(result.value("modification"))
+                self.assertIn(cell, invalid.modification_issue)
+                self.assertIn(expected, invalid.modification_issue)
+                self.assertIn(execution or ex, invalid.modification_issue)
+
+    def test_registration_syntax_and_modification_rule_are_independent(self):
+        seed_lab(self.storage)
+        self.storage.save_equipment(equipment())
+        for number, model, diagnostic in (
+            ("56560-14", "ТСП-9204", "не поддерживается для типа"),
+            ("34039-07", "ТСП-9204", "нет подтверждённого правила"),
+            ("34039-07", "ТСП-0193", "нет подтверждённого правила"),
+            ("34039/07", "ТСП-0193", "имеет неверный формат"),
+        ):
+            with self.subTest(number=number, model=model):
+                def customize(book):
+                    book["Таблицы"]["L27"] = number
+
+                p = fixture(self.root / "numbers.xlsx", "ТЕСТ-НОМЕР", "012B6", model=model, customize=customize)
+                result = self.checked(p)[0]
+                self.assertEqual(result.value("type_number"), number)
+                self.assertFalse(result.value("modification"))
+                blocker, = result.blockers
+                self.assertIn(number, blocker)
+                self.assertIn("L27", blocker)
+                self.assertIn(diagnostic, blocker)
+                if "/" not in number:
+                    self.assertIn(model, blocker)
+                    self.assertIn("A27", blocker)
+                with self.assertRaises(ValueError):
+                    format_packets([result], self.schema)
 
     def test_reader_dispatch_detects_unknown_and_ambiguous_workbooks(self):
         path = self.root / "ТПР.xlsx"

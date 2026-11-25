@@ -17,7 +17,7 @@ from urllib.request import ProxyHandler, build_opener
 from arshin_generator.arshin import NS, Schema, format_packets
 from arshin_generator.domain import Equipment
 from arshin_generator.public_registry import PublicClient, PublicDataError, official_type_title
-from arshin_generator.registry import lookup_equipment, lookup_key, resolve, resolve_many
+from arshin_generator.registry import equipment_diagnostic, lookup_equipment, lookup_key, resolve, resolve_many
 from arshin_generator.storage import Storage
 from arshin_generator.validation import check
 from arshin_generator.verification import RegistrySession
@@ -347,6 +347,8 @@ class RegistryLookupTests(unittest.TestCase):
                 self.assertEqual(found.state, "found")
                 self.assertEqual(found.candidates[0].entry.registry_serial, "42")
                 self.assertEqual(found.candidates[0].entry.category, "mis")
+                if modification in (None, "Нет модификации", "нет данных", "Барометры-анероиды,"):
+                    self.assertEqual(found.candidates[0].entry.model, "")
         for changes, state in (({"mi_number": "042"}, "missing"), ({"mit_number": "3745-74"}, "missing"),
                                ({"valid_date": "13.11.2026"}, "expired"), ({"applicability": False}, "conflict")):
             with self.subTest(changes=changes):
@@ -364,11 +366,35 @@ class RegistryLookupTests(unittest.TestCase):
                 self.assertIn("Excel: «Термометр ПТСВ-1-2Б»", result.message)
                 self.assertIn(f"ФИФ ОЕИ: «{model}»", result.message)
                 self.assertIn("VRI, поле «Модификация»", result.message)
+                details = equipment_diagnostic(replace(item, source="Оборудование!A8:E8"), result.message)
+                self.assertIn("Оборудование!A8:E8", details)
+                self.assertNotIn(item.source, details)
         conflict = {**row, "mi_modification": "ПТСВ-1-2А"}
         generic = {**row, "vri_id": "1-222", "mi_modification": "Нет модификации"}
         result = lookup_equipment(item, DAY, FixtureClient(verifications=[conflict, generic]))
         self.assertEqual(result.state, "conflict")
         self.assertFalse(any(candidate.eligible for candidate in result.candidates))
+
+    def test_registry_unavailability_is_distinguished_from_no_exact_type_or_incomplete_reply(self):
+        number = "34039-07"
+        unit = etalon()
+        requests = {lookup_key(unit, DAY.isoformat()): (unit, DAY)}
+        with patch("arshin_generator.verification.PublicClient", return_value=FixtureClient(unavailable=True)):
+            lookups, types = RegistrySession().check(requests, {number})
+        unavailable, = lookups.values()
+        self.assertEqual(unavailable.state, "unavailable")
+        self.assertIn("Не удалось подключиться", unavailable.message)
+        self.assertTrue(types[number].retryable)
+        self.assertIn("Нет связи", types[number].issue)
+        for rows, expected_retry in (([], False), ([{"number": number}], True),
+                                     ([{"number": number, "mit_uuid": "test"}], True)):
+            with self.subTest(rows=rows), patch("arshin_generator.verification.PublicClient") as client:
+                client.return_value.type_cache = None
+                client.return_value.response_cache = None
+                client.return_value.items.return_value = rows
+                _, types = RegistrySession().check({}, {number})
+                self.assertEqual(types[number].retryable, expected_retry)
+                self.assertEqual("не найден" in types[number].issue, not expected_retry)
 
     def test_mieta_uses_explicit_modification_from_linked_record(self):
         class LinkedModel(FixtureClient):

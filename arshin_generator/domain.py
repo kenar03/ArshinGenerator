@@ -80,6 +80,7 @@ class Protocol:
     notices: list[str] = field(default_factory=list)
     reader_name: str = ""
     preview_fields: tuple[PreviewField, ...] = ()
+    modification_issue: str = ""
 
 
 @dataclass(frozen=True)

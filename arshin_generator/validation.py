@@ -7,7 +7,7 @@ from .domain import Datum, Protocol, RegistryEntry, Result
 from .laboratory import apply_defaults
 from .normalization import metrologist
 from .public_registry import TYPE_NUMBER
-from .registry import has_registry_identity, iso_date, lookup_key, resolve_many
+from .registry import equipment_diagnostic, has_registry_identity, iso_date, lookup_key, resolve_many
 
 RULES = VERSION
 INVALID_STICKER = "Указанный номер наклейки должен содержать не более 128 символов, допустимых в XML."
@@ -62,13 +62,18 @@ def _prepare(protocol, laboratory, confirmations):
         if not field(key).value:
             issue(key, f"Заполните поле «{LABELS[key]}».")
     number = field("type_number").value
-    if not isinstance(number, str) or not TYPE_NUMBER.fullmatch(number):
-        issue("type_number", "Укажите корректный регистрационный номер типа СИ.")
+    valid_number = isinstance(number, str) and bool(TYPE_NUMBER.fullmatch(number))
+    if not valid_number:
+        raw = field("type_number").raw or number
+        issue("type_number", f"Регистрационный номер типа СИ «{raw}» имеет неверный формат."
+              if raw else "Укажите регистрационный номер типа СИ.")
     if not iso_date(field("verification_date").value):
         issue("verification_date", "Укажите корректную дату поверки.")
     if field("verification_type").value not in {"1", "2"}:
         issue("verification_type", "Укажите вид поверки.")
-    if not field("modification").value:
+    if protocol.modification_issue:
+        issues.append(protocol.modification_issue)
+    elif valid_number and not field("modification").value:
         issue("modification", "Не удалось определить модификацию по данным протокола.")
     if not field("owner").value:
         issue("owner", "Укажите фактического владельца СИ.")
@@ -121,6 +126,7 @@ def check(protocols: list[Protocol], confirmations: dict, registry: list[Registr
         shared, issues = _prepare(protocol, laboratory or {}, confirmations)
         equipment = []
         equipment_issues = []
+        shared_registry_issues = []
         equipment_conflict = False
         when = iso_date(shared.get("verification_date", Datum(None, "")).value)
         for item in protocol.equipment:
@@ -133,18 +139,20 @@ def check(protocols: list[Protocol], confirmations: dict, registry: list[Registr
             if entries:
                 equipment.extend(entries)
             else:
-                equipment_issues.append(f"{item.name or item.description} · {error.rstrip('.')}.")
+                equipment_issues.append(equipment_diagnostic(item, error or "Не удалось подтвердить сведения"))
                 equipment_conflict |= online is not None and not online.retryable
         identities = [
             (e.category, e.type_number, e.registry_serial, e.identity_kind) if e.category == "mis"
             else (e.category, e.identifier) for e in equipment
         ]
         if len(set(identities)) != len(identities):
-            equipment_issues.append("Несколько средств поверки сопоставлены с одной записью реестра.")
+            shared_registry_issues.append("Несколько средств поверки сопоставлены с одной записью реестра.")
             equipment_conflict = True
         number = shared.get("type_number", Datum(None, "")).value
         type_issue = type_issues.get(number, "") if check_registry and type_issues else ""
-        registry_issues = tuple(dict.fromkeys(([type_issue] if type_issue else []) + equipment_issues))
+        if type_issue:
+            shared_registry_issues.append(type_issue + location(protocol.fields.get("type_number")))
+        registry_issues = tuple(dict.fromkeys(shared_registry_issues + equipment_issues))
 
         failing = sum(item.outcome == "fail" for item in protocol.instruments)
         all_passed = all(item.outcome == "pass" for item in protocol.instruments)

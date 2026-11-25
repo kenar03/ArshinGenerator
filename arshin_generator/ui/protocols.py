@@ -125,19 +125,18 @@ class ProtocolDialog(QDialog):
             if not protocol.error:
                 self.show_records(box, protocol, expanded)
             in_registry_stage = any(item is protocol for item in self.window.registry_protocols)
-            self.show_issues(box, protocol, in_registry_stage)
+            self.show_issues(box, protocol)
             if protocol.equipment:
                 self.equipment_panel = EquipmentReviewPanel(self, self.window.storage, protocol,
                     self.window.lookups if in_registry_stage else {}, checked_inputs=in_registry_stage)
                 self.equipment_panel.changed.connect(self.window.recheck)
                 self.equipment_panel.setEnabled(not self.window.busy)
                 box.addWidget(self.equipment_panel)
-            if in_registry_stage:
+            if in_registry_stage or protocol in self.window.type_only_protocols:
                 requests, number = self.window.registry_keys(protocol)
-                retry = number in self.window.retryable_types or any(
-                    self.window.lookups[key].retryable
-                    for key in requests if key in self.window.lookups
-                )
+                retry = number in self.window.retryable_types or (in_registry_stage and any(
+                    self.window.lookups[key].retryable for key in requests if key in self.window.lookups
+                ))
                 if retry and not self.window.busy:
                     box.addWidget(button("Повторить проверку", lambda: self.window.retry_registry(protocol)))
         box.addStretch()
@@ -222,7 +221,7 @@ class ProtocolDialog(QDialog):
         toggle.setChecked(expanded)
         self.serial_toggle = toggle
 
-    def show_issues(self, box, protocol, in_registry_stage):
+    def show_issues(self, box, protocol):
         registry = dict.fromkeys(issue for record in self.records for issue in record.registry_issues)
         equipment = {issue for record in self.records for issue in record.equipment_issues}
         issues = dict.fromkeys(issue for record in self.records for issue in record.shared_issues if issue not in registry)
@@ -235,28 +234,33 @@ class ProtocolDialog(QDialog):
                 if record.incomplete_measurements and issue.startswith("Не завершены измерения."):
                     continue
                 title, _, hint = issue.partition(" Проверьте ")
-                if title not in group:
-                    group[title] = (hint, [])
-                group[title][1].append(serial_text(record.instrument))
+                group.setdefault(title, {}).setdefault(hint, []).append(serial_text(record.instrument))
         if incomplete:
             serials = examples(incomplete)
             hint = f" ({serials})" if serials else ""
             issues[f"Приборов с незавершёнными измерениями: {len(incomplete)}{hint}. {protocol.measurement_hint}"] = None
-        for title, (location, serials) in group.items():
+        for title, locations in group.items():
+            serials = [serial for names in locations.values() for serial in names]
             names = examples(serials)
             detail = f" · {names}" if names else ""
-            hint = f" Проверьте {location}" if location else ""
-            issues[f"{title.rstrip('.')}{detail}.{hint}"] = None
+            hints = []
+            for location, affected in locations.items():
+                if not location:
+                    continue
+                affected_names = examples(affected) if len(locations) > 1 else ""
+                prefix = f"Для № {affected_names} проверьте" if affected_names else "Проверьте"
+                hints.append(f"{prefix} {location.rstrip('.')}.")
+            issues[" ".join((f"{title.rstrip('.')}{detail}.", *hints))] = None
         if not self.records:
             issues.update(dict.fromkeys(self.window.source_issues.get(id(protocol), ())))
-        registry_only = [issue for issue in registry if issue not in equipment or " · " not in issue]
+        registry_only = [issue for issue in registry if issue not in equipment]
         if issues or registry:
             box.addWidget(section_label("Что нужно исправить"))
         if issues:
             box.addWidget(label("\n".join(f"• {issue}" for issue in issues)))
-        if registry and in_registry_stage:
-            box.addWidget(section_label("ФИФ ОЕИ"))
         if registry_only:
+            box.addWidget(section_label("ФИФ ОЕИ"))
             box.addWidget(label("\n".join(f"• {issue}" for issue in registry_only)))
-        for notice in protocol.notices:
-            box.addWidget(label(notice))
+        if protocol.notices:
+            box.addWidget(section_label("Информационные замечания"))
+            box.addWidget(label("\n".join(dict.fromkeys(protocol.notices))))

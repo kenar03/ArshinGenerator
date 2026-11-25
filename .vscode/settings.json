@@ -5,5 +5,6 @@
         "**/*.rpymc": true,
         "**/cache/": true,
         "game/cache/": true
-    }
+    },
+    "python-envs.defaultEnvManager": "ms-python.python:system"
 }

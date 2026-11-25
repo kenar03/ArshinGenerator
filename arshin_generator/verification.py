@@ -3,7 +3,7 @@ from dataclasses import dataclass
 import logging
 from time import monotonic
 
-from .public_registry import REGISTRY_TTL, PublicClient, PublicDataError, SharedResponses, official_type_title
+from .public_registry import REGISTRY_TTL, PublicClient, PublicDataError, SharedResponses, exact_type
 from .registry import EquipmentLookup, lookup_equipment
 
 
@@ -76,11 +76,18 @@ class RegistrySession:
         def find_type(number):
             if not cancelled():
                 try:
-                    title = official_type_title(number, client(20))
-                    return TypeLookup(title=title) if title else TypeLookup(
-                        issue=f"В реестре не найден точный тип СИ {number}. Проверьте номер в Excel.")
-                except PublicDataError:
-                    return TypeLookup(issue=f"Не удалось проверить тип СИ {number} в ФИФ ОЕИ.", retryable=True)
+                    record = exact_type(client(20), number)
+                    if record is None:
+                        return TypeLookup(issue=f"В ФИФ ОЕИ не найден утверждённый тип СИ с номером «{number}».")
+                    title = record.get("title")
+                    if isinstance(title, str) and title.strip():
+                        return TypeLookup(title=title.strip())
+                except PublicDataError as exc:
+                    if exc.kind == "connection":
+                        return TypeLookup(issue=f"Не удалось проверить тип СИ «{number}». Нет связи с ФИФ ОЕИ.",
+                                          retryable=True)
+                return TypeLookup(issue=f"Не удалось подтвердить тип СИ «{number}» по ответу ФИФ ОЕИ.",
+                                  retryable=True)
             return TypeLookup(issue="Проверка типа СИ остановлена.", retryable=True)
 
         def find_equipment(request):

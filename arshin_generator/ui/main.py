@@ -1,4 +1,5 @@
 from collections import defaultdict
+from dataclasses import replace
 from datetime import date
 from getpass import getuser
 import logging
@@ -19,7 +20,7 @@ from ..arshin import automatic_paths, export, format_packets, split_paths
 from ..domain import CHECKING, ERROR, READY, REVIEW
 from ..readers import EXTENSIONS, read_protocol
 from ..registry import iso_date, lookup_key
-from ..validation import check, empty_protocol_issues
+from ..validation import check, empty_protocol_issues, location
 from ..verification import RegistrySession
 from .common import apply_dialog_icon, button, fit_window, label, message, selected, table
 from .protocol_list import ProtocolHeader, ProtocolTableModel
@@ -246,19 +247,23 @@ class MainWindow(QMainWindow):
             p for p in self.protocols
             if (records := self.local_group[id(p)]) and self.complete(p, records)
         ]
+        self.type_only_protocols = [
+            p for p in self.protocols
+            if p.modification_issue and self.complete(p, self.local_group[id(p)], ignore=p.modification_issue)
+        ]
         self.source_issues = {id(p): empty_protocol_issues(p, self.laboratory, self.confirmations)
                               for p in self.protocols if not self.local_group[id(p)]}
         self.requests = {}
-        self.type_numbers = set()
+        self.type_numbers = {p.fields["type_number"].value for p in self.type_only_protocols}
         for protocol in self.registry_protocols:
             requests, number = self.registry_keys(protocol)
             self.requests.update(requests)
             self.type_numbers.add(number)
 
     @staticmethod
-    def complete(protocol, records):
+    def complete(protocol, records, *, ignore=None):
         return not protocol.error and bool(records) and len(records) == protocol.declared and all(
-            not result.blockers for result in records
+            all(issue == ignore for issue in result.blockers) for result in records
         )
 
     def registry_keys(self, protocol):
@@ -267,7 +272,9 @@ class MainWindow(QMainWindow):
                 protocol.fields["type_number"].value)
 
     def retry_registry(self, protocol):
-        requests, number = self.registry_keys(protocol)
+        requests, number = self.registry_keys(protocol) if protocol in self.registry_protocols else (
+            {}, protocol.fields["type_number"].value
+        )
         self.start_registry_checks(retry=(requests, {number}))
 
     def schedule_expiry(self):
@@ -331,7 +338,7 @@ class MainWindow(QMainWindow):
             self.type_issues = {number: result.issue for number, result in types.items() if result.issue}
             self.retryable_types = {number for number, result in types.items() if result.retryable}
         type_issues = {}
-        for protocol in self.registry_protocols:
+        for protocol in self.registry_protocols + self.type_only_protocols:
             number = protocol.fields["type_number"].value
             if number not in self.type_titles:
                 type_issues[number] = self.type_issues.get(number, f"Тип СИ {number} ещё не проверен в реестре.")
@@ -342,6 +349,14 @@ class MainWindow(QMainWindow):
             self.group[id(protocol)] = []
         for record in online:
             self.group[id(record.protocol)].append(record)
+        for protocol in self.type_only_protocols:
+            field = protocol.fields["type_number"]
+            if issue := type_issues.get(field.value):
+                issue += location(field)
+                self.group[id(protocol)] = [
+                    replace(record, shared_issues=(*record.shared_issues, issue), registry_issues=(issue,))
+                    for record in self.local_group[id(protocol)]
+                ]
         self.results = [record for protocol in self.protocols for record in self.group[id(protocol)]]
         self.render()
         self.schedule_expiry()

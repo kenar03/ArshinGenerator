@@ -192,7 +192,9 @@ class PublicClient:
 def exact_type(client: PublicClient, number: str) -> dict | None:
     def fetch():
         matches = [item for item in client.items("mit", number=number) if item.get("number") == number]
-        return matches[0] if len(matches) == 1 and matches[0].get("mit_uuid") else None
+        if matches and (len(matches) != 1 or not matches[0].get("mit_uuid")):
+            raise PublicDataError("ФИФ ОЕИ вернул неполные или неоднозначные сведения об утверждённом типе.")
+        return matches[0] if matches else None
 
     def shared():
         cache = getattr(client, "type_cache", None)

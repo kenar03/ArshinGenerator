@@ -6,6 +6,7 @@ import re
 from ..dates import expiry_before_anniversary
 from ..domain import Datum, ElementReading, Equipment, Instrument, PreviewField, Protocol
 from ..normalization import DASHES, family_prefix, serial, serial_list
+from ..public_registry import TYPE_NUMBER
 
 VERSION = "rtd-v1"
 DISPLAY_NAME = "ТСП/ТСМ"
@@ -23,9 +24,12 @@ MEASUREMENT_COLUMNS = (2, 3, 6, 7, 8, 9)
 EQUIPMENT_CATEGORIES = {"си": "mis", "г/р": "mis", "эталон": "mieta", "фиф": "mieta", "фиф без №": "mieta"}
 
 
-RTD_MODELS = {
-    "ТСП": {"0193", "1293", "1393", "1193", "1195", "0196", "0395", "0397"},
-    "ТСМ": {"0193", "1293", "1193", "1393", "0196", "0395"},
+# Confirmed composition of the designation for this type. Registry lookup is independent.
+MODELS_BY_TYPE = {
+    "56560-14": {
+        "ТСП": {"0193", "1293", "1393", "1193", "1195", "0196", "0395", "0397"},
+        "ТСМ": {"0193", "1293", "1193", "1393", "0196", "0395"},
+    },
 }
 EXPLOSION_PROTECTION = {"ex", "ех"}
 
@@ -35,23 +39,35 @@ def _component(value: str) -> str:
     return re.sub(r"\s*([-/])\s*", r"\1", value)
 
 
-def _approved_model(type_number: str, model: str) -> str:
-    family, _, code = family_prefix(model.translate(DASHES)).partition("-")
-    return f"{family}-{code}" if type_number == "56560-14" and code in RTD_MODELS.get(family, ()) else ""
-
-
-def confirmed_rtd_modification(type_number: str, model: str, execution: str, ex: str) -> str:
+def _modification(type_number: str, model: str, execution: str, ex: str) -> tuple[str, str]:
     model, execution, ex = (_component(value) for value in (model, execution, ex))
-    approved = _approved_model(type_number, model)
-    if not approved or (ex and ex.casefold() not in EXPLOSION_PROTECTION):
-        return ""
+    if not model:
+        return "", "Укажите модель в листе «Таблицы», ячейка A27."
+    if ex and ex.casefold() not in EXPLOSION_PROTECTION:
+        return "", (f"Взрывозащита «{ex}» в Таблицы!C27 не распознана. "
+                    "Сверьте обозначение с паспортом СИ. Поддерживаются Ex и Ех.")
+    if not TYPE_NUMBER.fullmatch(type_number):
+        return "", ""
+    models = MODELS_BY_TYPE.get(type_number)
+    if models is None:
+        return "", (f"Для регистрационного номера «{type_number}» из Таблицы!L27 в программе нет подтверждённого "
+                    f"правила формирования модификации модели «{model}» из Таблицы!A27. "
+                    "Сверьте регистрационный номер и обозначение в Таблицы!A27:C27 с паспортом СИ.")
+    family, _, code = family_prefix(model.translate(DASHES)).partition("-")
+    if code not in models.get(family, ()):
+        return "", (f"Модель «{model}» из Таблицы!A27 не поддерживается для типа «{type_number}» "
+                    "из Таблицы!L27. Сверьте обе ячейки с паспортом СИ.")
     # РЭД is a customer designation only for this documented execution of ТСП-0193.
-    if approved == "ТСП-0193" and execution in {"17М/РЭД", "17M/РЭД"}:
+    if type_number == "56560-14" and (family, code) == ("ТСП", "0193") and execution in {"17М/РЭД", "17M/РЭД"}:
         execution = execution.removesuffix("/РЭД")
     marking = model
     if execution:
         marking += execution if execution.startswith("/") else f"-{execution}"
-    return f"{marking}-{ex}" if ex else marking
+    return (f"{marking}-{ex}" if ex else marking), ""
+
+
+def confirmed_rtd_modification(type_number: str, model: str, execution: str, ex: str) -> str:
+    return _modification(type_number, model, execution, ex)[0]
 
 
 def _conclusion(text: str) -> str:
@@ -258,7 +274,7 @@ def read(book, protocol: Protocol) -> None:
     raw_date = t[24][1]
     actual = raw_date.date() if isinstance(raw_date, datetime) else raw_date
     put("verification_date", actual.isoformat() if type(actual) is date else None, "Таблицы!B24", raw_date)
-    put("type_number", _present(t[27][11]), "Таблицы!L27")
+    put("type_number", _present(t[27][11]), "Таблицы!L27", t[27][11])
     kind = _text(t[1][1]).casefold()
     put("verification_type", {"первичной": "1", "первичная": "1",
                               "периодической": "2", "периодическая": "2"}.get(kind), "Таблицы!B1", kind)
@@ -278,10 +294,12 @@ def read(book, protocol: Protocol) -> None:
         "Отчёт!A61 / Таблицы!A27:D27")
     put("wiring", scheme, "Таблицы!H27")
     put("interval", _present(t[27][10]), "Таблицы!K27")
-    for column, key, raw in zip("ABC", ("model", "execution", "explosion_protection"), t[27][:3]):
+    component_issues = []
+    for column, key, caption, raw in zip("ABC", ("model", "execution", "explosion_protection"),
+                                         ("Модель", "Исполнение", "Взрывозащита"), t[27][:3]):
         put(key, _component(_present(raw)), f"Таблицы!{column}27", raw)
         if _text(raw).startswith("#"):
-            protocol.issues.append(f"Ошибка Excel в Таблицы!{column}27. Проверьте ячейку и сохраните книгу.")
+            component_issues.append(f"{caption} в Таблицы!{column}27 содержит ошибку Excel «{_text(raw)}».")
     interval = protocol.fields["interval"].value
     if not re.fullmatch(r"[1-9][0-9]*", interval):
         protocol.issues.append("Укажите МПИ в полных годах. Проверьте лист «Таблицы», ячейку K27.")
@@ -298,11 +316,12 @@ def read(book, protocol: Protocol) -> None:
     put("selected_standard", _present(t[30][7]), "Таблицы!H30:J30")
     put("equipment_list", None, "Таблицы!A10:A18")
     type_number = protocol.fields["type_number"].value
-    modification = confirmed_rtd_modification(type_number, model, execution, ex)
-    source = "Таблицы!A27:C27"
-    if not modification:
-        source = "Таблицы!C27" if _approved_model(type_number, _component(model)) else "Таблицы!A27"
-    put("modification", modification, source, " / ".join(part for part in (model, execution, ex) if part))
+    if component_issues:
+        modification, modification_issue = "", " ".join((*component_issues, "Исправьте ячейки и сохраните книгу."))
+    else:
+        modification, modification_issue = _modification(type_number, model, execution, ex)
+    protocol.modification_issue = modification_issue
+    put("modification", modification, "Таблицы!A27:C27", " / ".join(part for part in (model, execution, ex) if part))
     catalog = _matrix(book["Оборудование"], 301, 5)
     protocol.equipment = _equipment(protocol, t, catalog, _matrix(book["Эталоны"], 301, 7))
     for row in range(10, 19):

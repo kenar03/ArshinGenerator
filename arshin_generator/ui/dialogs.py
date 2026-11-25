@@ -14,7 +14,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..arshin import NS, open_xml
-from ..registry import CATEGORIES, iso_date, lookup_key, resolve_many
+from ..registry import CATEGORIES, equipment_diagnostic, iso_date, lookup_key, resolve_many
 from ..storage import PORTAL_STATES
 from .common import Form, apply_dialog_icon, button, fit_window, label, message, selected, table
 
@@ -255,7 +255,10 @@ class EquipmentReviewPanel(QWidget):
             resolved, issue = resolve_many(item, entries, self.day, live, require_public=True) if self.checked_inputs else ([], "")
             self.assessments[item] = bool(resolved), issue
             numbers = ", ".join(entry.identifier or entry.type_number for entry in resolved)
-            rows.append((item, (item.name or item.description, item.serial, numbers, "Проверено" if resolved else issue)))
+            status = "Проверено" if resolved else issue
+            if not resolved and live and live.state == "conflict":
+                status = "Сведения не подтверждены"
+            rows.append((item, (item.name or item.description, item.serial, numbers, status)))
         self.pending = [item for item, (ready, _) in self.assessments.items() if not ready]
         self.checked = sum(self.assessments[item][0] for item, _ in rows)
         suffix = f": проверено {self.checked} из {len(rows)}" if self.checked_inputs else ""
@@ -288,7 +291,7 @@ class EquipmentReviewPanel(QWidget):
                 note += f". Поверка действовала до {end:%d.%m.%Y}."
             if candidates[0].status.startswith(("Модель", "Заводской номер")):
                 note += f" {candidates[0].status}."
-        self.note.setText(note if live and (live.state == "choice" or live.state == "expired") else "")
+        self.note.setText(equipment_diagnostic(item, note) if item and live and not resolved else "")
         self.note.setVisible(bool(self.note.text()))
         eligible = [candidate for candidate in candidates if candidate.eligible]
         self.candidate_model.update([
