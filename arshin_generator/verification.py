@@ -95,7 +95,12 @@ class RegistrySession:
                 return EquipmentLookup("unavailable", "Проверка средства поверки остановлена")
             try:
                 item, day = request
-                return lookup_equipment(item, day, client(100))
+                result = lookup_equipment(item, day, client(100))
+                logging.info("Сверка оборудования: %s, Excel %s, номер=%s, дата=%s, состояние=%s, причина=%s, карточки=%s",
+                             item.category, item.source, item.registration or item.type_number, day, result.state,
+                             result.message or "проверено",
+                             [(c.entry.public_id, c.entry.valid_until, c.status) for c in result.candidates])
+                return result
             except Exception:
                 logging.exception("Ошибка проверки публичной карточки")
                 return EquipmentLookup("response", "Ответ реестра не удалось проверить")
@@ -103,4 +108,8 @@ class RegistrySession:
         with ThreadPoolExecutor(max_workers=2) as workers:
             types = {number: workers.submit(find_type, number) for number in sorted(numbers)}
             equipment = dict(zip(requests, workers.map(find_equipment, requests.values())))
-            return equipment, {number: future.result() for number, future in types.items()}
+            checked_types = {number: future.result() for number, future in types.items()}
+            for number, result in checked_types.items():
+                logging.info("Сверка типа: номер=%s, результат=%s, повтор=%s",
+                             number, result.title or result.issue, result.retryable)
+            return equipment, checked_types

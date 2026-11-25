@@ -1,7 +1,10 @@
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtWidgets import QCheckBox, QHeaderView, QStyle
+from PySide6.QtCore import QEvent, Qt, Signal
+from PySide6.QtWidgets import QCheckBox, QHeaderView, QStyle, QStyledItemDelegate, QStyleOptionViewItem
 
 from .common import TableModel
+
+ALIGNMENTS = (Qt.AlignmentFlag.AlignHCenter, Qt.AlignmentFlag.AlignLeft, Qt.AlignmentFlag.AlignLeft,
+              Qt.AlignmentFlag.AlignHCenter, Qt.AlignmentFlag.AlignHCenter)
 
 
 class ProtocolTableModel(TableModel):
@@ -17,12 +20,19 @@ class ProtocolTableModel(TableModel):
         self.marks_changed.emit()
 
     def data(self, index, role):
+        if index.isValid() and role == Qt.ItemDataRole.TextAlignmentRole:
+            return ALIGNMENTS[index.column()] | Qt.AlignmentFlag.AlignVCenter
         if index.isValid() and index.column() == 0:
             if role == Qt.ItemDataRole.CheckStateRole:
                 return (Qt.CheckState.Checked if self.rows[index.row()][0].path in self.marked_paths
                         else Qt.CheckState.Unchecked)
             return None
         return super().data(index, role)
+
+    def headerData(self, section, orientation, role):
+        if orientation == Qt.Orientation.Horizontal and role == Qt.ItemDataRole.TextAlignmentRole:
+            return ALIGNMENTS[section] | Qt.AlignmentFlag.AlignVCenter
+        return super().headerData(section, orientation, role)
 
     def flags(self, index):
         flags = super().flags(index)
@@ -65,6 +75,7 @@ class SelectAllCheckBox(QCheckBox):
 class ProtocolHeader(QHeaderView):
     def __init__(self, parent):
         super().__init__(Qt.Orientation.Horizontal, parent)
+        self.setObjectName("protocolHeader")
         self.select_all = SelectAllCheckBox(self.viewport())
         self.select_all.setTristate(True)
         self.select_all.setAccessibleName("Выбрать все")
@@ -75,6 +86,31 @@ class ProtocolHeader(QHeaderView):
         parent.horizontalScrollBar().valueChanged.connect(self.place_checkbox)
 
     def place_checkbox(self, *_):
-        margin = self.style().pixelMetric(QStyle.PixelMetric.PM_FocusFrameHMargin) + 1
+        margin = (self.sectionSize(0) - self.select_all.width()) // 2
         top = (self.height() - self.select_all.height()) // 2
         self.select_all.move(self.sectionViewportPosition(0) + margin, top)
+
+
+class ProtocolCheckDelegate(QStyledItemDelegate):
+    def check_options(self, option, index):
+        item = QStyleOptionViewItem(option)
+        self.initStyleOption(item, index)
+        style = self.parent().style()
+        rect = style.subElementRect(QStyle.SubElement.SE_ItemViewItemCheckIndicator, item, item.widget)
+        return item, style, rect
+
+    def paint(self, painter, option, index):
+        item, style, rect = self.check_options(option, index)
+        item.features &= ~QStyleOptionViewItem.ViewItemFeature.HasCheckIndicator
+        style.drawControl(QStyle.ControlElement.CE_ItemViewItem, item, painter, item.widget)
+        rect.moveCenter(item.rect.center())
+        item.rect = rect
+        item.state |= QStyle.StateFlag.State_On if item.checkState == Qt.CheckState.Checked else QStyle.StateFlag.State_Off
+        style.drawPrimitive(QStyle.PrimitiveElement.PE_IndicatorItemViewItemCheck, item, painter, item.widget)
+
+    def editorEvent(self, event, model, option, index):
+        if event.type() in (QEvent.Type.MouseButtonPress, QEvent.Type.MouseButtonRelease, QEvent.Type.MouseButtonDblClick):
+            item, _, rect = self.check_options(option, index)
+            option = QStyleOptionViewItem(option)
+            option.rect = option.rect.translated(item.rect.center() - rect.center())
+        return super().editorEvent(event, model, option, index)

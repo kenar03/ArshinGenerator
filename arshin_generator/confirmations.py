@@ -1,8 +1,11 @@
 from hashlib import sha256
 import json
 
+from .domain import Datum
+
 LEGACY_RULES = "1.0.0"
 GUARDS = "__guards"
+YEAR_SCOPE = "manufacture_year"
 
 
 def _encoded(value) -> str:
@@ -62,3 +65,13 @@ def get_confirmation(confirmations: dict, scope: str, protocol, instrument=None)
 
 def legacy_key(protocol, instrument=None) -> str:
     return f"{LEGACY_RULES}:{protocol.reader}:{protocol.digest}:{instrument.serial if instrument else ''}"
+
+
+def manufacture_year(protocol, confirmations, instrument=None):
+    targets = (instrument, None) if instrument is not None and instrument.serial else (None,)
+    for target in targets:
+        saved = get_confirmation(confirmations, YEAR_SCOPE, protocol, target)
+        if saved and "manufacture_year" in saved[0]:
+            value = saved[0]["manufacture_year"]
+            return Datum(value, "Год указан для прибора" if target else "Год указан для партии", str(value or ""))
+    return protocol.fields.get("manufacture_year", Datum("", ""))

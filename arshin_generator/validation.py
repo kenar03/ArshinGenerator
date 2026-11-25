@@ -2,7 +2,7 @@ from collections import Counter
 import re
 
 from . import VERSION
-from .confirmations import get_confirmation
+from .confirmations import get_confirmation, manufacture_year
 from .domain import Datum, Protocol, RegistryEntry, Result
 from .laboratory import apply_defaults
 from .normalization import metrologist
@@ -11,6 +11,7 @@ from .registry import equipment_diagnostic, has_registry_identity, iso_date, loo
 
 RULES = VERSION
 INVALID_STICKER = "Указанный номер наклейки должен содержать не более 128 символов, допустимых в XML."
+INVALID_YEAR = "Год изготовления должен состоять из четырёх цифр и не превышать год поверки."
 XML_FORBIDDEN = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\ud800-\udfff\ufffe\uffff]")
 LABELS = {
     "type_number": "Регистрационный номер типа",
@@ -51,6 +52,10 @@ def _prepare(protocol, laboratory, confirmations):
     issues = [*protocol.issues]
     if protocol.serial_issue:
         issues.append(protocol.serial_issue)
+    year = manufacture_year(protocol, confirmations)
+    fields["manufacture_year"] = year
+    if not valid_manufacture_year(year.value, iso_date(fields.get("verification_date", Datum(None, "")).value)):
+        issues.append(INVALID_YEAR + " Проверьте год партии в просмотре протокола.")
 
     def field(name):
         return fields.get(name, Datum(None, ""))
@@ -115,9 +120,16 @@ def valid_sticker(value) -> bool:
     return len(number) <= 128 and not XML_FORBIDDEN.search(number)
 
 
+def valid_manufacture_year(value, when) -> bool:
+    if value in (None, ""):
+        return True
+    year = str(value)
+    return bool(re.fullmatch(r"[0-9]{4}", year) and int(year) > 0 and (when is None or int(year) <= when.year))
+
+
 def check(protocols: list[Protocol], confirmations: dict, registry: list[RegistryEntry],
           lookups: dict | None = None, *, laboratory=None, check_registry=True,
-          require_public=False, type_issues=None) -> list[Result]:
+          require_public=False, type_issues=None, pending_types=()) -> list[Result]:
     results = []
     lookups = lookups or {}
     for protocol in protocols:
@@ -128,6 +140,7 @@ def check(protocols: list[Protocol], confirmations: dict, registry: list[Registr
         equipment_issues = []
         shared_registry_issues = []
         equipment_conflict = False
+        registry_pending = shared.get("type_number", Datum(None, "")).value in pending_types
         when = iso_date(shared.get("verification_date", Datum(None, "")).value)
         for item in protocol.equipment:
             if not check_registry:
@@ -135,6 +148,9 @@ def check(protocols: list[Protocol], confirmations: dict, registry: list[Registr
                     issues.append(f"Уточните реквизиты средства «{item.name or item.description}» в Excel ({item.source}).")
                 continue
             online = lookups.get(lookup_key(item, when.isoformat() if when else ""))
+            if require_public and (online is None or online.retryable):
+                registry_pending = True
+                continue
             entries, error = resolve_many(item, registry, when, online, require_public=require_public)
             if entries:
                 equipment.extend(entries)
@@ -163,6 +179,7 @@ def check(protocols: list[Protocol], confirmations: dict, registry: list[Registr
         batch = []
         for instrument in protocol.instruments:
             fields = shared.copy()
+            fields["manufacture_year"] = manufacture_year(protocol, confirmations, instrument)
             fields["outcome"] = Datum(instrument.outcome, instrument.source, protocol.evidence)
             if instrument.outcome != "fail" or failing != 1:
                 fields.pop("reasons", None)
@@ -175,7 +192,11 @@ def check(protocols: list[Protocol], confirmations: dict, registry: list[Registr
             result = Result(protocol, instrument, fields, equipment,
                             shared_issues=tuple(dict.fromkeys(issues + list(registry_issues))),
                             equipment_issues=tuple(dict.fromkeys(equipment_issues)), registry_issues=registry_issues,
-                            equipment_conflict=equipment_conflict)
+                            equipment_conflict=equipment_conflict, registry_pending=registry_pending)
+            if fields["manufacture_year"] != shared["manufacture_year"] and not valid_manufacture_year(
+                result.value("manufacture_year"), when
+            ):
+                result.issues.append(INVALID_YEAR + " Проверьте год прибора в просмотре протокола.")
             if instrument.problem:
                 result.issues.append(instrument.problem if "Проверьте" in instrument.problem else
                                      f"{instrument.problem} Проверьте {instrument.source}.")
@@ -221,9 +242,3 @@ def _check_fields(result, failing):
                 result.issues.append("Дата окончания должна быть корректной и не раньше даты поверки.")
     elif value("outcome") == "fail" and not value("reasons") and failing == 1:
         result.issues.append("Укажите причину непригодности." + location(result.protocol.fields.get("reasons")))
-
-    if value("manufacture_year"):
-        year = str(value("manufacture_year"))
-        when = iso_date(value("verification_date"))
-        if not re.fullmatch(r"[0-9]{4}", year) or int(year) == 0 or (when and int(year) > when.year):
-            result.issues.append("Год выпуска должен состоять из четырёх цифр и не превышать год поверки.")

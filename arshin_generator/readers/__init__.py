@@ -26,11 +26,12 @@ READERS: tuple[ProtocolReader, ...] = (rtd,)
 
 
 def read_protocol(path: Path) -> Protocol:
-    path = path.resolve()
     if path.suffix.casefold() not in EXTENSIONS:
-        return Protocol(path, "", error="Поддерживаются книги Excel XLSM, XLSX, XLTM и XLTX.", unsupported=True)
+        return Protocol(path.absolute(), "", error="Поддерживаются книги Excel XLSM, XLSX, XLTM и XLTX.", unsupported=True)
     protocol = Protocol(path, "")
     try:
+        path = path.resolve()
+        protocol.path = path
         with path.open("rb") as stream:
             snapshot = stream.read(80_000_001)
         if len(snapshot) > 80_000_000:
@@ -55,7 +56,10 @@ def read_protocol(path: Path) -> Protocol:
             protocol.error = f"Книга подходит под несколько форматов ({names}). Проверьте структуру протокола."
         else:
             protocol.error = "Структура книги не соответствует ни одному поддерживаемому формату протокола."
-    except Exception:
-        logging.exception("Ошибка чтения %s", path)
+    except (FileNotFoundError, PermissionError) as exc:
+        logging.warning("Исходный Excel недоступен: %s, код %s", type(exc).__name__, exc.errno)
+        protocol.error = "Книга недоступна. Проверьте, что файл на месте и доступен для чтения."
+    except Exception as exc:
+        logging.error("Ошибка чтения Excel [%s]: %s", protocol.digest[:12], type(exc).__name__)
         protocol.error = "Книга не прочитана. Проверьте формат, доступ к файлу и сохранение в Excel."
     return protocol

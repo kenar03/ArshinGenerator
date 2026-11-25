@@ -17,13 +17,13 @@ from PySide6.QtWidgets import (
 
 from .. import APP_NAME
 from ..arshin import automatic_paths, export, format_packets, split_paths
-from ..domain import CHECKING, ERROR, READY, REVIEW
+from ..domain import CHECKING, CORRECTION, READY, RECHECK, UNVERIFIED
 from ..readers import EXTENSIONS, read_protocol
 from ..registry import iso_date, lookup_key
 from ..validation import check, empty_protocol_issues, location
 from ..verification import RegistrySession
 from .common import apply_dialog_icon, button, fit_window, label, message, selected, table
-from .protocol_list import ProtocolHeader, ProtocolTableModel
+from .protocol_list import ProtocolCheckDelegate, ProtocolHeader, ProtocolTableModel
 from .protocols import ProtocolDialog
 from .workflow import laboratory_settings
 
@@ -31,14 +31,24 @@ from .workflow import laboratory_settings
 class ImportThread(QThread):
     imported = Signal(object)
 
-    def __init__(self, paths, storage, parent):
+    def __init__(self, paths, storage, parent, *, reload=False):
         super().__init__(parent)
         self.paths = paths
         self.storage = storage
         self.audit_failed = False
+        self.reload = reload
 
     def run(self):
-        protocols = [read_protocol(path) for path in self.paths]
+        protocols = []
+        for path in self.paths:
+            protocol = read_protocol(path)
+            if self.reload:
+                protocol.path = path
+            protocols.append(protocol)
+            logging.info("%s Excel [%s]: формат=%s, приборы=%d, средства=%d, результат=%s",
+                         "Повторное чтение" if self.reload else "Импорт", protocol.digest[:12] or "без снимка",
+                         protocol.reader or "не определён", len(protocol.instruments), len(protocol.equipment),
+                         protocol.error or "прочитан сохранённый файл")
         try:
             self.storage.record_imports(protocols)
         except (sqlite3.Error, ValueError):
@@ -75,6 +85,7 @@ class MainWindow(QMainWindow):
         self.thread = None
         self.lookup_thread = None
         self.after_registry_check = None
+        self.reload_notice_pending = False
         self.lookups = {}
         self.type_titles = {}
         self.type_issues = {}
@@ -115,6 +126,8 @@ class MainWindow(QMainWindow):
         actions.addWidget(self.add_btn)
         self.remove_btn = button("Удалить выбранные", self.remove_protocols)
         actions.addWidget(self.remove_btn)
+        self.recheck_btn = button("Перепроверить", self.reload_protocols)
+        actions.addWidget(self.recheck_btn)
         actions.addStretch()
         self.preview_btn = button("Просмотреть", self.show_results)
         self.export_btn = button("Сформировать XML", self.export_xml, primary=True)
@@ -127,8 +140,10 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.empty, 1)
 
         self.source, self.source_model = table(("", "Протокол", "Тип протокола", "Приборов", "Состояние"),
-                                               (34, 250, 140, 80, 152), model_class=ProtocolTableModel,
+                                               (34, 250, 128, 80, 230), model_class=ProtocolTableModel,
                                                header_class=ProtocolHeader)
+        self.source.setWordWrap(False)
+        self.source.setItemDelegateForColumn(0, ProtocolCheckDelegate(self.source))
         sizes = self.source.horizontalHeader()
         sizes.setStretchLastSection(False)
         sizes.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
@@ -200,14 +215,24 @@ class MainWindow(QMainWindow):
             self.set_notice("В выбранной папке нет книг Excel.")
             return
         self.storage.set_setting("input_folder", str(files[0].parent))
-        self.set_notice("Читаем протоколы…")
-        self.thread = ImportThread(list(dict.fromkeys(path.resolve() for path in files)), self.storage, self)
+        self.start_import(list(dict.fromkeys(path.resolve() for path in files)))
+
+    def reload_protocols(self):
+        if self.protocols and not self.busy:
+            self.start_import([p.path for p in self.protocols], reload=True)
+
+    def start_import(self, paths, *, reload=False):
+        self.set_notice("Перечитываем сохранённые книги Excel…" if reload else "Читаем протоколы…")
+        self.thread = ImportThread(paths, self.storage, self, reload=reload)
         self.thread.imported.connect(self.append_protocols)
         self.thread.finished.connect(self.import_finished)
         self.render()
         self.thread.start()
 
     def append_protocols(self, incoming):
+        if self.thread.reload:
+            self.protocols = incoming
+            return
         paths = {protocol.path: index for index, protocol in enumerate(self.protocols)}
         digests = {protocol.digest: index for index, protocol in enumerate(self.protocols) if protocol.digest}
         for protocol in incoming:
@@ -226,13 +251,15 @@ class MainWindow(QMainWindow):
 
     def import_finished(self):
         audit_failed = self.thread.audit_failed
+        reload = self.thread.reload
         self.thread.deleteLater()
         self.thread = None
         if audit_failed:
             self.recheck()
             self.set_notice("Не удалось записать историю импорта. Проверьте доступ к папке данных.")
         else:
-            self.start_registry_checks()
+            self.reload_notice_pending = reload
+            self.start_registry_checks(retry_failed=reload)
 
     def check_inputs(self):
         self.entries = self.storage.entries()
@@ -284,13 +311,16 @@ class MainWindow(QMainWindow):
             if expiry is not None:
                 self.expiry_timer.start(max(1, ceil((expiry - self.registry.clock()) * 1_000)))
 
-    def start_registry_checks(self, *, retry=None, after_check=None):
+    def start_registry_checks(self, *, retry=None, retry_failed=False, after_check=None):
         if self.busy:
             return
         self.check_inputs()
+        if retry_failed:
+            retry = self.requests, self.type_numbers
         requests, type_numbers = self.registry.pending(self.requests, self.type_numbers, retry)
         if not self.online or not (requests or type_numbers):
             self.recheck(inputs_checked=True)
+            self.finish_reload()
             if after_check:
                 self.continue_export(after_check)
             return
@@ -318,8 +348,17 @@ class MainWindow(QMainWindow):
         self.lookup_thread = None
         after_check, self.after_registry_check = self.after_registry_check, None
         self.recheck()
+        self.finish_reload()
         if after_check:
             self.continue_export(after_check)
+
+    def finish_reload(self):
+        if self.reload_notice_pending:
+            self.reload_notice_pending = False
+            self.set_notice("Прочитаны последние сохранённые версии Excel. Несохранённые изменения не учтены.")
+            logging.info("Повторная проверка: протоколов=%d, приборов=%d, ошибок чтения=%d, готовых протоколов=%d",
+                         len(self.protocols), len(self.results), sum(bool(p.error) for p in self.protocols),
+                         sum(self.complete(p, self.group[id(p)]) for p in self.protocols))
 
     def continue_export(self, save):
         if self.can_export:
@@ -337,13 +376,12 @@ class MainWindow(QMainWindow):
             self.type_titles = {number: result.title for number, result in types.items() if result.title}
             self.type_issues = {number: result.issue for number, result in types.items() if result.issue}
             self.retryable_types = {number for number, result in types.items() if result.retryable}
-        type_issues = {}
-        for protocol in self.registry_protocols + self.type_only_protocols:
-            number = protocol.fields["type_number"].value
-            if number not in self.type_titles:
-                type_issues[number] = self.type_issues.get(number, f"Тип СИ {number} ещё не проверен в реестре.")
+        type_issues = {number: issue for number, issue in self.type_issues.items()
+                       if number not in self.retryable_types and number not in self.type_titles}
+        pending_types = self.type_numbers - self.type_titles.keys() - type_issues.keys()
         online = check(self.registry_protocols, self.confirmations, self.entries, self.lookups,
-                       laboratory=self.laboratory, require_public=True, type_issues=type_issues)
+                       laboratory=self.laboratory, require_public=True, type_issues=type_issues,
+                       pending_types=pending_types)
         self.group = self.local_group.copy()
         for protocol in self.registry_protocols:
             self.group[id(protocol)] = []
@@ -381,10 +419,15 @@ class MainWindow(QMainWindow):
         if self.busy:
             return CHECKING
         if not self.complete(protocol, self.local_group[id(protocol)]):
-            return ERROR
+            return CORRECTION
+        if any(record.data_issues for record in records):
+            return CORRECTION
         if self.complete(protocol, records):
             return READY
-        return REVIEW
+        requests, number = self.registry_keys(protocol)
+        if number in self.retryable_types or any(self.lookups[key].retryable for key in requests if key in self.lookups):
+            return UNVERIFIED
+        return RECHECK
 
     def update_marks(self):
         select_all = self.source.horizontalHeader().select_all
@@ -422,6 +465,7 @@ class MainWindow(QMainWindow):
         self.empty.setVisible(not rows)
         self.source.setVisible(bool(rows))
         self.add_btn.setEnabled(not self.busy)
+        self.recheck_btn.setEnabled(bool(rows) and not self.busy)
         self.settings_btn.setEnabled(not self.busy)
         self.preview_btn.setEnabled(bool(rows) and not self.busy)
         refreshable = self.can_refresh_for_export()

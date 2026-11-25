@@ -9,7 +9,7 @@ from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QHeaderView,
 )
 
-from ..domain import ERROR, READY, REVIEW, UNSUPPORTED
+from ..domain import CORRECTION, ERROR, READY, REVIEW, UNSUPPORTED
 from .style import ERROR_TEXT, SUCCESS, WARNING
 
 
@@ -95,7 +95,7 @@ class TableModel(QAbstractTableModel):
                 return QColor(SUCCESS)
             if value == REVIEW:
                 return QColor(WARNING)
-            if value in (ERROR, UNSUPPORTED):
+            if value in (CORRECTION, ERROR, UNSUPPORTED):
                 return QColor(ERROR_TEXT)
         return None
 

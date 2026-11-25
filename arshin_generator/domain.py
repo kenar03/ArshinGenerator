@@ -6,6 +6,9 @@ Scalar: TypeAlias = str | int | bool | None
 READY = "Готов"
 CHECKING = "Проверяется"
 REVIEW = "Требует проверки"
+CORRECTION = "Требуется исправление"
+RECHECK = "Требуется повторная проверка"
+UNVERIFIED = "Не удалось проверить"
 ERROR = "Ошибка"
 UNSUPPORTED = "Формат не поддерживается"
 OUTCOMES = {"pass": "Пригоден", "fail": "Непригоден", "": "Нет результата"}
@@ -120,17 +123,22 @@ class Result:
     registry_issues: tuple[str, ...] = ()
     equipment_conflict: bool = False
     incomplete_measurements: bool = False
+    registry_pending: bool = False
 
     def value(self, name: str) -> Scalar:
         return self.fields[name].value if name in self.fields else None
 
     @property
     def status(self) -> str:
-        return REVIEW if self.issues or self.shared_issues else READY
+        return REVIEW if self.data_issues else RECHECK if self.registry_pending else READY
+
+    @property
+    def data_issues(self) -> tuple[str, ...]:
+        return self.shared_issues + tuple(self.issues)
 
     @property
     def blockers(self) -> tuple[str, ...]:
-        return self.shared_issues + tuple(self.issues)
+        return self.data_issues + ((RECHECK,) if self.registry_pending else ())
 
     @property
     def identity(self) -> tuple:

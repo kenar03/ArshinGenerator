@@ -1,9 +1,15 @@
 import re
+import sqlite3
+from getpass import getuser
 
 from PySide6.QtCore import Qt, QUrl
 from PySide6.QtGui import QDesktopServices
-from PySide6.QtWidgets import QComboBox, QDialog, QFormLayout, QFrame, QHBoxLayout, QScrollArea, QVBoxLayout, QWidget
+from PySide6.QtWidgets import (
+    QComboBox, QDialog, QFormLayout, QFrame, QHBoxLayout, QLineEdit, QScrollArea, QVBoxLayout, QWidget,
+)
 
+from ..confirmations import YEAR_SCOPE, individual_key, manufacture_year, protocol_key
+from ..domain import READY, RECHECK, UNVERIFIED
 from ..registry import iso_date
 from .common import apply_dialog_icon, button, display, fit_window, label, message
 from .dialogs import EquipmentReviewPanel
@@ -24,12 +30,7 @@ def examples(serials, limit=4):
 
 
 def serial_text(instrument):
-    number = instrument.serial
-    # The fallback reader can store the entire batch in raw when measurement rows are missing.
-    raw = instrument.raw if instrument.elements else ""
-    if raw and raw != number:
-        return f"{raw} (в XML: {number})" if number else raw
-    return number
+    return instrument.serial or (instrument.raw if instrument.elements else "")
 
 
 def serial_summary(serials):
@@ -65,11 +66,12 @@ class ProtocolDialog(QDialog):
         fit_window(self, 835, 600)
         self.protocol = None
         self.serial_toggle = None
+        self.year_selector = self.year_input = None
         layout = QVBoxLayout(self)
         layout.setContentsMargins(18, 12, 18, 12)
         self.selector = QComboBox()
         for item in window.protocols:
-            self.selector.addItem(item.number or item.path.name, item)
+            self.selector.addItem(item.number or item.path.name, item.path)
         if protocol is not None:
             self.selector.setCurrentIndex(next(i for i, item in enumerate(window.protocols) if item is protocol))
         layout.addWidget(self.selector)
@@ -105,11 +107,16 @@ class ProtocolDialog(QDialog):
                 error=True)
 
     def refresh(self):
-        protocol = self.selector.currentData()
-        expanded = self.protocol is protocol and self.serial_toggle is not None and self.serial_toggle.isChecked()
+        path = self.selector.currentData()
+        protocol = next((p for p in self.window.protocols if p.path == path), None)
+        same = self.protocol is protocol
+        expanded = same and self.serial_toggle is not None and self.serial_toggle.isChecked()
+        target = self.year_selector.currentData() if same and self.year_selector else None
+        draft = self.year_input.text() if same and self.year_input and self.year_input.isModified() else None
         self.protocol = protocol
         self.open_excel_btn.setEnabled(protocol is not None)
         self.serial_toggle = None
+        self.year_selector = self.year_input = None
         self.records = self.window.group.get(id(protocol), [])
         self.equipment_panel = None
         page = QWidget()
@@ -117,13 +124,20 @@ class ProtocolDialog(QDialog):
         box.setContentsMargins(6, 6, 10, 8)
         box.setSpacing(8)
         if protocol:
+            self.selector.setItemText(self.selector.currentIndex(), protocol.number or protocol.path.name)
             box.addWidget(section_label(f"Протокол {protocol.number or protocol.path.name}"))
+            state = self.window.state(protocol, self.records)
             if self.window.busy:
                 box.addWidget(label("Проверяем сведения…"))
-            elif self.window.complete(protocol, self.records):
+            elif state == READY:
                 box.addWidget(label("Готов к выгрузке"))
+            elif state in (RECHECK, UNVERIFIED):
+                box.addWidget(label(state))
+                box.addWidget(label("Проверьте связь с ФИФ ОЕИ и нажмите «Перепроверить»." if state == UNVERIFIED
+                                    else "Сведения ФИФ ОЕИ будут проверены перед выгрузкой."))
             if not protocol.error:
                 self.show_records(box, protocol, expanded)
+                self.show_year_editor(box, protocol, target, draft)
             in_registry_stage = any(item is protocol for item in self.window.registry_protocols)
             self.show_issues(box, protocol)
             if protocol.equipment:
@@ -166,14 +180,12 @@ class ProtocolDialog(QDialog):
                 continue
             if field.key == "type_number" and text and (name := self.window.type_titles.get(text)):
                 text = f"{text} · {name}"
+            if field.key == "modification" and not text:
+                text = " / ".join(
+                    part for key in ("model", "execution", "explosion_protection") if (part := value(key))
+                )
             rows.append((field.title, text))
-        rows.extend((
-            ("Владелец СИ", value("owner")),
-            ("Поверитель", value("metrologist")),
-            ("Методика поверки", value("method")),
-            ("Дата поверки", display_day(value("verification_date"))),
-            ("Действительна до", display_day(value("valid_date") if passed else None)),
-        ))
+        rows.append(("Дата поверки", display_day(value("verification_date"))))
         for title, text in rows:
             caption = label(title)
             caption.setWordWrap(False)
@@ -181,7 +193,7 @@ class ProtocolDialog(QDialog):
         box.addLayout(details)
 
         total = max(protocol.declared or 0, len(self.records))
-        problems = total - len(self.records) + sum(bool(r.blockers) for r in self.records)
+        problems = total - len(self.records) + sum(bool(r.data_issues) for r in self.records)
         totals = f"Приборов: {total} · Пригодны: {passed} · Непригодны: {len(failed)}"
         if problems:
             totals += f" · Проблемных: {problems}"
@@ -221,6 +233,65 @@ class ProtocolDialog(QDialog):
         toggle.setChecked(expanded)
         self.serial_toggle = toggle
 
+    def show_year_editor(self, box, protocol, target, draft):
+        if not self.records or not protocol.number or not all(
+            protocol.fields.get(key) and protocol.fields[key].value for key in ("verification_date", "type_number")
+        ):
+            return
+        box.addWidget(section_label("Год изготовления"))
+        row = QHBoxLayout()
+        self.year_selector = QComboBox()
+        self.year_selector.setAccessibleName("К какому прибору относится год изготовления")
+        self.year_selector.addItem("Вся партия", None)
+        instruments = {r.instrument.serial: r.instrument for r in self.records if r.instrument.serial}
+        for serial in instruments:
+            self.year_selector.addItem(f"№ {serial}", serial)
+        overrides = sum((YEAR_SCOPE, individual_key(protocol, serial)) in self.window.confirmations
+                        for serial in instruments)
+        self.year_selector.setCurrentIndex(max(0, self.year_selector.findData(target)))
+        self.year_input = QLineEdit()
+        self.year_input.setAccessibleName("Год изготовления")
+        self.year_input.setPlaceholderText("ГГГГ")
+        self.year_input.setMaxLength(32)
+        self.year_input.setMaximumWidth(105)
+        year_source = label("")
+        year_save = button("Сохранить год")
+        year_save.setAutoDefault(False)
+        row.addWidget(self.year_selector, 1)
+        row.addWidget(self.year_input)
+        row.addWidget(year_save)
+        box.addLayout(row)
+        box.addWidget(year_source)
+
+        def show_value():
+            instrument = instruments.get(self.year_selector.currentData())
+            year = manufacture_year(protocol, self.window.confirmations, instrument)
+            self.year_input.setText(str(year.value) if year.value is not None else "")
+            description = ("Предполагаемый год — год поверки." if year.source.startswith("Предполагаемый") else
+                           year.source + "." if year.source else "Год не указан. Его можно оставить пустым.")
+            if instrument is None and overrides:
+                description += f" Индивидуальный ввод: {overrides} СИ."
+            year_source.setText(description)
+
+        def save_value():
+            instrument = instruments.get(self.year_selector.currentData())
+            subject = individual_key(protocol, instrument.serial) if instrument else protocol_key(protocol)
+            try:
+                self.window.storage.save_confirmation(YEAR_SCOPE, subject, {"manufacture_year": self.year_input.text().strip()},
+                                                      "Ручной ввод года изготовления", getuser())
+            except sqlite3.Error:
+                year_source.setText("Не удалось сохранить год. Проверьте доступ к папке данных.")
+                return
+            self.year_input.setModified(False)
+            self.window.recheck()
+
+        self.year_selector.currentIndexChanged.connect(show_value)
+        year_save.clicked.connect(save_value)
+        show_value()
+        if draft is not None:
+            self.year_input.setText(draft)
+            self.year_input.setModified(True)
+
     def show_issues(self, box, protocol):
         registry = dict.fromkeys(issue for record in self.records for issue in record.registry_issues)
         equipment = {issue for record in self.records for issue in record.equipment_issues}
@@ -254,7 +325,7 @@ class ProtocolDialog(QDialog):
         if not self.records:
             issues.update(dict.fromkeys(self.window.source_issues.get(id(protocol), ())))
         registry_only = [issue for issue in registry if issue not in equipment]
-        if issues or registry:
+        if issues or registry_only:
             box.addWidget(section_label("Что нужно исправить"))
         if issues:
             box.addWidget(label("\n".join(f"• {issue}" for issue in issues)))

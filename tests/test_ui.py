@@ -11,7 +11,7 @@ from unittest.mock import patch
 from urllib.error import URLError
 
 from openpyxl import load_workbook
-from PySide6.QtCore import QEventLoop, QItemSelectionModel, QPoint, QTimer, Qt
+from PySide6.QtCore import QEventLoop, QItemSelectionModel, QTimer, Qt
 from PySide6.QtGui import QColor, QPalette
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
@@ -125,18 +125,19 @@ class InterfaceTests(unittest.TestCase):
             self.assertFalse(main.notice.text())
             overview = ProtocolDialog(main, protocol)
             self.assertEqual(overview.equipment_panel.checked, 7)
-            self.assertFalse(overview.findChildren(QLineEdit))
+            self.assertEqual(overview.findChildren(QLineEdit), [overview.year_input])
+            self.assertEqual(overview.year_input.text(), "")
             texts = "\n".join(label.text() for label in overview.findChildren(QLabel))
             self.assertIn("56560-14 · Термопреобразователи сопротивления", texts)
             self.assertIn("Регистрационный номер типа СИ", texts)
-            self.assertIn("Исполнение", texts)
+            self.assertIn("ТСМ-0193-01", texts)
+            self.assertIn("Обозначение СИ", texts)
             self.assertNotIn("Модель и модификация", texts)
             self.assertIn("Готов к выгрузке", texts)
-            self.assertIn('ООО "ЧТП"', texts)
-            self.assertIn("Еремеева А.В.", texts)
-            self.assertIn(SAMPLE_METHOD, texts)
+            self.assertNotIn("Владелец СИ", texts)
+            self.assertNotIn("Поверитель", texts)
+            self.assertNotIn("Методика поверки", texts)
             self.assertIn("22.11.2026", texts)
-            self.assertIn("21.11.2030", texts)
             self.assertIn("Приборов: 25 · Пригодны: 25 · Непригодны: 0", texts)
             self.assertIn("009W6–033W6 (25 приборов)", texts)
             self.assertNotIn("Непригодные приборы", texts)
@@ -300,7 +301,7 @@ class InterfaceTests(unittest.TestCase):
             self.assertTrue(full.isVisible())
             numbers = full.text().split(", ")
             self.assertEqual(len(numbers), 500)
-            self.assertEqual(numbers[3], "900В6 (в XML: 900B6)")
+            self.assertEqual(numbers[3], "900B6")
             self.assertEqual(numbers[-1], "500B6")
             self.assertGreater(dialog.scroll.verticalScrollBar().maximum(), 0)
             self.assertEqual(dialog.scroll.horizontalScrollBar().maximum(), 0)
@@ -339,7 +340,7 @@ class InterfaceTests(unittest.TestCase):
             self.assertIn("Не указана методика поверки", common)
             self.assertIn("лист «Отчёт», ячейку A33", common)
             overview = ProtocolDialog(main, main.protocols[0])
-            self.assertFalse(overview.findChildren(QLineEdit))
+            self.assertEqual(overview.findChildren(QLineEdit), [overview.year_input])
             overview.close()
 
             updated = fixture(file, "ТЕСТ-ПОВТОР", "001B6", sticker="")
@@ -382,7 +383,7 @@ class InterfaceTests(unittest.TestCase):
             self.app.processEvents()
             rect = main.source.visualRect(model.index(1, 0))
             QTest.mouseClick(main.source.viewport(), Qt.MouseButton.LeftButton,
-                             pos=QPoint(rect.left() + 10, rect.center().y()))
+                             pos=rect.center())
             self.assertEqual(model.marked_paths, {second.path})
             self.assertEqual(header.checkState(), state.PartiallyChecked)
             self.assertTrue(main.remove_btn.isEnabled())
@@ -426,7 +427,7 @@ class InterfaceTests(unittest.TestCase):
             main.type_titles.clear()
             main.type_issues["56560-14"] = "В реестре не найден точный тип СИ 56560-14."
             main.recheck()
-            self.assertEqual(main.source_model.rows[0][1][-1], "Требует проверки")
+            self.assertEqual(main.source_model.rows[0][1][-1], "Требуется исправление")
             type_dialog = ProtocolDialog(main, p)
             self.assertIn("не найден точный тип СИ", "\n".join(label.text() for label in type_dialog.findChildren(QLabel)))
             type_dialog.close()
@@ -436,11 +437,12 @@ class InterfaceTests(unittest.TestCase):
             main.type_titles["56560-14"] = "Термопреобразователи сопротивления"
             main.lookups[key] = EquipmentLookup("unavailable", "Не удалось подключиться к реестру")
             main.recheck()
-            self.assertEqual(main.source_model.rows[0][1][-1], "Требует проверки")
+            self.assertEqual(main.source_model.rows[0][1][-1], "Не удалось проверить")
+            self.assertFalse(main.results[0].data_issues)
             self.assertFalse(main.can_export)
             dialog = ProtocolDialog(main, p)
             self.assertEqual(dialog.equipment_panel.checked, 0)
-            self.assertIn("Не удалось подключиться к реестру", dialog.equipment_panel.item_model.rows[0][1][-1])
+            self.assertIn("Не удалось подключиться к реестру", dialog.equipment_panel.note.text())
             self.assertIn("Повторить проверку", [btn.text() for btn in dialog.findChildren(QPushButton)])
             dialog.close()
             main.close()
@@ -464,7 +466,7 @@ class InterfaceTests(unittest.TestCase):
             self.assertNotIn("Готов к выгрузке", detail)
             self.assertNotIn("Средства поверки: проверено", detail)
             self.assertIn("и ещё 21", detail)
-            self.assertFalse(dialog.findChildren(QLineEdit))
+            self.assertEqual(dialog.findChildren(QLineEdit), [dialog.year_input])
             dialog.close()
             main.close()
 
@@ -596,7 +598,7 @@ class InterfaceTests(unittest.TestCase):
             self.assertEqual(sum(server.calls.values()), 5)
             self.assertFalse(main.can_export)
             self.assertFalse(main.export_btn.isEnabled())
-            self.assertEqual(main.source_model.rows[0][1][-1], "Требует проверки")
+            self.assertEqual(main.source_model.rows[0][1][-1], "Требуется исправление")
             self.assertEqual(main.source_model.rows[1][1][-1], "Готов")
             details = ProtocolDialog(main, main.protocols[0])
             self.assertIn("Срок поверки средства истёк", details.equipment_panel.item_model.rows[0][1][-1])
@@ -626,6 +628,15 @@ class InterfaceTests(unittest.TestCase):
             QTest.qWait(20)
             self.assertFalse(main.can_export)
             self.assertTrue(main.export_btn.isEnabled())
+            self.assertTrue(all(row[-1] == "Требуется повторная проверка" for _, row in main.source_model.rows))
+            self.assertTrue(all(r.registry_pending and not r.data_issues for r in main.results))
+            details = ProtocolDialog(main, main.protocols[0])
+            texts = "\n".join(label.text() for label in details.scroll.widget().findChildren(QLabel))
+            self.assertIn("Требуется повторная проверка", texts)
+            self.assertNotIn("ещё не проверен", texts)
+            self.assertNotIn("Проблемных", texts)
+            self.assertNotIn("Что нужно исправить", texts)
+            details.close()
             self.assertEqual(main.expiry_timer.interval(), 450_000)
             with patch.object(ProtocolDialog, "exec", return_value=0) as preview:
                 main.open_protocol(main.protocols[0])
@@ -647,6 +658,109 @@ class InterfaceTests(unittest.TestCase):
             root, issues, _ = open_xml(output, main.schema)
             self.assertEqual(len(root), 2)
             self.assertFalse(issues)
+
+    def test_reload_reads_all_paths_and_keeps_marks_selection_and_fresh_cache(self):
+        with TemporaryDirectory() as directory, registry_http() as server:
+            path = Path(directory)
+            main = self.window(path, online=True, registry_session=RegistrySession(opener=server.opener))
+            seed_lab(main.storage)
+            files = [path / f"{i}.xlsx" for i in range(1, 4)]
+            for index, file in enumerate(files, 1):
+                fixture(file, f"ТЕСТ-{index}", f"00{index}B6", sticker="")
+            main.import_paths(files)
+            self.wait_for_import(main)
+            self.assertTrue(main.can_export)
+            self.assertEqual(sum(server.calls.values()), 3)
+            model = main.source_model
+            main.source.selectRow(0)
+            model.setData(model.index(1, 0), Qt.CheckState.Checked, Qt.ItemDataRole.CheckStateRole)
+            overview = ProtocolDialog(main, main.protocols[0])
+
+            fixture(files[0], "ТЕСТ-1-ИСПРАВЛЕН", "011B6", sticker="")
+            files[1].unlink()
+            files[2].write_bytes(b"bad workbook")
+            before = files[0].read_bytes()
+            main.recheck_btn.click()
+            self.wait_for_import(main)
+            self.assertEqual([p.path for p in main.protocols], files)
+            self.assertEqual(main.protocols[0].instruments[0].serial, "011B6")
+            self.assertEqual(overview.protocol, main.protocols[0])
+            self.assertIn("ИСПРАВЛЕН", overview.selector.currentText())
+            self.assertIn("недоступна", main.protocols[1].error)
+            self.assertIn("не прочитана", main.protocols[2].error)
+            self.assertEqual(model.marked_paths, {files[1]})
+            self.assertEqual([i.row() for i in main.source.selectionModel().selectedRows()], [0])
+            self.assertEqual(sum(server.calls.values()), 3)
+            self.assertIn("Несохранённые изменения не учтены", main.notice.text())
+            self.assertEqual(files[0].read_bytes(), before)
+            self.assertFalse(main.can_export)
+            overview.close()
+
+    def test_year_editor_saves_batch_and_individual_years_then_exports_after_reload(self):
+        with TemporaryDirectory() as directory, registry_http() as server:
+            path = Path(directory)
+            main = self.window(path, online=True, registry_session=RegistrySession(opener=server.opener))
+            seed_lab(main.storage)
+            file = path / "batch.xlsx"
+            fixture(file, "ТЕСТ-ГОД", "", count=2, dual=True, sticker="")
+            main.import_paths([file])
+            self.wait_for_import(main)
+            preview = ProtocolDialog(main)
+            self.assertEqual(preview.year_input.text(), "2026")
+            self.assertIn("Предполагаемый год — год поверки.",
+                          [label.text() for label in preview.scroll.widget().findChildren(QLabel)])
+
+            def save(year):
+                preview.year_input.setText(year)
+                next(btn for btn in preview.scroll.widget().findChildren(QPushButton)
+                     if btn.text() == "Сохранить год").click()
+
+            save("2024")
+            preview.year_selector.setCurrentIndex(preview.year_selector.findData("002B6"))
+            self.assertEqual(preview.year_input.text(), "2024")
+            for invalid in ("2027", "20х5"):
+                save(invalid)
+                self.assertFalse(main.can_export)
+                self.assertIn("Год изготовления должен", " ".join(main.results[1].blockers))
+                self.assertFalse(main.results[0].data_issues)
+            save("2025")
+            self.assertTrue(main.can_export)
+            preview.close()
+            fixture(file, "ТЕСТ-ГОД", "", count=2, dual=True, sticker="", owner="Другой владелец")
+            main.recheck_btn.click()
+            self.wait_for_import(main)
+            self.assertEqual([r.value("manufacture_year") for r in main.results], ["2024", "2025"])
+            self.assertEqual(sum(server.calls.values()), 3)
+            out = path / "years.xml"
+            with patch.object(main, "choose_xml_path", return_value=out):
+                main.export_btn.click()
+            root, issues, _ = open_xml(out, main.schema)
+            self.assertFalse(issues)
+            self.assertEqual([node.text for node in root.findall(f".//{{{NS}}}manufactureYear")], ["2024", "2025"])
+
+    def test_protocol_table_aligns_each_header_with_its_values(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory)
+            main = self.window(path)
+            main.protocols = [fixture(path / "long.xlsx", "Протокол " + "Х" * 190, "001B6")]
+            main.recheck()
+            main.show()
+            header = main.source.horizontalHeader()
+            model = main.source_model
+            for width in (740, 1000):
+                main.resize(width, 600)
+                self.app.processEvents()
+                for column, horizontal in enumerate((
+                    Qt.AlignmentFlag.AlignHCenter, Qt.AlignmentFlag.AlignLeft, Qt.AlignmentFlag.AlignLeft,
+                    Qt.AlignmentFlag.AlignHCenter, Qt.AlignmentFlag.AlignHCenter,
+                )):
+                    alignment = horizontal | Qt.AlignmentFlag.AlignVCenter
+                    self.assertEqual(model.index(0, column).data(Qt.ItemDataRole.TextAlignmentRole), alignment)
+                    self.assertEqual(model.headerData(column, Qt.Orientation.Horizontal, Qt.ItemDataRole.TextAlignmentRole),
+                                     alignment)
+                self.assertLessEqual(abs(header.select_all.geometry().center().x() - header.sectionSize(0) // 2), 1)
+                self.assertEqual(main.source.columnWidth(3), 80)
+                self.assertEqual(main.source.rowHeight(0), 36)
 
     def test_expiry_during_save_dialog_preserves_destination_and_continues(self):
         with TemporaryDirectory() as directory, registry_http() as server:
@@ -727,7 +841,7 @@ class InterfaceTests(unittest.TestCase):
                     fixture(file, "ТЕСТ-ПОЛЕ", "001B6", sticker="", **fields)
                     main.import_paths([file])
                     self.wait_for_import(main)
-                    self.assertEqual(main.source_model.rows[0][1][-1], "Ошибка")
+                    self.assertEqual(main.source_model.rows[0][1][-1], "Требуется исправление")
                     details = ProtocolDialog(main, main.protocols[0])
                     self.assertIn(f"ячейку {cell}", "\n".join(label.text() for label in details.findChildren(QLabel)))
                     details.close()

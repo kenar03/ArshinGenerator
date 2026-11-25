@@ -1,5 +1,6 @@
 from collections import defaultdict
 from datetime import date, datetime
+import logging
 from math import isfinite
 import re
 
@@ -12,9 +13,7 @@ VERSION = "rtd-v1"
 DISPLAY_NAME = "ТСП/ТСМ"
 PREVIEW_FIELDS = (
     PreviewField("type_number", "Регистрационный номер типа СИ"),
-    PreviewField("model", "Тип"),
-    PreviewField("execution", "Исполнение", optional=True),
-    PreviewField("explosion_protection", "Взрывозащита", optional=True),
+    PreviewField("modification", "Обозначение СИ"),
 )
 PASS = "СООТВЕТСТВУЕТ"
 FAIL = "НЕ СООТВЕТСТВУЕТ"
@@ -50,13 +49,12 @@ def _modification(type_number: str, model: str, execution: str, ex: str) -> tupl
         return "", ""
     models = MODELS_BY_TYPE.get(type_number)
     if models is None:
-        return "", (f"Для регистрационного номера «{type_number}» из Таблицы!L27 в программе нет подтверждённого "
-                    f"правила формирования модификации модели «{model}» из Таблицы!A27. "
-                    "Сверьте регистрационный номер и обозначение в Таблицы!A27:C27 с паспортом СИ.")
+        return "", (f"Для типа «{type_number}» и модели «{model}» нет подтверждённого правила модификации. "
+                    "Сверьте Таблицы!L27 и A27 с паспортом СИ.")
     family, _, code = family_prefix(model.translate(DASHES)).partition("-")
     if code not in models.get(family, ()):
-        return "", (f"Модель «{model}» из Таблицы!A27 не поддерживается для типа «{type_number}» "
-                    "из Таблицы!L27. Сверьте обе ячейки с паспортом СИ.")
+        return "", (f"Модель «{model}» не поддерживается для типа «{type_number}». "
+                    "Сверьте Таблицы!A27 и L27 с паспортом СИ.")
     # РЭД is a customer designation only for this documented execution of ТСП-0193.
     if type_number == "56560-14" and (family, code) == ("ТСП", "0193") and execution in {"17М/РЭД", "17M/РЭД"}:
         execution = execution.removesuffix("/РЭД")
@@ -278,6 +276,8 @@ def read(book, protocol: Protocol) -> None:
     kind = _text(t[1][1]).casefold()
     put("verification_type", {"первичной": "1", "первичная": "1",
                               "периодической": "2", "периодическая": "2"}.get(kind), "Таблицы!B1", kind)
+    if protocol.fields["verification_type"].value == "1" and type(actual) is date:
+        put("manufacture_year", f"{actual.year:04d}", "Предполагаемый год из Таблицы!B24")
     put("method", " ".join(_present(report[33][0]).split()), "Отчёт!A33", report[33][0])
     put("owner", _present(report[24][9]), "Отчёт!J24")
     put("metrologist", _present(t[23][1]), "Таблицы!B23")
@@ -321,6 +321,10 @@ def read(book, protocol: Protocol) -> None:
     else:
         modification, modification_issue = _modification(type_number, model, execution, ex)
     protocol.modification_issue = modification_issue
+    if modification_issue:
+        logging.warning("Модификация Excel [%s]: Таблицы!L27=%r, A27=%r, B27=%r, C27=%r. Причина: %r",
+                        protocol.digest[:12], _text(t[27][11])[:128], _text(t[27][0])[:128],
+                        _text(t[27][1])[:128], _text(t[27][2])[:128], modification_issue[:300])
     put("modification", modification, "Таблицы!A27:C27", " / ".join(part for part in (model, execution, ex) if part))
     catalog = _matrix(book["Оборудование"], 301, 5)
     protocol.equipment = _equipment(protocol, t, catalog, _matrix(book["Эталоны"], 301, 7))

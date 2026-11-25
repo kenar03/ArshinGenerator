@@ -17,7 +17,7 @@ from openpyxl import Workbook, load_workbook
 from arshin_generator.arshin import (
     NS, PORTAL_BYTES, SCHEMA_HASH, TARGET_BYTES, Schema, export, format_packets, open_xml, signature, split_paths,
 )
-from arshin_generator.confirmations import get_confirmation, individual_key, legacy_key, protocol_key, with_guards
+from arshin_generator.confirmations import YEAR_SCOPE, get_confirmation, individual_key, legacy_key, protocol_key, with_guards
 from arshin_generator.dates import expiry_before_anniversary
 from arshin_generator.domain import Datum, PreviewField, RegistryEntry
 from arshin_generator.normalization import modification_candidate, metrologist, serial_list
@@ -408,6 +408,34 @@ class WorkflowTests(unittest.TestCase):
 
     def checked(self, *protocols):
         return check(protocols, self.storage.confirmations(), self.storage.entries(), laboratory=self.storage.laboratory())
+
+    def test_manufacture_year_comes_from_primary_date_and_empty_override_omits_xml(self):
+        seed_lab(self.storage)
+        self.storage.save_equipment(equipment())
+        day = date(2026, 11, 23)
+        primary = fixture(self.root / "primary.xlsx", "ТЕСТ-ПЕРВИЧНАЯ", "021B6", day=day, sticker="")
+        periodic = fixture(self.root / "periodic.xlsx", "ТЕСТ-ПЕРИОДИЧЕСКАЯ", "022B6", day=day, sticker="",
+                           kind="периодической")
+        primary_result, periodic_result = self.checked(primary, periodic)
+        self.assertEqual(primary_result.value("manufacture_year"), "2026")
+        self.assertFalse(periodic_result.value("manufacture_year"))
+        schema = self.schema
+        root, issues, _ = schema.inspect(format_packets([primary_result, periodic_result], schema)[0][0])
+        self.assertFalse(issues)
+        self.assertEqual([node.text for node in root.findall(f".//{{{NS}}}manufactureYear")], ["2026"])
+
+        subject = individual_key(primary, primary.instruments[0].serial)
+        self.storage.save_confirmation(YEAR_SCOPE, subject, {"manufacture_year": ""}, "Тест", "Тест")
+        [result] = self.checked(primary)
+        self.assertFalse(result.blockers)
+        root, issues, _ = schema.inspect(format_packets([result], schema)[0][0])
+        self.assertFalse(issues)
+        self.assertIsNone(root.find(f".//{{{NS}}}manufactureYear"))
+
+        other = fixture(self.root / "other.xlsx", primary.number, "023B6", day=day)
+        self.assertEqual(self.checked(other)[0].value("manufacture_year"), "2026")
+        self.storage.save_confirmation(YEAR_SCOPE, protocol_key(primary), {"manufacture_year": "2027"}, "Тест", "Тест")
+        self.assertIn("Проверьте год партии", " ".join(self.checked(primary)[0].blockers))
 
     def test_batch_corrections_are_atomic(self):
         rows = [("protocol", "A", {"sign_cipher": "ТСТ"}, "Тест", "Тест"),

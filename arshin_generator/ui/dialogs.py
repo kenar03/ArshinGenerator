@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..arshin import NS, open_xml
+from ..domain import RECHECK, UNVERIFIED
 from ..registry import CATEGORIES, equipment_diagnostic, iso_date, lookup_key, resolve_many
 from ..storage import PORTAL_STATES
 from .common import Form, apply_dialog_icon, button, fit_window, label, message, selected, table
@@ -256,7 +257,11 @@ class EquipmentReviewPanel(QWidget):
             self.assessments[item] = bool(resolved), issue
             numbers = ", ".join(entry.identifier or entry.type_number for entry in resolved)
             status = "Проверено" if resolved else issue
-            if not resolved and live and live.state == "conflict":
+            if self.checked_inputs and live is None:
+                status = RECHECK
+            elif live and live.retryable:
+                status = UNVERIFIED
+            elif not resolved and live and live.state == "conflict":
                 status = "Сведения не подтверждены"
             rows.append((item, (item.name or item.description, item.serial, numbers, status)))
         self.pending = [item for item, (ready, _) in self.assessments.items() if not ready]
