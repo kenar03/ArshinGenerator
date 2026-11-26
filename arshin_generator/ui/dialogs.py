@@ -138,7 +138,7 @@ class XmlDialog(QDialog):
         try:
             root, issues, details = open_xml(path, self.schema)
             self.raw.setPlainText(etree.tostring(root.getroottree(), encoding="unicode", pretty_print=True))
-            for record in root.findall(f"{{{NS}}}result"):
+            for position, record in enumerate(root.findall(f"{{{NS}}}result")):
                 serial_number = next(iter(record.xpath(
                     ".//*[local-name()='manufactureNum' or local-name()='inventoryNum' or local-name()='regNumber'][1]/text()"
                 )), "")
@@ -148,7 +148,8 @@ class XmlDialog(QDialog):
                 )
                 type_number = record.findtext(f".//{{{NS}}}mitypeNumber", "")
                 identity = (serial_number, day, type_number)
-                self.records.append((record, (serial_number, day, title), self.protocols.get(identity, "")))
+                protocol = self.protocols.get((path.name, position, *identity), self.protocols.get(identity, ""))
+                self.records.append((record, (serial_number, day, title), protocol))
             summary = "Есть ошибки XML или размера." if issues else "XML соответствует выбранной XSD."
             self.status.setText(f"{summary}  Записей: {len(self.records)}.  {self.schema.path.name}")
             self.errors.setPlainText("\n".join(issues + (["", *details] if details else [])) or "Ошибок XSD нет.")

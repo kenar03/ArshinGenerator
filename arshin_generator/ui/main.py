@@ -18,8 +18,9 @@ from PySide6.QtWidgets import (
 from .. import APP_NAME
 from ..arshin import automatic_paths, export, format_packets, split_paths
 from ..domain import CHECKING, CORRECTION, READY, RECHECK, UNVERIFIED
+from ..public_registry import TYPE_NUMBER
 from ..readers import EXTENSIONS, read_protocol
-from ..registry import iso_date, lookup_key
+from ..registry import has_registry_identity, iso_date, lookup_key, resolve_many
 from ..validation import check, empty_protocol_issues, location
 from ..verification import RegistrySession
 from .common import apply_dialog_icon, button, fit_window, label, message, selected, table
@@ -61,30 +62,48 @@ class ImportThread(QThread):
 class RegistryCheckThread(QThread):
     assessed = Signal(object)
 
-    def __init__(self, session, requests, type_numbers, parent):
+    def __init__(self, session, requests, type_numbers, parent, *, force=False):
         super().__init__(parent)
         self.requests = requests
         self.type_numbers = type_numbers
         self.session = session
+        self.force = force
+        self.storage = parent.storage
+        self.entries = parent.entries
 
     def run(self):
-        self.assessed.emit(self.session.check(self.requests, self.type_numbers, self.isInterruptionRequested))
+        lookups, types = self.session.check(self.requests, self.type_numbers, self.isInterruptionRequested, force=self.force)
+        verified = {}
+        for key, lookup in lookups.items():
+            item, day = self.requests[key]
+            entries, _ = resolve_many(item, self.entries, day, lookup, require_public=True)
+            if entries:
+                verified[key] = entries
+        counts = self.session.remember(lookups, types, confirmed=verified.keys())
+        try:
+            self.storage.save_registry_checks(entry for key, entries in verified.items()
+                                              if lookups[key].state == "found" for entry in entries)
+        except sqlite3.Error:
+            logging.exception("Не удалось записать историю сверки с реестром")
+        self.assessed.emit(counts)
 
 
 class MainWindow(QMainWindow):
     checked = Signal()
+    registry_refreshed = Signal(str)
 
     def __init__(self, storage, schema, *, online=True, registry_session=None):
         super().__init__()
         self.storage = storage
         self.schema = schema
         self.online = online
-        self.registry = registry_session or RegistrySession()
+        self.registry = registry_session or RegistrySession(storage=storage)
         self.protocols = []
         self.results = []
         self.thread = None
         self.lookup_thread = None
         self.after_registry_check = None
+        self.force_counts = None
         self.reload_notice_pending = False
         self.lookups = {}
         self.type_titles = {}
@@ -105,12 +124,7 @@ class MainWindow(QMainWindow):
         layout.setSpacing(8)
 
         header = QHBoxLayout()
-        title = QVBoxLayout()
-        title.setSpacing(4)
-        title.addWidget(label("Протоколы поверки", "workTitle"))
-        self.summary = label("")
-        title.addWidget(self.summary)
-        header.addLayout(title, 1)
+        header.addWidget(label("Протоколы поверки", "workTitle"), 1)
         self.settings_btn = button("Настройки", self.laboratory_settings)
         header.addWidget(self.settings_btn, alignment=Qt.AlignmentFlag.AlignTop)
         layout.addLayout(header)
@@ -155,7 +169,12 @@ class MainWindow(QMainWindow):
         self.source.doubleClicked.connect(self.open_row)
 
         self.notice = label("")
-        layout.addWidget(self.notice)
+        self.summary = label("")
+        self.summary.setWordWrap(False)
+        footer = QHBoxLayout()
+        footer.addWidget(self.notice, 1)
+        footer.addWidget(self.summary, alignment=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignBottom)
+        layout.addLayout(footer)
         QShortcut(QKeySequence("Ctrl+O"), self, activated=self.pick_files)
         QShortcut(QKeySequence(Qt.Key.Key_Delete), self, activated=self.remove_protocols)
         self.recheck()
@@ -294,9 +313,13 @@ class MainWindow(QMainWindow):
         )
 
     def registry_keys(self, protocol):
-        when = iso_date(protocol.fields["verification_date"].value)
-        return ({lookup_key(item, when.isoformat()): (item, when) for item in protocol.equipment},
-                protocol.fields["type_number"].value)
+        date_field = protocol.fields.get("verification_date")
+        when = iso_date(date_field.value) if date_field else None
+        type_field = protocol.fields.get("type_number")
+        number = str(type_field.value or "") if type_field else ""
+        requests = {lookup_key(item, when.isoformat()): (item, when) for item in protocol.equipment
+                    if has_registry_identity(item)} if when else {}
+        return requests, number if TYPE_NUMBER.fullmatch(number) else ""
 
     def schedule_expiry(self):
         self.expiry_timer.stop()
@@ -305,37 +328,51 @@ class MainWindow(QMainWindow):
             if expiry is not None:
                 self.expiry_timer.start(max(1, ceil((expiry - self.registry.clock()) * 1_000)))
 
-    def start_registry_checks(self, *, retry=None, retry_failed=False, after_check=None):
+    def force_registry_refresh(self):
+        return self.start_registry_checks(force=True)
+
+    def start_registry_checks(self, *, retry=None, retry_failed=False, after_check=None, force=False):
         if self.busy:
-            return
+            return False
         self.check_inputs()
-        if retry_failed:
-            retry = self.requests, self.type_numbers
-        requests, type_numbers = self.registry.pending(self.requests, self.type_numbers, retry)
+        if force:
+            requests, type_numbers = {}, set()
+            for protocol in self.protocols:
+                if not protocol.error:
+                    equipment, number = self.registry_keys(protocol)
+                    requests.update(equipment)
+                    if number:
+                        type_numbers.add(number)
+        else:
+            if retry_failed:
+                retry = self.requests, self.type_numbers
+            requests, type_numbers = self.registry.pending(self.requests, self.type_numbers, retry)
         if not self.online or not (requests or type_numbers):
             self.recheck(inputs_checked=True)
             self.finish_reload()
             if after_check:
                 self.continue_export(after_check)
-            return
+            if force:
+                self.report_registry_refresh("Нет реквизитов для обновления. Проверьте загруженные протоколы.")
+            return False
         self.expiry_timer.stop()
         self.after_registry_check = after_check
-        self.lookup_thread = RegistryCheckThread(self.registry, requests, type_numbers, self)
+        self.lookup_thread = RegistryCheckThread(self.registry, requests, type_numbers, self, force=force)
         self.lookup_thread.assessed.connect(self.accept_registry_checks)
         self.lookup_thread.finished.connect(self.registry_checks_finished)
-        self.set_notice("Проверяем сведения в ФИФ ОЕИ…")
+        self.set_notice("Обновляем сведения в ФИФ ОЕИ…" if force else "Проверяем сведения в ФИФ ОЕИ…")
         self.render()
         self.checked.emit()
         self.lookup_thread.start()
+        return True
 
     def accept_registry_checks(self, result):
-        lookups, types = result
-        self.registry.remember(lookups, types)
-        try:
-            self.storage.save_registry_checks(c.entry for lookup in lookups.values()
-                                              if lookup.state == "found" for c in lookup.candidates if c.eligible)
-        except sqlite3.Error:
-            logging.exception("Не удалось сохранить результаты сверки с реестром")
+        if self.lookup_thread.force:
+            self.force_counts = result
+
+    def report_registry_refresh(self, text):
+        self.set_notice(text)
+        self.registry_refreshed.emit(text)
 
     def registry_checks_finished(self):
         self.lookup_thread.deleteLater()
@@ -343,6 +380,11 @@ class MainWindow(QMainWindow):
         after_check, self.after_registry_check = self.after_registry_check, None
         self.recheck()
         self.finish_reload()
+        if self.force_counts is not None:
+            updated, failed = self.force_counts
+            self.force_counts = None
+            counts = f"Обновлено: {updated} · Не удалось проверить: {failed}."
+            self.report_registry_refresh(counts if updated else f"Данные ФИФ ОЕИ не обновлены. {counts}")
         if after_check:
             self.continue_export(after_check)
 
@@ -454,7 +496,7 @@ class MainWindow(QMainWindow):
                     break
         screened = {id(protocol) for protocol in self.registry_protocols}
         ready = sum(not record.blockers and id(record.protocol) in screened for record in self.results)
-        total = sum(values[3] for _, values in rows)
+        total = sum(len(protocol.instruments) for protocol in self.protocols)
         self.summary.setText(f"Протоколов {len(rows)}  ·  Приборов {total}  ·  Готово {ready}")
         self.empty.setVisible(not rows)
         self.source.setVisible(bool(rows))

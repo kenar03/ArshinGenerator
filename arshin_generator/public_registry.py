@@ -22,7 +22,7 @@ PUBLIC_CARD = "https://fgis.gost.ru/fundmetrology/cm/results/"
 TYPE_NUMBER = re.compile(r"[0-9]{2,9}-[0-9]{2,4}")
 PAGE_SIZE = 50
 MAX_RECORDS = 250
-REGISTRY_TTL = 15 * 60
+REGISTRY_TTL = 24 * 60 * 60
 
 
 class PublicDataError(ValueError):
@@ -44,6 +44,11 @@ class SharedResponses:
         self.ready = OrderedDict()
         self.pending = {}
 
+    def discard(self, keys):
+        with self.lock:
+            for key in keys:
+                self.ready.pop(key, None)
+
     def get(self, key, fetch):
         with self.lock:
             now = self.clock()
@@ -62,7 +67,7 @@ class SharedResponses:
             future.set_exception(exc)
         finally:
             with self.lock:
-                if self.cache_errors or future.exception() is None:
+                if self.cache_errors or (future.exception() is None and future.result() is not None):
                     self.ready[key] = self.clock() + self.ttl, future
                 self.pending.pop(key)
         return future.result()

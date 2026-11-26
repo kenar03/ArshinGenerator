@@ -1,3 +1,4 @@
+from collections import defaultdict
 from dataclasses import asdict
 from hashlib import sha256
 import os
@@ -9,7 +10,7 @@ from uuid import uuid4
 
 from lxml import etree
 
-from .domain import Result
+from .domain import Result, duplicate_serials
 from .normalization import CANONICAL_NAME, serial
 from .validation import RULES
 
@@ -171,8 +172,11 @@ def format_packets(results: list[Result], schema: Schema, limit: int = TARGET_BY
         raise ValueError("Для формирования пакета применяется оригинальная XSD от 19.06.2020.")
     if not results or any(r.blockers for r in results):
         raise ValueError("В пакет можно включить только записи без блокирующих замечаний.")
-    if len({(r.identity[0], r.identity[1].upper(), r.identity[2]) for r in results}) != len(results):
-        raise ValueError("В пакете обнаружены одинаковые результаты.")
+    instruments = defaultdict(list)
+    for result in results:
+        instruments[result.protocol.path].append(result.instrument)
+    if any(duplicate_serials(batch) for batch in instruments.values()):
+        raise ValueError("В одном протоколе обнаружены повторяющиеся заводские номера.")
     packets = []
     fragments = []
     expected = []
@@ -267,10 +271,11 @@ def export(packets, schema, paths, storage, confirmer, *, overwrite=None):
                     stream.flush()
                     os.fsync(stream.fileno())
                 verify_disk_content((stage / name).read_bytes(), expected, schema)
-                for result, record in expected:
+                for position, (result, record) in enumerate(expected):
                     audit_items.append((result.identity, sha256(repr(record).encode()).hexdigest(), {
                         "protocol": result.protocol.number, "reader": result.protocol.reader,
-                        "file": name, "source": str(result.protocol.path), "digest": result.protocol.digest,
+                        "file": name, "position": position, "source": str(result.protocol.path),
+                        "digest": result.protocol.digest,
                         "serial": asdict(result.instrument),
                         "fields": {key: asdict(value) for key, value in result.fields.items()},
                         "equipment": [asdict(item) for item in result.equipment],

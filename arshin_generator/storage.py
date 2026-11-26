@@ -1,4 +1,4 @@
-from collections import defaultdict
+from collections import Counter, defaultdict
 from contextlib import contextmanager, closing
 from dataclasses import asdict, replace
 from datetime import datetime
@@ -35,6 +35,11 @@ def encode(value) -> str:
 PORTAL_STATES = ("Сформирован", "Загружен", "Подготовлен к публикации", "Ошибка", "Опубликован")
 DDL = """
 create table if not exists settings (key text primary key, value text not null);
+create table if not exists registry_cache (
+    kind text not null, lookup_key text not null, checked_at real not null, data text not null,
+    primary key(kind, lookup_key)
+);
+create index if not exists ix_registry_cache_checked on registry_cache(checked_at);
 create table if not exists confirmations (
     scope text not null, subject text not null, data text not null, evidence text not null,
     confirmer text not null, confirmed_at text not null, primary key(scope, subject)
@@ -107,6 +112,21 @@ class Storage:
         with self.session() as db:
             db.execute("insert or replace into settings values (?,?)", (LABORATORY_SETTING, encode(values)))
             self._audit(db, "Настройки лаборатории", [values, confirmer])
+
+    def registry_cache(self, since, until):
+        with self.session() as db:
+            return db.execute("select * from registry_cache where checked_at > ? and checked_at <= ?",
+                              (since, until)).fetchall()
+
+    def save_registry_cache(self, checked_at, verified, invalidated):
+        with self.session() as db:
+            db.executemany("delete from registry_cache where kind=? and lookup_key=? and checked_at <= ?",
+                           ((kind, encode(key), checked_at) for kind, key in invalidated))
+            db.executemany("""
+                insert into registry_cache values (?,?,?,?)
+                on conflict(kind, lookup_key) do update set checked_at=excluded.checked_at, data=excluded.data
+                where excluded.checked_at >= registry_cache.checked_at
+            """, ((kind, encode(key), checked_at, encode(asdict(value))) for kind, key, value in verified))
 
     def confirmations(self) -> dict:
         with self.session() as db:
@@ -270,14 +290,18 @@ class Storage:
         return known
 
     def record_export(self, batch_id, directory, files, schema_hash, rules, excluded, confirmer, items):
+        occurrences = Counter()
+        records = []
+        for identity, digest, data in items:
+            occurrences[identity] += 1
+            key = identity if occurrences[identity] == 1 else (*identity, occurrences[identity])
+            records.append((batch_id, encode(key), digest, encode(data)))
         with self.session() as db:
             db.execute("insert into exports values (?,?,?,?,?,?,?,?,?)", (
                 batch_id, now(), str(directory), encode(files), schema_hash, rules,
                 encode(excluded), confirmer, PORTAL_STATES[0]
             ))
-            db.executemany("insert into export_items values (?,?,?,?)", (
-                (batch_id, encode(identity), digest, encode(data)) for identity, digest, data in items
-            ))
+            db.executemany("insert into export_items values (?,?,?,?)", records)
             self._audit(db, "XML сформирован", [batch_id, files, excluded])
 
     def history(self) -> list[dict]:
@@ -291,6 +315,8 @@ class Storage:
                 data = json.loads(row["data"])
                 key = (data["serial"]["serial"], data["fields"]["verification_date"]["value"],
                        data["fields"]["type_number"]["value"])
+                if "position" in data:
+                    key = (data["file"], data["position"], *key)
                 result[key] = data["protocol"]
             return result
 

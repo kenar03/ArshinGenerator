@@ -16,8 +16,8 @@ from urllib.request import ProxyHandler, build_opener
 
 from arshin_generator.arshin import NS, Schema, format_packets
 from arshin_generator.domain import Equipment
-from arshin_generator.public_registry import PublicClient, PublicDataError, official_type_title
-from arshin_generator.registry import equipment_diagnostic, lookup_equipment, lookup_key, resolve, resolve_many
+from arshin_generator.public_registry import REGISTRY_TTL, PublicClient, PublicDataError, official_type_title
+from arshin_generator.registry import lookup_equipment, lookup_key, resolve, resolve_many
 from arshin_generator.storage import Storage
 from arshin_generator.validation import check
 from arshin_generator.verification import RegistrySession
@@ -145,7 +145,7 @@ class RegistryLookupTests(unittest.TestCase):
         self.expired = mieta("100003", "32777.06.2Р.01000003", "ГПС 3", expiry="20.11.2026")
         self.client = FixtureClient((self.first, self.second, self.expired))
 
-    def test_http_deduplication_changed_date_model_and_expiry(self):
+    def test_http_deduplication_depends_on_date_and_identity_without_model_text(self):
         day = date(2026, 1, 15)
         item = Equipment("Средство", "Книга", "10000-10", "001", "Учебное средство", category="mis",
                          type_number="10000-10")
@@ -170,7 +170,9 @@ class RegistryLookupTests(unittest.TestCase):
             batch([item], next_day)
             self.assertEqual(sum(server.calls.values()), 3)
             changed, _ = batch([replace(item, name="Другая модель")], next_day)
-            self.assertEqual(next(iter(changed.values())).state, "conflict")
+            self.assertEqual(next(iter(changed.values())).state, "found")
+            self.assertEqual(sum(server.calls.values()), 3)
+            batch([replace(item, serial="002")], next_day)
             self.assertEqual(sum(server.calls.values()), 4)
 
             ticks[0] = 31
@@ -178,6 +180,63 @@ class RegistryLookupTests(unittest.TestCase):
             self.assertEqual(session.snapshot({key: (item, day)}, numbers), ({}, {}))
             batch([item], day)
             self.assertEqual(sum(server.calls.values()), 6)
+
+    def test_persistent_cache_reopens_for_24_hours_and_forced_outage_keeps_last_success(self):
+        unit = Equipment("Средство", "Книга", "10000-10", "001", "Средство", category="mis", type_number="10000-10")
+        key = lookup_key(unit, DAY.isoformat())
+        requests, numbers = {key: (unit, DAY)}, {unit.type_number}
+        ticks = [1_800_000_000]
+        base = ticks[0]
+        with TemporaryDirectory() as folder, registry_http() as server:
+            path = Path(folder) / "cache.sqlite3"
+
+            def open_session():
+                return RegistrySession(storage=Storage(path), clock=lambda: ticks[0] - base,
+                                       wall_clock=lambda: ticks[0], opener=server.opener)
+
+            initial = open_session()
+            self.assertEqual(initial.remember(*initial.check(requests, numbers)), (2, 0))
+            self.assertEqual(sum(server.calls.values()), 2)
+
+            ticks[0] = base + REGISTRY_TTL - 1
+            restarted = open_session()
+            self.assertEqual(restarted.pending(requests, numbers), ({}, set()))
+            self.assertEqual(restarted.snapshot(requests, numbers)[0][key].state, "found")
+            self.assertEqual(sum(server.calls.values()), 2)
+
+            self.assertEqual(restarted.remember(*restarted.check(requests, numbers, force=True)), (2, 0))
+            self.assertEqual(sum(server.calls.values()), 4)
+            self.assertEqual({row["checked_at"] for row in Storage(path).registry_cache(base - 1, ticks[0])}, {ticks[0]})
+            refreshed = ticks[0]
+
+            ticks[0] += 5
+            respond = server.response
+            server.response = lambda *_: (401, {})
+            self.assertEqual(restarted.remember(*restarted.check(requests, numbers, force=True)), (0, 2))
+            self.assertEqual(restarted.snapshot(requests, numbers)[0][key].state, "unavailable")
+            self.assertEqual(restarted.pending(requests, numbers, (requests, numbers)), (requests, numbers))
+            self.assertEqual({row["checked_at"] for row in Storage(path).registry_cache(base - 1, ticks[0])}, {refreshed})
+            self.assertEqual(open_session().pending(requests, numbers), ({}, set()))
+
+            server.response = respond
+            ticks[0] = refreshed + REGISTRY_TTL
+            expired = open_session()
+            self.assertEqual(expired.pending(requests, numbers), (requests, numbers))
+            self.assertEqual(expired.remember(*expired.check(requests, numbers)), (2, 0))
+            self.assertEqual(sum(server.calls.values()), 7)
+
+    def test_definitive_equipment_conflict_invalidates_persisted_success(self):
+        unit = Equipment("Средство", "Книга", "10000-10", "001", "Средство", category="mis", type_number="10000-10")
+        key = lookup_key(unit, DAY.isoformat())
+        requests = {key: (unit, DAY)}
+        with TemporaryDirectory() as folder, registry_http() as server:
+            storage = Storage(Path(folder) / "cache.sqlite3")
+            session = RegistrySession(storage=storage, opener=server.opener)
+            self.assertEqual(session.remember(*session.check(requests, set())), (1, 0))
+            server.valid_until = "2026-11-12"
+            self.assertEqual(session.remember(*session.check(requests, set(), force=True)), (0, 1))
+            self.assertEqual(session.snapshot(requests, set())[0][key].state, "expired")
+            self.assertFalse(RegistrySession(storage=storage).snapshot(requests, set())[0])
 
     def test_http_429_is_bounded_and_manual_retry_only_checks_failed_keys(self):
         item = Equipment("Средство", "Книга", "10000-10", "001", "Учебное средство", category="mis",
@@ -244,7 +303,7 @@ class RegistryLookupTests(unittest.TestCase):
         self.assertEqual(conflict.state, "expired")
         self.assertIsNone(resolve(item, [selected], DAY, conflict)[0])
 
-    def test_complete_registration_disambiguates_but_latin_spelling_requires_review(self):
+    def test_complete_registration_is_requested_exactly_without_substituting_letters(self):
         number = self.first[0]["number"]
         item = etalon(source_id=number, type_number="", registration=number)
         exact = lookup_equipment(item, DAY, self.client)
@@ -253,9 +312,11 @@ class RegistryLookupTests(unittest.TestCase):
         self.assertEqual([query for resource, query in self.client.requests if
                           resource == "mieta" and isinstance(query, dict)], [{"number": number}])
         changed = number.replace("Р", "P")
+        self.client.requests.clear()
         variant = lookup_equipment(replace(item, source_id=changed, registration=changed), DAY, self.client)
-        self.assertEqual(variant.state, "choice")
-        self.assertEqual(variant.candidates[0].entry.identifier, number)
+        self.assertEqual(variant.state, "missing")
+        self.assertFalse(variant.candidates)
+        self.assertEqual(self.client.requests, [("mieta", {"number": changed})])
 
     def test_two_explicit_registrations_for_same_unit_survive_xml_export(self):
         numbers = [self.first[0]["number"], self.second[0]["number"]]
@@ -325,13 +386,14 @@ class RegistryLookupTests(unittest.TestCase):
         self.assertEqual(found.state, "conflict")
         self.assertIn("расходятся со связанной поверкой", found.message)
 
-    def test_full_identifier_does_not_override_serial_or_model(self):
+    def test_full_identifier_does_not_override_serial_and_ignores_model(self):
         number = self.first[0]["number"]
-        for item in (etalon(registration=number, serial="3342"),
-                     etalon(registration=number, name="Термометр ПТСВ-1-1")):
-            found = lookup_equipment(item, DAY, self.client)
-            self.assertEqual(found.state, "conflict")
-            self.assertFalse(found.candidates[0].eligible)
+        wrong = lookup_equipment(etalon(registration=number, serial="3342"), DAY, self.client)
+        self.assertEqual(wrong.state, "conflict")
+        self.assertFalse(wrong.candidates[0].eligible)
+        found = lookup_equipment(etalon(registration=number, name="Термометр ПТСВ-1-1"), DAY, self.client)
+        self.assertEqual(found.state, "found")
+        self.assertEqual(found.candidates[0].entry.identifier, number)
 
     def test_vri_barometer_uses_exact_identity_without_generic_model_error(self):
         item = Equipment("3745-73 Барометр-анероид метеорологический М-110 № 42", "Оборудование!A10:E10",
@@ -347,33 +409,27 @@ class RegistryLookupTests(unittest.TestCase):
                 self.assertEqual(found.state, "found")
                 self.assertEqual(found.candidates[0].entry.registry_serial, "42")
                 self.assertEqual(found.candidates[0].entry.category, "mis")
-                if modification in (None, "Нет модификации", "нет данных", "Барометры-анероиды,"):
-                    self.assertEqual(found.candidates[0].entry.model, "")
+                self.assertEqual(found.candidates[0].entry.model, modification or "")
         for changes, state in (({"mi_number": "042"}, "missing"), ({"mit_number": "3745-74"}, "missing"),
                                ({"valid_date": "13.11.2026"}, "expired"), ({"applicability": False}, "conflict")):
             with self.subTest(changes=changes):
                 result = lookup_equipment(item, DAY, FixtureClient(verifications=[{**row, **changes}]))
                 self.assertEqual(result.state, state)
 
-    def test_vri_reports_real_model_differences_with_source(self):
+    def test_vri_model_text_does_not_select_between_ambiguous_official_records(self):
         item = replace(etalon(), category="mis", name="Термометр ПТСВ-1-2Б")
         row = {"vri_id": "1-111", "mit_number": "32777-06", "mi_number": "003342",
                "verification_date": "14.04.2026", "valid_date": "13.04.2027", "applicability": True}
         for model in ("ПТСВ-1-2", "ПТСВ-1-2А", "ПТСВ-1-3", "ПТСВ-1-2Б/1"):
             with self.subTest(model=model):
                 result = lookup_equipment(item, DAY, FixtureClient(verifications=[{**row, "mi_modification": model}]))
-                self.assertEqual(result.state, "conflict")
-                self.assertIn("Excel: «Термометр ПТСВ-1-2Б»", result.message)
-                self.assertIn(f"ФИФ ОЕИ: «{model}»", result.message)
-                self.assertIn("VRI, поле «Модификация»", result.message)
-                details = equipment_diagnostic(replace(item, source="Оборудование!A8:E8"), result.message)
-                self.assertIn("Оборудование!A8:E8", details)
-                self.assertNotIn(item.source, details)
+                self.assertEqual(result.state, "found")
+                self.assertEqual(result.candidates[0].entry.model, model)
         conflict = {**row, "mi_modification": "ПТСВ-1-2А"}
         generic = {**row, "vri_id": "1-222", "mi_modification": "Нет модификации"}
         result = lookup_equipment(item, DAY, FixtureClient(verifications=[conflict, generic]))
-        self.assertEqual(result.state, "conflict")
-        self.assertFalse(any(candidate.eligible for candidate in result.candidates))
+        self.assertEqual(result.state, "choice")
+        self.assertFalse(resolve_many(item, [], DAY, result, require_public=True)[0])
 
     def test_registry_unavailability_is_distinguished_from_no_exact_type_or_incomplete_reply(self):
         number = "34039-07"
@@ -396,7 +452,7 @@ class RegistryLookupTests(unittest.TestCase):
                 self.assertEqual(types[number].retryable, expected_retry)
                 self.assertEqual("не найден" in types[number].issue, not expected_retry)
 
-    def test_mieta_uses_explicit_modification_from_linked_record(self):
+    def test_mieta_and_linked_vri_can_differ_in_modification_text(self):
         class LinkedModel(FixtureClient):
             def detail(self, resource, record_id):
                 result = super().detail(resource, record_id)
@@ -407,10 +463,8 @@ class RegistryLookupTests(unittest.TestCase):
                 return result
 
         result = lookup_equipment(etalon(), DAY, LinkedModel((self.first,)))
-        self.assertEqual(result.state, "conflict")
-        self.assertIn("Excel: «Термометр ПТСВ-1-2»", result.message)
-        self.assertIn("ФИФ ОЕИ: «ПТСВ-1-3»", result.message)
-        self.assertIn("связанная VRI", result.message)
+        self.assertEqual(result.state, "found")
+        self.assertTrue(result.candidates[0].eligible)
 
     def test_selected_new_template_standards_are_verified_and_exported(self):
         second = mieta("100002", "32777.06.2Р.01000002", "ГПС 2", serial="003343")

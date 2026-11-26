@@ -23,7 +23,7 @@ from arshin_generator.domain import Datum, RegistryEntry
 from arshin_generator.normalization import modification_candidate, metrologist, serial_list
 from arshin_generator.public_registry import exact_records
 from arshin_generator.readers import read_protocol, rtd
-from arshin_generator.registry import iso_date, resolve
+from arshin_generator.registry import EquipmentCandidate, EquipmentLookup, iso_date, lookup_key, resolve
 from arshin_generator.storage import Storage
 from arshin_generator.validation import INVALID_STICKER, check, empty_protocol_issues
 
@@ -102,9 +102,11 @@ class MaterialTests(unittest.TestCase):
         self.assertEqual(sample.fields["modification"].value, "ТСМ-0193-01")
         self.assertEqual([(e.serial, e.registration or e.type_number) for e in sample.equipment], [
             ("83046", "4542-74"), ("3342", "32777.06.2Р.01504903"), ("3342", "32777.06.2Р.01504902"),
-            ("231024843", "58550-14"), ("10253831", "19973.06.4Р.01149311"),
+            ("231024843", "58550-14"), ("", ""),
             ("21-5558L", "80030.20.3Р.01538249"), ("21-5558L", "80030.20.3Р.01538250"),
         ])
+        self.assertIn("19973.06.4P.01149311", sample.equipment[4].description)
+        self.assertIn("Таблицы!A15", " ".join(check([sample], {}, [], check_registry=False)[0].blockers))
         results = check([sample], {}, [])
         self.assertTrue(all(r.value("outcome") == "pass" for r in results))
         for key, value in {
@@ -121,6 +123,11 @@ class MaterialTests(unittest.TestCase):
         template = read_protocol(TEMPLATE)
         self.assertEqual(template.reader, sample.reader)
         self.assertEqual(template.instruments, [])
+        self.assertEqual(len(template.equipment), 9)
+        self.assertEqual(template.fields["equipment_list"].source, "Оборудование!F2:F301")
+        self.assertEqual(template.fields["report_results"].source, "Отчёт!A335")
+        self.assertEqual(template.fields["marking"].source, "Отчёт!A352")
+        self.assertIn("Отчёт!A336", template.fields["aggregate"].source)
         self.assertTrue(template.issues)
         self.assertIn("ячейку B5", " ".join(empty_protocol_issues(template, {}, {})))
         incomplete = read_protocol(INCOMPLETE)
@@ -199,11 +206,11 @@ def fixture(path, number, serial, *, dual=False, outcome="СООТВЕТСТВУ
             for col, value in enumerate((block, instrument, part, name, "", name, name, name,
                                          outcome if part == per_device else "СООТВЕТСТВУЕТ"), 1):
                 d.cell(block + 1, col, value)
-            for row in (33 + block * 2, 34 + block * 2):
+            for point, row in enumerate((33 + block * 2, 34 + block * 2)):
                 for col in (3, 4, 7, 8, 9, 10):
                     if complete or col != 7:
                         outside = (fail and part == per_device) != (inconsistent == (instrument, part))
-                        t.cell(row, col, 101 if col == 8 and outside else 100)
+                        t.cell(row, col, point * 100 if col == 3 else 101 if col == 8 and outside else 100)
     if customize:
         customize(book)
     book.save(path)
@@ -216,6 +223,114 @@ class RtdTemplateTests(unittest.TestCase):
         folder = TemporaryDirectory()
         self.addCleanup(folder.cleanup)
         self.root = Path(folder.name)
+
+    @staticmethod
+    def extended_layout(book, count, *, shift=0):
+        catalog, table, report = book["Оборудование"], book["Таблицы"], book["Отчёт"]
+        catalog["F1"] = "Используется"
+        table["A10"] = "#REF!"  # Old print range is irrelevant for the new format.
+        for r in range(302 - count, 302):
+            fields = (("10000-10", f"СИ {r}", f"{r:04d}", "СИ") if r % 2 == 0 else
+                      (f"32777.06.2Р.{r:08d}", f"Эталон {r}", f"{r:04d}", "Эталон"))
+            for col, value in enumerate((*fields, "Устаревшее печатное обозначение", "+"), 1):
+                catalog.cell(r, col, value)
+        if count < 299:
+            catalog["F3"] = "+"  # A marker on an otherwise empty row is ignored.
+        result_row = 335 + shift
+        report["A45"] = "Заключение: СИ не годны к применению. Эта строка относится к перечню оборудования."
+        report[f"A{result_row}"] = f"Результаты поверки: см. приложение к протоколу № {table['D1'].value}"
+        report[f"A{result_row + 1}"] = f"Заключение: СИ {table['C19'].value}."
+        report[f"A{result_row + 10}"] = f"Приложение к протоколу поверки № {table['D1'].value}"
+        report[f"A{result_row + 17}"] = "ТСП-0193-01-100/100П/С/4"
+        report[f"A{result_row + 18}"] = "№"
+        report[f"C{result_row + 18}"] = "Т,°С"
+        report[f"D{result_row + 18}"] = "Rэт, Ом"
+
+    def test_marked_catalog_supports_full_range_and_only_exports_marked_rows(self):
+        schema = Schema()
+        for count in (1, 5, 9, 15, 300):
+            with self.subTest(count=count):
+                p = fixture(self.root / f"units-{count}.xlsx", "Новый", "001B6", sticker="",
+                            customize=lambda book: self.extended_layout(book, count))
+                self.assertFalse(p.issues)
+                self.assertEqual(p.report_outcome, "pass")
+                self.assertEqual(p.fields["marking"].value, "ТСП-0193-01-100/100П/С/4")
+                self.assertEqual(p.fields["modification"].value, "ТСП-0193-01")
+                self.assertEqual([item.serial for item in p.equipment], [f"{r:04d}" for r in range(302 - count, 302)])
+                day = p.fields["verification_date"].value
+                lookups = {}
+                for item in p.equipment:
+                    entry = replace(equipment(), local_id=item.source_id, serial=item.serial, category=item.category,
+                                    registry_serial=item.serial, type_number=item.type_number, identifier=item.registration)
+                    lookups[lookup_key(item, day)] = EquipmentLookup("found", "", (EquipmentCandidate(entry, "", True),))
+                records = check([p], {}, [], lookups, require_public=True)
+                self.assertFalse(records[0].blockers)
+                root, errors, _ = schema.inspect(format_packets(records, schema)[0][0])
+                self.assertFalse(errors)
+                self.assertEqual(len(root.xpath(".//g:means/g:mis/g:mi | .//g:means/g:mieta/g:number", namespaces={"g": NS})), count)
+
+    def test_new_catalog_empty_or_invalid_category_reports_cell(self):
+        empty = fixture(self.root / "empty.xlsx", "Новый", "001B6", customize=lambda b: self.extended_layout(b, 0))
+        self.assertFalse(empty.equipment)
+        self.assertIn("знаком «+» в Оборудование!F2:F301", " ".join(check([empty], {}, [], check_registry=False)[0].blockers))
+
+        def incorrect(book):
+            self.extended_layout(book, 1)
+            book["Оборудование"]["D301"] = "ФИФ"  # This alias belongs to older workbooks.
+
+        invalid = fixture(self.root / "invalid.xlsx", "Новый", "001B6", customize=incorrect)
+        issues = check([invalid], {}, [], check_registry=False)[0].blockers
+        self.assertEqual(sum("Оборудование!D301" in issue for issue in issues), 1)
+
+    def test_extended_report_finds_sections_by_headings_and_blocks_contradictions(self):
+        def shifted(book):
+            self.extended_layout(book, 1, shift=4)
+            book["Отчёт"]["A340"] = "Заключение: СИ не годны к применению."
+
+        p = fixture(self.root / "extended.xlsx", "Новый", "001B6", customize=shifted)
+        self.assertEqual(p.fields["marking"].source, "Отчёт!A356")
+        self.assertEqual(p.fields["report_results"].source, "Отчёт!A339")
+        self.assertEqual(p.report_outcome, "fail")
+        self.assertIn("Таблицы!C19 и Отчёт!A340", " ".join(p.issues))
+
+    def test_class_c_validates_only_point_zero_for_each_sensitive_element(self):
+        for grade in ("AA", "A", "B", "С", "C"):
+            for dual in (False, True):
+                with self.subTest(grade=grade, dual=dual):
+                    def customize(book):
+                        self.extended_layout(book, 1)
+                        table = book["Таблицы"]
+                        table["G27"] = grade
+                        for row in (36, 38):
+                            table[f"G{row}"].value = None
+                            table[f"H{row}"] = 101
+
+                    p = fixture(self.root / "class.xlsx", "Допуск", "001B6", dual=dual, customize=customize)
+                    i, = p.instruments
+                    self.assertEqual(len(i.elements), 2 if dual else 1)
+                    self.assertEqual(i.outcome, "pass" if grade in {"C", "С"} else "")
+                    self.assertTrue(all(e.complete == (grade in {"C", "С"}) for e in i.elements))
+
+    def test_class_c_rejects_missing_zero_measurement_and_saved_status_conflict(self):
+        def class_c(book):
+            self.extended_layout(book, 1)
+            table = book["Таблицы"]
+            table["G27"] = "C"
+            for row in (36, 38):
+                table[f"G{row}"].value = None
+
+        p = fixture(self.root / "bad.xlsx", "Допуск", "001B6", dual=True, inconsistent=(0, 2), customize=class_c)
+        self.assertIn("Данные!I3, Таблицы!C37:J37", p.instruments[0].problem)
+        fail = fixture(self.root / "failed.xlsx", "Допуск", "001B6", outcome=rtd.FAIL, dual=True, customize=class_c)
+        self.assertEqual(fail.instruments[0].outcome, "fail")
+        self.assertFalse(fail.issues)
+
+        def missing(book):
+            class_c(book)
+            book["Таблицы"]["G37"].value = None
+
+        absent = fixture(self.root / "missing.xlsx", "Допуск", "001B6", dual=True, customize=missing)
+        self.assertTrue(check([absent], {}, [], check_registry=False)[0].incomplete_measurements)
 
     def test_equipment_category_comes_from_column_d_for_both_label_formats(self):
         rows = [
@@ -267,7 +382,7 @@ class RtdTemplateTests(unittest.TestCase):
         self.assertEqual(protocol.issues, [])
         self.assertFalse(protocol.serial_issue)
 
-    def test_standard_errors_report_selected_label_and_exact_cell(self):
+    def test_calculation_standards_are_independent_of_used_equipment(self):
         def customize(book):
             table, catalog = book["Таблицы"], book["Оборудование"]
             table["L34"] = "Эталон для измерения"
@@ -277,14 +392,10 @@ class RtdTemplateTests(unittest.TestCase):
             catalog["D2"] = "СИ"
 
         protocol = fixture(self.root / "errors.xlsx", "ТЕСТ", "009B6", customize=customize)
-        issues = "\n".join(protocol.issues)
-        self.assertIn("«Отсутствующий эталон № 20» из Таблицы!H31 отсутствует в Таблицы!A10:A18", issues)
-        self.assertIn("«Учебное средство №001» из Таблицы!L35", issues)
-        self.assertIn("Оборудование!A2:E2", issues)
-        self.assertIn("Требуется категория «Эталон»", issues)
-        self.assertNotIn("Таблицы!H30", issues)
+        self.assertFalse(protocol.issues)
+        self.assertEqual([(item.category, item.serial) for item in protocol.equipment], [("mis", "001")])
 
-    def test_only_saved_measurement_rows_check_individual_selection(self):
+    def test_ignoring_calculation_labels_does_not_skip_missing_measurements(self):
         def customize(book):
             table = book["Таблицы"]
             table["L34"] = "Эталон для измерения"
@@ -293,9 +404,7 @@ class RtdTemplateTests(unittest.TestCase):
             table["L36"] = "Строка ещё не измерена №2"
 
         protocol = fixture(self.root / "partial.xlsx", "ТЕСТ", "009B6", complete=False, customize=customize)
-        issues = "\n".join(protocol.issues)
-        self.assertIn("«Нет в перечне №1» из Таблицы!L35 отсутствует в Таблицы!A10:A18", issues)
-        self.assertNotIn("Таблицы!L36", issues)
+        self.assertFalse(protocol.issues)
         self.assertFalse(protocol.instruments[0].elements[0].complete)
 
     def test_individual_choices_replace_unused_defaults_and_ignore_legacy_l(self):
@@ -372,15 +481,19 @@ def sample_copy_with_kind(path, kind):
             contents = original.read(item)
             if item.filename == name:
                 sheet = etree.fromstring(contents)
-                row = sheet.find(f".//{{{namespace}}}row[@r='1']")
-                cell = row.find(f"{{{namespace}}}c[@r='B1']")
-                if cell is None:
-                    cell = etree.Element(f"{{{namespace}}}c", r="B1")
-                    row.insert(1, cell)
-                for child in list(cell):
-                    cell.remove(child)
-                cell.set("t", "inlineStr")
-                etree.SubElement(etree.SubElement(cell, f"{{{namespace}}}is"), f"{{{namespace}}}t").text = kind
+                # The supplied older book retains a stale print label in A15. Correct the test copy only.
+                correct_label = ("19973.06.4Р.01149311 Система поверки термопреобразователей "
+                                 "автоматизированная АСПТ № 10253831")
+                for address, row_number, value in (("B1", 1, kind), ("A15", 15, correct_label)):
+                    row = sheet.find(f".//{{{namespace}}}row[@r='{row_number}']")
+                    cell = row.find(f"{{{namespace}}}c[@r='{address}']")
+                    if cell is None:
+                        cell = etree.Element(f"{{{namespace}}}c", r=address)
+                        row.insert(1 if address == "B1" else 0, cell)
+                    for child in list(cell):
+                        cell.remove(child)
+                    cell.set("t", "inlineStr")
+                    etree.SubElement(etree.SubElement(cell, f"{{{namespace}}}is"), f"{{{namespace}}}t").text = value
                 contents = etree.tostring(sheet, encoding="utf-8")
             copied.writestr(item, contents)
     return path
@@ -760,14 +873,39 @@ class WorkflowTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Фамилия И.О."):
             format_packets(results, self.schema)
 
-    def test_duplicate_identity_is_blocked(self):
-        p = fixture(self.root / "one.xlsx", "ТЕСТ-А", "034C6")
-        q = fixture(self.root / "two.xlsx", "ТЕСТ-Б", "034С6")
+    def test_same_serial_can_be_exported_from_distinct_protocols_and_audited(self):
+        p = fixture(self.root / "one.xlsx", "ТЕСТ-А", "034C6", dual=True, sticker="")
+        q = fixture(self.root / "two.xlsx", "ТЕСТ-Б", "034С6", execution="02", sticker="")
         self.storage.save_equipment(equipment())
         seed_lab(self.storage)
-        seed_lab(self.storage)
         results = self.checked(p, q)
-        self.assertTrue(all(any("Повтор результата" in i for i in r.issues) for r in results))
+        self.assertEqual([r.instrument.serial for r in results], ["034C6", "034C6"])
+        self.assertTrue(all(not r.blockers for r in results))
+        packets = format_packets(results, self.schema)
+        xml = self.root / "repeat.xml"
+        export(packets, self.schema, [xml], self.storage, "Тест")
+        root, issues, _ = open_xml(xml, self.schema)
+        self.assertFalse(issues)
+        self.assertEqual(len(root), 2)
+        context = self.storage.export_context(self.storage.history()[0]["id"])
+        self.assertEqual(context[(xml.name, 0, "034C6", "2026-01-15", "56560-14")], "ТЕСТ-А")
+        self.assertEqual(context[(xml.name, 1, "034C6", "2026-01-15", "56560-14")], "ТЕСТ-Б")
+        with self.assertRaisesRegex(ValueError, "В одном протоколе"):
+            format_packets([results[0], results[0]], self.schema)
+
+    def test_same_full_serial_in_two_groups_of_one_protocol_is_blocked(self):
+        def duplicate(book):
+            data = book["Данные"]
+            for cell in ("D3", "F3", "G3"):
+                data[cell] = "001B6"
+            book["Таблицы"]["B19"] = "№001B6, 001B6"
+
+        p = fixture(self.root / "one.xlsx", "Один", "", count=2, sticker="", customize=duplicate)
+        self.storage.save_equipment(equipment())
+        results = self.checked(p)
+        self.assertEqual(len(results), 2)
+        self.assertTrue(all(r.instrument.serial == "001B6" for r in results))
+        self.assertTrue(all(any("Повтор заводского номера" in issue for issue in r.blockers) for r in results))
         with self.assertRaises(ValueError):
             format_packets(results, self.schema)
 
@@ -783,13 +921,13 @@ class WorkflowTests(unittest.TestCase):
         self.assertFalse(result.blockers)
         self.assertEqual(len(format_packets([result], self.schema)), 1)
 
-    def test_print_limit_warns_and_block_63_is_read(self):
+    def test_print_limit_does_not_warn_and_block_63_is_read(self):
         p = fixture(self.root / "batch.xlsx", "ТЕСТ-ВМЕСТИМОСТЬ", "unused", count=63, print_limit=62)
         self.assertEqual(len(p.instruments), 63)
         self.assertEqual(p.instruments[-1].serial, "063B6")
         self.assertTrue(p.instruments[-1].elements[0].complete)
         self.assertFalse(p.issues)
-        self.assertIn("62", p.notices[0])
+        self.assertFalse(p.notices)
 
     def test_confirmation_migrates_and_only_changed_evidence_is_invalidated(self):
         p = fixture(self.root / "one.xlsx", "ТЕСТ-ПЕРЕНОС", "034C6")

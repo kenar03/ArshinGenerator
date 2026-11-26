@@ -1,3 +1,4 @@
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TypeAlias
@@ -52,6 +53,11 @@ class Instrument:
     elements: tuple[ElementReading, ...] = ()
     problem: str = ""
     outcome: str = ""
+
+
+def duplicate_serials(instruments) -> tuple[str, ...]:
+    numbers = Counter(instrument.serial.upper() for instrument in instruments if instrument.serial)
+    return tuple(number for number, count in numbers.items() if count > 1)
 
 
 @dataclass

@@ -297,7 +297,7 @@ class ProtocolDialog(QDialog):
                 for entry in entries:
                     number = entry.type_number if entry.category == "mis" else entry.identifier
                     inventory = entry.registry_serial if entry.category == "mis" and entry.identity_kind == "inventoryNum" else ""
-                    row = (entry.name or item.name, "" if inventory else entry.registry_serial, number, inventory, "Проверено")
+                    row = (item.name or entry.name, "" if inventory else entry.registry_serial, number, inventory, "Проверено")
                     grouped.setdefault(entry.category, []).append((entry, row))
             else:
                 status = "Не подтверждено" if item in resolutions or not item.category else "Не проверено"

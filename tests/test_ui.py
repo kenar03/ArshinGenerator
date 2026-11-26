@@ -23,6 +23,7 @@ from arshin_generator.arshin import NS, SCHEMA_HASH, Schema, export, format_pack
 from arshin_generator.confirmations import protocol_key
 from arshin_generator.domain import Datum, RegistryEntry
 from arshin_generator.readers import read_protocol
+from arshin_generator.public_registry import REGISTRY_TTL
 from arshin_generator.storage import Storage
 from arshin_generator.registry import EquipmentCandidate, EquipmentLookup, lookup_equipment, lookup_key
 from arshin_generator.ui.common import Form
@@ -503,7 +504,7 @@ class InterfaceTests(unittest.TestCase):
             self.assertNotIn("имеет неверный формат", texts)
             preview.close()
 
-    def test_preview_groups_instrument_errors_with_each_location_and_separates_notices(self):
+    def test_preview_groups_instrument_errors_without_print_limit_notice(self):
         def customize(book):
             table = book["Таблицы"]
             table["H35"] = table["H37"] = 101
@@ -520,12 +521,12 @@ class InterfaceTests(unittest.TestCase):
             self.assertEqual(texts.count("Сохранённый результат ЧЭ расходится с допусками"), 1)
             self.assertIn("Для № 001B6 проверьте Данные!I2, Таблицы!C35:J36", texts)
             self.assertIn("Для № 002B6 проверьте Данные!I3, Таблицы!C37:J38", texts)
-            self.assertIn("Печатная вместимость", texts)
+            self.assertNotIn("Печатная вместимость", texts)
             self.assertEqual(texts.count("Что нужно исправить"), 1)
             self.assertFalse(main.can_export)
             preview.close()
 
-    def test_equipment_preview_shows_real_modification_mismatch_and_workbook_location(self):
+    def test_equipment_preview_accepts_model_differences_but_reports_serial_mismatch(self):
         with TemporaryDirectory() as directory:
             path = Path(directory)
             main = self.window(path)
@@ -544,8 +545,15 @@ class InterfaceTests(unittest.TestCase):
             main.recheck()
             preview = ProtocolDialog(main)
             texts = "\n".join(label.text() for label in preview.findChildren(QLabel))
-            self.assertEqual(texts.count("Модификация средства поверки расходится"), 1)
-            for value in ("Учебное средство:", "Другое исполнение А1", "Оборудование!A2:E2"):
+            self.assertNotIn("Что нужно исправить", texts)
+            self.assertEqual(preview.equipment_models["mis"].rows[0][1][-1], "Проверено")
+            self.assertTrue(main.can_export)
+
+            client.verifications[0]["mi_number"] = "не совпадает"
+            main.lookups[lookup_key(item, day.isoformat())] = lookup_equipment(item, day, client)
+            main.recheck()
+            texts = "\n".join(label.text() for label in preview.scroll.widget().findChildren(QLabel))
+            for value in ("Учебное средство:", "ФИФ ОЕИ не подтвердил", "Оборудование!A2:E2"):
                 self.assertIn(value, texts)
             self.assertNotIn("(VRI", texts)
             self.assertEqual(preview.equipment_models["mis"].rows[0][1][-1], "Не подтверждено")
@@ -626,14 +634,14 @@ class InterfaceTests(unittest.TestCase):
             main.import_paths([first.path])
             self.wait_for_import(main)
             self.assertEqual(sum(server.calls.values()), 3)
-            ticks[0] = 450
+            ticks[0] = REGISTRY_TTL // 2
             main.import_paths([second.path])
             self.wait_for_import(main)
             self.assertEqual(sum(server.calls.values()), 4)
             self.assertTrue(main.can_export)
             initial = server.calls.copy()
 
-            ticks[0] = 900
+            ticks[0] = REGISTRY_TTL
             main.expiry_timer.start(1)
             QTest.qWait(20)
             self.assertFalse(main.can_export)
@@ -647,7 +655,7 @@ class InterfaceTests(unittest.TestCase):
             self.assertNotIn("Проблемных", texts)
             self.assertNotIn("Что нужно исправить", texts)
             details.close()
-            self.assertEqual(main.expiry_timer.interval(), 450_000)
+            self.assertEqual(main.expiry_timer.interval(), REGISTRY_TTL * 500)
             with patch.object(ProtocolDialog, "exec", return_value=0) as preview:
                 main.open_protocol(main.protocols[0])
                 main.open_protocol(main.protocols[1])
@@ -785,7 +793,7 @@ class InterfaceTests(unittest.TestCase):
             output = path / "after dialog.xml"
 
             def choose(_):
-                ticks[0] += 900
+                ticks[0] += REGISTRY_TTL
                 return output
 
             with patch.object(main, "choose_xml_path", side_effect=choose) as chooser:
@@ -808,7 +816,7 @@ class InterfaceTests(unittest.TestCase):
                 main.import_paths([protocol.path])
                 self.wait_for_import(main)
                 self.assertTrue(main.can_export)
-                ticks[0] = 900
+                ticks[0] = REGISTRY_TTL
                 before = server.calls.copy()
                 server.failure = 429 if failure == "rate" else 0
 
@@ -1021,6 +1029,71 @@ class InterfaceTests(unittest.TestCase):
             self.assertEqual(reopened.storage.xml_output(), (False, str(automatic)))
             self.assertEqual(reopened.output_folder(), previous)
 
+    def test_force_button_bypasses_cache_reports_outage_and_preserves_previous_checks(self):
+        with TemporaryDirectory() as directory, registry_http() as server:
+            path = Path(directory)
+            storage = Storage(path / "ui.sqlite3")
+            session = RegistrySession(storage=storage, opener=server.opener)
+            main = self.window(path, online=True, registry_session=session)
+            workbook = fixture(path / "protocol.xlsx", "Обновление", "001B6", dual=True, sticker="")
+            main.import_paths([workbook.path])
+            self.wait_for_import(main)
+            self.assertTrue(main.can_export)
+            self.assertEqual(sum(server.calls.values()), 3)
+            self.assertEqual(main.summary.text(), "Протоколов 1  ·  Приборов 1  ·  Готово 1")
+
+            def open_settings(form):
+                self.assertEqual(sum(server.calls.values()), 3)
+                form.reject()
+                return form.result()
+
+            with patch.object(Form, "exec", new=open_settings):
+                main.settings_btn.click()
+            main.recheck_btn.click()
+            self.wait_for_import(main)
+            self.assertEqual(sum(server.calls.values()), 3)
+
+            def force(form):
+                refresh = next(button for button in form.findChildren(QPushButton)
+                               if button.text() == "Принудительно обновить данные ФИФ ОЕИ")
+                self.assertTrue(refresh.isEnabled())
+                refresh.click()
+                self.assertFalse(refresh.isEnabled())
+                self.assertTrue(main.busy)
+                self.wait_for_import(main)
+                self.assertTrue(refresh.isEnabled())
+                self.assertIn(main.notice.text(), [label.text() for label in form.findChildren(QLabel)])
+                form.reject()
+                return form.result()
+
+            with patch.object(Form, "exec", new=force):
+                main.settings_btn.click()
+                self.assertEqual(sum(server.calls.values()), 6)
+                self.assertIn("Обновлено: 2 · Не удалось проверить: 0", main.notice.text())
+                self.assertTrue(main.can_export)
+                previous = [tuple(row) for row in storage.registry_cache(0, session.wall_clock())]
+                server.response = lambda *_: (401, {})
+                main.settings_btn.click()
+            self.assertIn("Данные ФИФ ОЕИ не обновлены", main.notice.text())
+            self.assertIn("Не удалось проверить: 2", main.notice.text())
+            self.assertFalse(main.can_export)
+            self.assertEqual(main.summary.text(), "Протоколов 1  ·  Приборов 1  ·  Готово 0")
+            self.assertEqual(previous, [tuple(row) for row in storage.registry_cache(0, session.wall_clock())])
+            main.show()
+            self.app.processEvents()
+            self.assertGreater(main.summary.geometry().top(), main.source.geometry().bottom())
+            self.assertEqual(main.summary.geometry().right(), main.source.geometry().right())
+            main.close()
+
+            # A fresh application instance reuses the unexpired successful records.
+            reopened = self.window(path, online=True, registry_session=RegistrySession(storage=storage, opener=server.opener))
+            before = server.calls.copy()
+            reopened.import_paths([workbook.path])
+            self.wait_for_import(reopened)
+            self.assertEqual(server.calls, before)
+            self.assertTrue(reopened.can_export)
+            reopened.close()
+
     def test_automatic_single_export_uses_next_unused_name_and_keeps_manual_folder(self):
         with TemporaryDirectory() as directory:
             path = Path(directory)
@@ -1143,7 +1216,7 @@ class InterfaceTests(unittest.TestCase):
             main.import_paths([protocol.path])
             self.wait_for_import(main)
             self.assertEqual(sum(server.calls.values()), 3)
-            ticks[0] += 900
+            ticks[0] += REGISTRY_TTL
             xml = path / "СИ-Экспорт_ТЕСТ-1.xml"
             with patch.object(main, "choose_xml_path") as file_dialog, \
                     patch.object(QFileDialog, "getExistingDirectory") as folder_dialog:
@@ -1193,11 +1266,14 @@ class InterfaceTests(unittest.TestCase):
             self.assertEqual(dialog.equipment_models["mieta"].rows[0][1][-1], "Не подтверждено")
             self.assertFalse(main.can_export)
             self.assertFalse(main.storage.entries())
-            main.lookups[key] = EquipmentLookup("choice", "В номере эталона из Excel латинская P. Сверьте карточку с кириллической Р",
-                                                (found.candidates[0],))
+            number = first[1].replace("Р", "P")
+            changed = replace(item, source_id=number, type_number="", registration=number)
+            protocol.equipment = [changed]
+            main.lookups[lookup_key(changed, day.isoformat())] = lookup_equipment(changed, day, FixtureClient(cases))
             main.recheck()
             texts = "\n".join(label.text() for label in dialog.scroll.widget().findChildren(QLabel))
-            self.assertEqual(texts.count("латинская P вместо кириллической Р"), 1)
+            self.assertEqual(texts.count("ФИФ ОЕИ не подтвердил средство поверки с указанными реквизитами"), 1)
+            self.assertNotIn("латинская", texts)
             self.assertFalse(main.can_export)
             dialog.close()
 

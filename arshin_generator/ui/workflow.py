@@ -47,6 +47,25 @@ def laboratory_settings(parent, storage):
     destination.setEnabled(automatic.isChecked())
     automatic.toggled.connect(destination.setEnabled)
 
+    refresh_status = label("")
+    refresh_status.hide()
+
+    def finish_refresh(text):
+        refresh_status.setText(text)
+        refresh_status.show()
+        refresh.setEnabled(bool(parent.protocols) and not parent.busy and parent.online)
+
+    def start_refresh():
+        if parent.force_registry_refresh():
+            refresh.setEnabled(False)
+            refresh_status.setText("Обновляем сведения в ФИФ ОЕИ…")
+            refresh_status.show()
+
+    refresh = button("Принудительно обновить данные ФИФ ОЕИ", start_refresh)
+    refresh.setEnabled(bool(parent.protocols) and not parent.busy and parent.online)
+    fields.addRow(refresh)
+    fields.addRow(refresh_status)
+
     def validate(values):
         if values != initial_fields:
             validate_defaults(values)
@@ -54,7 +73,12 @@ def laboratory_settings(parent, storage):
             raise ValueError("Выберите папку автоматического сохранения XML.")
 
     form.validate = validate
-    if form.exec():
+    parent.registry_refreshed.connect(finish_refresh)
+    try:
+        accepted = form.exec()
+    finally:
+        parent.registry_refreshed.disconnect(finish_refresh)
+    if accepted:
         output = automatic.isChecked(), folder.text()
         if output != xml_output:
             storage.save_xml_output(*output)

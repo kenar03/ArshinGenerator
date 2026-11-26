@@ -3,7 +3,7 @@ import re
 
 from . import VERSION
 from .confirmations import get_confirmation, manufacture_year
-from .domain import Datum, Protocol, RegistryEntry, Result
+from .domain import Datum, Protocol, RegistryEntry, Result, duplicate_serials
 from .laboratory import LABORATORY_DEFAULTS, apply_defaults
 from .normalization import metrologist
 from .public_registry import TYPE_NUMBER
@@ -97,7 +97,10 @@ def _prepare(protocol, laboratory, confirmations):
     if type(field("calibration").value) is not bool:
         issues.append("Укажите в настройках, используются ли результаты калибровки.")
     if not protocol.equipment:
-        issue("equipment_list", "В протоколе не указаны средства поверки.")
+        if field("equipment_list").source.startswith("Оборудование!"):
+            issues.append(f"Отметьте используемые средства поверки знаком «+» в {field('equipment_list').source}.")
+        else:
+            issue("equipment_list", "В протоколе не указаны средства поверки.")
     for key, limit in {
         "type_number": 32, "modification": 128, "owner": 512, "method": 128,
         "metrologist": 128, "temperature": 128, "pressure": 128, "humidity": 128,
@@ -139,6 +142,10 @@ def check(protocols: list[Protocol], confirmations: dict, registry: list[Registr
         if protocol.error or not protocol.instruments:
             continue
         shared, issues = _prepare(protocol, laboratory or {}, confirmations)
+        repeated = duplicate_serials(protocol.instruments)
+        if repeated and "Повтор заводского номера" not in protocol.serial_issue:
+            numbers = ", ".join(repeated[:8]) + (f" и ещё {len(repeated) - 8}" if len(repeated) > 8 else "")
+            issues.append(f"Повтор заводского номера в одном протоколе: {numbers}. Проверьте Таблицы!B19 и лист «Данные».")
         equipment = []
         equipment_resolutions = {}
         equipment_issues = []
@@ -224,12 +231,9 @@ def check(protocols: list[Protocol], confirmations: dict, registry: list[Registr
                 result.issues.append("Один номер наклейки указан на партию приборов." + location(batch_sticker))
         results.extend(batch)
 
-    identities = Counter(result.identity for result in results if result.instrument.serial)
     stickers = Counter(result.value("sticker") for result in results
                        if result.value("outcome") == "pass" and result.value("sticker"))
     for result in results:
-        if identities[result.identity] > 1:
-            result.issues.append("Повтор результата для того же типа, заводского номера и даты поверки.")
         if result.value("outcome") == "pass" and stickers[result.value("sticker")] > 1:
             result.issues.append("Один номер наклейки указан у нескольких результатов.")
     return results

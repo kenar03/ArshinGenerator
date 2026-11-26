@@ -121,9 +121,6 @@ def _sign(value) -> bool | None:
 
 
 def _catalog_label(text: str) -> str:
-    # Old saved dropdown text can retain Latin P after the catalog has been corrected.
-    # This key is only used to join labels. API requests use the untouched column A.
-    text = re.sub(r"^([0-9]+\.[0-9]+\.[0-9]+)[PР](\.[0-9]+)(?=\s|$)", r"\1Р\2", text)
     return " ".join(re.sub(r"\s*№\s*", " № ", text).split())
 
 
@@ -133,17 +130,57 @@ def _equipment_labels(number, name, factory):
     return ()
 
 
-def _equipment(protocol, t, catalog, etalons) -> list[Equipment]:
+def _equipment_item(protocol, description, source, fields, category_cells, *, modern=False):
+    local_id, factory, name, kind = fields
+    categories = {"си": "mis", "эталон": "mieta"} if modern else EQUIPMENT_CATEGORIES
+    category = categories.get(kind, "mieta" if not modern and kind.startswith("фиф без") else "")
+    type_number, registration, input_issue = "", "", ""
+    if not category:
+        input_issue = f"Для средства «{name or description}» не указан допустимый тип прибора. Проверьте {category_cells}."
+    elif category == "mis" or TYPE_NUMBER.fullmatch(local_id):
+        type_number = local_id
+    else:
+        registration = local_id
+    if input_issue:
+        protocol.issues.append(input_issue)
+    return Equipment(description, source, local_id, factory, name, category=category, type_number=type_number,
+                     registration=registration, input_issue=input_issue)
+
+
+def _catalog_fields(row):
+    number, name, factory, kind = (_text(value) for value in row[:4])
+    return number, factory, name, " ".join(kind.casefold().split())
+
+
+def _marked_equipment(protocol, catalog):
+    result = []
+    for r, row in enumerate(catalog[2:], 2):
+        if _text(row[5]) != "+":
+            continue
+        fields = _catalog_fields(row)
+        if not any(fields):
+            continue
+        number, factory, name, _ = fields
+        description = f"{number} {name} № {factory}" if number and name and factory else name or number or f"Строка {r}"
+        source = f"Оборудование!A{r}:D{r}"
+        errors = [f"Оборудование!{column}{r}" for column, value in zip("ABCD", row[:4])
+                  if _text(value).startswith("#")]
+        if errors:
+            protocol.issues.append("Ошибка Excel в реквизитах средства поверки. Проверьте " + ", ".join(errors) + ".")
+        result.append(_equipment_item(protocol, description, source, fields, f"Оборудование!D{r}", modern=True))
+    return result
+
+
+def _legacy_equipment(protocol, t, catalog):
     lookup = defaultdict(set)
     labels = defaultdict(set)
     for r, row in enumerate(catalog[2:], 2):
-        local_id, name, factory, kind = (_text(value) for value in row[:4])
-        entry = (local_id, factory, name, " ".join(kind.casefold().split()), r)
-        if _present(row[4]):
-            label = _text(row[4])
+        fields = _catalog_fields(row)
+        entry = (*fields, r)
+        if label := _present(row[4]):
             lookup[label].add(entry)
             labels[_catalog_label(label)].add(entry)
-        # Saved selections may still contain the display text from before the catalog was updated.
+        local_id, factory, name, _ = fields
         for alias in _equipment_labels(local_id, name, factory):
             labels[_catalog_label(alias)].add(entry)
     result = []
@@ -154,88 +191,44 @@ def _equipment(protocol, t, catalog, etalons) -> list[Equipment]:
         matches = lookup.get(text) or labels.get(_catalog_label(text), set())
         identities = {entry[:4] for entry in matches}
         source = f"Таблицы!A{r}"
-        category, type_number, registration = "", "", ""
-        input_issue = ""
         if len(identities) == 1:
-            local_id, factory, name, kind = next(iter(identities))
             catalog_rows = sorted(k for *_, k in matches)
             source += " / " + ", ".join(f"Оборудование!A{k}:E{k}" for k in catalog_rows)
-            category = EQUIPMENT_CATEGORIES.get(kind, "mieta" if kind.startswith("фиф без") else "")
-            if category == "mis":
-                type_number = local_id
-            elif category == "mieta":
-                if re.fullmatch(r"[0-9]+-[0-9]+", local_id):
-                    type_number = local_id
-                elif re.fullmatch(r"[0-9]+\.[0-9]+\.[\w]+\.[0-9]+", local_id):
-                    registration = local_id
-            else:
-                cells = ", ".join(f"Оборудование!D{k}" for k in catalog_rows)
-                input_issue = f"Для средства «{name or text}» не указан допустимый тип прибора. Проверьте {cells}."
-                protocol.issues.append(input_issue)
+            cells = ", ".join(f"Оборудование!D{k}" for k in catalog_rows)
+            result.append(_equipment_item(protocol, text, source, next(iter(identities)), cells))
         else:
-            local_id, name, factory = "", "", ""
-        hints = {
-            f"Эталоны!F{k}:G{k}: {_text(row[5])}, до {_text(row[6])}"
-            for k, row in enumerate(etalons[2:], 2)
-            if factory and _text(row[0]) == _text(t[30][7]) and _text(row[0]).endswith(f"№{factory}")
-        }
-        result.append(Equipment(text, source, local_id, factory, name, "; ".join(sorted(hints)),
-                                category, type_number, registration, input_issue))
+            result.append(Equipment(text, source))
     return result
 
 
-def _check_standard_selections(protocol, t, measurement_rows):
-    selections = {}
-    if _text(t[34][11]).casefold() == "эталон для измерения":
-        for row, default in measurement_rows:
-            override = _text(t[row][11])
-            if override:
-                selections[f"Таблицы!L{row}"] = override
-            else:
-                selections[f"Таблицы!H{default}"] = _text(t[default][7])
-    elif standard := _present(t[30][7]):
-        selections["Таблицы!H30"] = standard
-
-    references = defaultdict(list)
-    for cell, label in selections.items():
-        references[label].append(cell)
-    for label, cells in references.items():
-        where = ", ".join(cells[:4])
-        if len(cells) > 4:
-            where += f" и ещё {len(cells) - 4}"
-        if not label or label.startswith("#"):
-            protocol.issues.append(f"Укажите эталон в {where}. Проверьте выбор и сохраните книгу в Excel.")
-            continue
-        key = _catalog_label(label)
-        matches = [item for item in protocol.equipment if _catalog_label(item.description) == key]
-        if not matches:
-            matches = [item for item in protocol.equipment if any(
-                _catalog_label(alias) == key for alias in _equipment_labels(item.source_id, item.name, item.serial)
-            )]
-        if not matches:
-            # The «Эталоны» dropdown can contain the shortened designation, without the registry number.
-            model, marker, factory = key.rpartition(" № ")
-            if marker and model and factory:
-                designation = re.compile(r"(?<![\w/.-])" + re.escape(model) + r"(?![\w/.-])", re.I)
-                matches = [item for item in protocol.equipment
-                           if item.serial == factory and designation.search(" ".join(item.name.split()))]
-        if not matches:
-            protocol.issues.append(f"Эталон «{label}» из {where} отсутствует в Таблицы!A10:A18. "
-                                   "Добавьте его в перечень средств поверки.")
-        elif any(item.category != "mieta" for item in matches):
-            sources = ", ".join(item.source for item in matches if item.category != "mieta")
-            protocol.issues.append(f"Для эталона «{label}» из {where} проверьте тип прибора "
-                                   f"в столбце D листа «Оборудование» ({sources}). Требуется категория «Эталон» "
-                                   "(в старом шаблоне — «ФИФ» или «ФИФ без №»).")
+def _extended_report_rows(report):
+    # The appendix and its column titles distinguish report contents from equipment list text.
+    appendix = next((r for r, row in enumerate(report[35:], 35)
+                     if _text(row[0]).casefold().startswith("приложение к протоколу поверки")), 0)
+    if not appendix:
+        return 0, 0, 0
+    results = next((r for r in range(appendix - 1, 34, -1)
+                    if _text(report[r][0]).casefold().startswith("результаты поверки:")), 0)
+    conclusion = next((r for r in range(results + 1, appendix)
+                       if _text(report[r][0]).casefold().startswith("заключение:")), 0) if results else 0
+    measurements = next((r for r in range(appendix + 1, len(report))
+                         if _text(report[r][0]) == "№"
+                         and _text(report[r][2]).replace(" ", "").casefold() in {"т,°с", "т,°c"}
+                         and _text(report[r][3]).casefold().startswith("rэт")), 0)
+    return results, conclusion, measurements - 1 if measurements else 0
 
 
 def read(book, protocol: Protocol) -> None:
     protocol.measurement_hint = "Проверьте сохранённые результаты на листах «Данные» и «Таблицы»."
     data = _matrix(book["Данные"], DATA_LAST_ROW, 12)
     t = _matrix(book["Таблицы"], MEASUREMENT_LAST_ROW, 12)
-    report = _matrix(book["Отчёт"], 61, 10)
+    catalog = _matrix(book["Оборудование"], 301, 6)
+    modern = _text(catalog[1][5]).casefold() == "используется"
+    report = _matrix(book["Отчёт"], 420 if modern else 61, 10)
+    results_row, conclusion_row, marking_row = _extended_report_rows(report) if modern else (0, 45, 61)
+    conclusion_cell = f"Отчёт!A{conclusion_row or 336}"
     protocol.number = _present(t[1][3])
-    protocol.evidence = _present(report[45][0])
+    protocol.evidence = _present(report[conclusion_row][0]) if conclusion_row else ""
     protocol.conclusion = _text(t[19][2]).casefold()
     protocol.report_outcome = _conclusion(protocol.evidence)
     protocol.conclusion_outcome = _conclusion(protocol.conclusion)
@@ -254,12 +247,6 @@ def read(book, protocol: Protocol) -> None:
         protocol.elements = 2 if "х" in scheme else 1
     else:
         protocol.issues.append("Укажите поддерживаемую схему соединения в Таблицы!H27.")
-    print_limit = data[1][11]
-    if protocol.declared and protocol.elements and type(print_limit) is int and print_limit > 0:
-        blocks = protocol.declared * protocol.elements
-        if blocks > print_limit:
-            protocol.notices.append(f"Печатная вместимость «Данные»!L1 — {print_limit} блоков, в партии {blocks}. "
-                                    "Проверьте полный отчёт. Выгрузка XML проверяет все строки измерений.")
     if protocol.declared and protocol.elements and protocol.declared * protocol.elements > DATA_LAST_ROW - 1:
         protocol.issues.append("Количество заявленных измерительных блоков превышает диапазон расчётных строк.")
 
@@ -286,9 +273,9 @@ def read(book, protocol: Protocol) -> None:
                          (7, "humidity", "%"), (8, "other", "В")]:
         put(key, _condition(t[r][1], unit), f"Таблицы!B{r}", t[r][1])
     model, execution, ex, length = (_present(v) for v in t[27][:4])
-    full = _present(report[61][0])
+    full = _present(report[marking_row][0]) if marking_row else ""
     put("marking", full or " / ".join(v for v in (model, execution, ex, length) if v),
-        "Отчёт!A61 / Таблицы!A27:D27")
+        f"Отчёт!A{marking_row}" if full else "Таблицы!A27:D27")
     put("wiring", scheme, "Таблицы!H27")
     put("interval", _present(t[27][10]), "Таблицы!K27")
     component_issues = []
@@ -309,9 +296,10 @@ def read(book, protocol: Protocol) -> None:
         except ValueError as exc:
             protocol.issues.append(f"{exc} Проверьте дату и МПИ в Таблицы!B24 и K27.")
     put("serial_list", _present(t[19][1]), "Таблицы!B19 / D2:G4")
-    put("aggregate", _present(t[19][2]), "Таблицы!C19 / Отчёт!A45")
-    put("selected_standard", _present(t[30][7]), "Таблицы!H30:J30")
-    put("equipment_list", None, "Таблицы!A10:A18")
+    put("aggregate", _present(t[19][2]), f"Таблицы!C19 / {conclusion_cell}")
+    if results_row:
+        put("report_results", _present(report[results_row][0]), f"Отчёт!A{results_row}")
+    put("equipment_list", None, "Оборудование!F2:F301" if modern else "Таблицы!A10:A18")
     type_number = protocol.fields["type_number"].value
     if component_issues:
         modification, modification_issue = "", " ".join((*component_issues, "Исправьте ячейки и сохраните книгу."))
@@ -323,21 +311,23 @@ def read(book, protocol: Protocol) -> None:
                         protocol.digest[:12], _text(t[27][11])[:128], _text(t[27][0])[:128],
                         _text(t[27][1])[:128], _text(t[27][2])[:128], modification_issue[:300])
     put("modification", modification, "Таблицы!A27:C27", " / ".join(part for part in (model, execution, ex) if part))
-    catalog = _matrix(book["Оборудование"], 301, 5)
-    protocol.equipment = _equipment(protocol, t, catalog, _matrix(book["Эталоны"], 301, 7))
-    for row in range(10, 19):
-        if _text(t[row][0]).startswith("#"):
-            protocol.issues.append(f"Ошибка Excel в строке средства поверки Таблицы!A{row}.")
-    measurement_rows = _instruments(protocol, t, data)
-    _check_standard_selections(protocol, t, measurement_rows)
+    if modern:
+        protocol.equipment = _marked_equipment(protocol, catalog)
+    else:
+        protocol.equipment = _legacy_equipment(protocol, t, catalog)
+        for row in range(10, 19):
+            if _text(t[row][0]).startswith("#"):
+                protocol.issues.append(f"Ошибка Excel в строке средства поверки Таблицы!A{row}.")
+    points = 1 if _text(t[27][6]).upper() in {"C", "С"} else 2
+    _instruments(protocol, t, data, points)
     if not protocol.report_outcome or not protocol.conclusion_outcome:
-        protocol.issues.append("Не заполнено итоговое заключение. Проверьте Таблицы!C19 и Отчёт!A45.")
+        protocol.issues.append(f"Не заполнено итоговое заключение. Проверьте Таблицы!C19 и {conclusion_cell}.")
     elif protocol.report_outcome != protocol.conclusion_outcome:
-        protocol.issues.append("Итоговые заключения расходятся. Проверьте Таблицы!C19 и Отчёт!A45.")
+        protocol.issues.append(f"Итоговые заключения расходятся. Проверьте Таблицы!C19 и {conclusion_cell}.")
     elif protocol.instruments and all(item.outcome for item in protocol.instruments):
         measured = "fail" if any(item.outcome == "fail" for item in protocol.instruments) else "pass"
         if measured != protocol.report_outcome:
-            protocol.issues.append("Итоговое заключение расходится с измерениями. Проверьте Таблицы!C19 и Отчёт!A45.")
+            protocol.issues.append(f"Итоговое заключение расходится с измерениями. Проверьте Таблицы!C19 и {conclusion_cell}.")
 
 
 def _source_ranges(t, declared):
@@ -363,10 +353,9 @@ def _source_ranges(t, declared):
     return (names, ", ".join(ranges)) if names else None
 
 
-def _instruments(protocol: Protocol, t: list, data: list) -> list[tuple[int, int]]:
+def _instruments(protocol: Protocol, t: list, data: list, points: int) -> None:
     by_index = defaultdict(list)
     malformed = []
-    measurement_rows = []
     for r, row in enumerate(data[2:], 2):
         _, index, part, entry, suffix, padded, combined, _, status = row[:9]
         if entry in ("", None) and combined in ("", None):
@@ -380,19 +369,15 @@ def _instruments(protocol: Protocol, t: list, data: list) -> list[tuple[int, int
         except ValueError:
             number = ""
         first = 35 + (r - 2) * 2
-        rows = t[first:first + 2]
+        rows = t[first:first + points]
         if not number or raw != _text(padded) + _text(suffix):
             malformed.append(r)
-        elif 0 <= index < (protocol.declared or 0) and 1 <= part <= protocol.elements:
-            # Each saved block maps to two rows with defaults H30 and H31 in the template.
-            measurement_rows.extend((first + offset, 30 + offset) for offset, line in enumerate(rows)
-                                    if type(line[6]) in (int, float) and isfinite(line[6]))
         values = tuple(tuple(line[c] for c in MEASUREMENT_COLUMNS) for line in rows)
-        measured = len(values) == 2 and all(
+        measured = len(values) == points and (points != 1 or values[0][0] == 0) and all(
             type(value) in (int, float) and isfinite(value) for line in values for value in line
         ) and all(line[-1] >= 0 for line in values)
         by_index[index].append((number, raw, ElementReading(
-            part, _text(status), measured, f"Данные!I{r}, Таблицы!C{first}:J{first + 1}", values if measured else ()
+            part, _text(status), measured, f"Данные!I{r}, Таблицы!C{first}:J{first + points - 1}", values if measured else ()
         )))
     if malformed:
         protocol.issues.append("Некорректные или отсутствующие кэши индексов/номеров на листе «Данные»: " +
@@ -438,13 +423,12 @@ def _instruments(protocol: Protocol, t: list, data: list) -> list[tuple[int, int
                 protocol.instruments = [Instrument(n, _text(t[19][1]), "Таблицы!B19") for n in serial_list(_text(t[19][1]))]
             except ValueError:
                 pass
-    return measurement_rows
 
 
 def _status_disagrees(reading: ElementReading) -> bool:
     if not reading.complete or reading.status not in {PASS, FAIL}:
         return False
-    # Данные!I сравнивает верхнюю и нижнюю границы H/I с допуском J в двух точках.
+    # Compare H/I with the saved tolerance J for each required point.
     within_limits = all(upper <= limit and lower >= -limit
                         for _, _, _, upper, lower, limit in reading.measurements)
     return within_limits != (reading.status == PASS)
