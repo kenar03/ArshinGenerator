@@ -43,7 +43,8 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'PyInstaller failed.' }
     $portable = Join-Path $dist 'SI-Export'
     New-Item -ItemType File -Force (Join-Path $portable 'portable.flag') | Out-Null
-    Copy-Item docs/quick_start.md (Join-Path $portable 'Инструкция.md')
+    $guide = (Get-Content -Raw -Encoding utf8 -LiteralPath 'docs/quick_start.txt') -replace '\r?\n', "`r`n"
+    [IO.File]::WriteAllText((Join-Path $portable 'Инструкция.txt'), $guide, [Text.UTF8Encoding]::new($true))
     & $Python packaging/collect_licenses.py $portable
     if ($LASTEXITCODE -ne 0) { throw 'Could not collect third-party notices.' }
     Compress-Archive -LiteralPath $portable -DestinationPath (Join-Path $out 'SI-Export-Portable-x64.zip') -Force

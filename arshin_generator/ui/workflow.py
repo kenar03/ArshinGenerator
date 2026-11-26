@@ -10,7 +10,7 @@ from .common import Form, button, label
 def laboratory_settings(parent, storage):
     laboratory = storage.laboratory()
     xml_output = storage.xml_output()
-    form = Form(parent, "Настройки", size=(665, 440), save="Сохранить настройки")
+    form = Form(parent, "Настройки", size=(665, 535), save="Сохранить настройки")
     fields = form.editor.form
     fields.addRow(label("Реквизиты лаборатории", "heading"))
     fields.addRow(label("Программа использует эти сведения, когда соответствующее поле в Excel пустое."))
@@ -47,6 +47,27 @@ def laboratory_settings(parent, storage):
     destination.setEnabled(automatic.isChecked())
     automatic.toggled.connect(destination.setEnabled)
 
+    fields.addRow(label("Папка для сохранения PDF", "heading"))
+    pdf_destination = QWidget(form.editor)
+    pdf_row = QHBoxLayout(pdf_destination)
+    pdf_row.setContentsMargins(0, 0, 0, 0)
+    saved_pdf = storage.setting("pdf_folder")
+    pdf_folder = QLineEdit(saved_pdf)
+    pdf_folder.setReadOnly(True)
+    pdf_folder.setAccessibleName("Папка для сохранения PDF")
+    pdf_folder.setPlaceholderText("Выбирать папку при создании PDF")
+    pdf_row.addWidget(pdf_folder, 1)
+
+    def browse_pdf():
+        path = QFileDialog.getExistingDirectory(form, "Папка для сохранения PDF",
+                                                pdf_folder.text() or str(parent.output_folder()))
+        if path:
+            pdf_folder.setText(str(Path(path)))
+
+    pdf_row.addWidget(button("Обзор…", browse_pdf))
+    pdf_row.addWidget(button("Сбросить", pdf_folder.clear))
+    fields.addRow(pdf_destination)
+
     refresh_status = label("")
     refresh_status.hide()
 
@@ -82,6 +103,8 @@ def laboratory_settings(parent, storage):
         output = automatic.isChecked(), folder.text()
         if output != xml_output:
             storage.save_xml_output(*output)
+        if pdf_folder.text() != saved_pdf:
+            storage.set_setting("pdf_folder", pdf_folder.text())
         values = form.values()
         if values != initial_fields:
             changed = {key: value for key, value in values.items() if value != initial_fields[key]}

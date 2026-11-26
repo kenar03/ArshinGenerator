@@ -5,7 +5,7 @@ import sys
 
 output = Path(sys.argv[1]) / "licenses"
 output.mkdir(exist_ok=True)
-for name in ("PySide6-Essentials", "shiboken6", "openpyxl", "et_xmlfile", "lxml"):
+for name in ("PySide6-Essentials", "shiboken6", "openpyxl", "et_xmlfile", "lxml", "pypdf", "pywin32"):
     package = distribution(name)
     target = output / name
     target.mkdir(exist_ok=True)

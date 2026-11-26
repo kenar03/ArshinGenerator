@@ -24,6 +24,7 @@ from arshin_generator.confirmations import protocol_key
 from arshin_generator.domain import Datum, RegistryEntry
 from arshin_generator.readers import read_protocol
 from arshin_generator.public_registry import REGISTRY_TTL
+from arshin_generator.pdf_export import PdfResult
 from arshin_generator.storage import Storage
 from arshin_generator.registry import EquipmentCandidate, EquipmentLookup, lookup_equipment, lookup_key
 from arshin_generator.ui.common import Form
@@ -1093,6 +1094,88 @@ class InterfaceTests(unittest.TestCase):
             self.assertEqual(server.calls, before)
             self.assertTrue(reopened.can_export)
             reopened.close()
+
+    def test_pdf_toolbar_fits_narrow_and_wide_windows(self):
+        with TemporaryDirectory() as directory:
+            main = self.window(Path(directory))
+            main.show()
+            buttons = (main.add_btn, main.remove_btn, main.recheck_btn, main.preview_btn,
+                       main.export_btn, main.pdf.action)
+            for width in (680, 1000):
+                main.resize(width, 550)
+                self.app.processEvents()
+                for control in buttons:
+                    self.assertGreaterEqual(control.width(), control.minimumSizeHint().width(), control.text())
+                self.assertLessEqual(abs(main.export_btn.geometry().center().y()
+                                         - main.pdf.action.geometry().center().y()), 1)
+                self.assertLess(main.export_btn.geometry().right(), main.pdf.action.x())
+
+    def test_pdf_selects_destination_runs_with_xml_unavailable_and_reports_progress(self):
+        with TemporaryDirectory() as directory:
+            folder = Path(directory)
+            main = self.window(folder)
+            protocol = fixture(folder / "Выбранный.xlsx", "Недостаточно данных для XML", "001B6", temperature=None)
+            main.protocols = [protocol]
+            main.recheck()
+            self.assertFalse(main.export_btn.isEnabled())
+            notices = []
+
+            def batch(jobs, *, replace_existing, progress):
+                self.assertEqual([job.source for job in jobs], [protocol.path])
+                self.assertFalse(replace_existing)
+                progress(protocol.path, 1, 1)
+                return [PdfResult(protocol.path, "created")]
+
+            show_progress = main.pdf.show_progress
+
+            def track(source, index, total):
+                show_progress(source, index, total)
+                notices.append(main.pdf.status.text())
+
+            with patch.object(main.pdf, "show_progress", side_effect=track), \
+                    patch.object(QFileDialog, "getExistingDirectory", return_value=str(folder)) as choose, \
+                    patch("arshin_generator.ui.pdf.message", return_value=False), \
+                    patch("arshin_generator.ui.pdf.create_pdfs", side_effect=batch) as exporter:
+                main.pdf.action.click()
+                self.assertFalse(main.pdf.action.isEnabled())
+                main.pdf.start([protocol.path])
+                loop = QEventLoop()
+                main.pdf.thread.finished.connect(loop.quit)
+                QTimer.singleShot(5000, loop.quit)
+                loop.exec()
+                exporter.assert_called_once()
+                choose.assert_called_once()
+            self.assertEqual(main.storage.setting("pdf_folder"), "")
+            self.assertTrue(main.pdf.action.isEnabled())
+            self.assertEqual(notices, ["Создаётся PDF: Выбранный.xlsx (1 из 1)"])
+            self.assertIn("Создано PDF: 1", main.pdf.status.text())
+            self.assertFalse(main.pdf.open.isHidden())
+
+    def test_pdf_folder_can_be_saved_in_settings_and_reused(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            main = self.window(root)
+
+            def configure(form):
+                field = next(w for w in form.findChildren(QLineEdit) if w.accessibleName() == "Папка для сохранения PDF")
+                picker = next(w for w in field.parentWidget().findChildren(QPushButton) if w.text() == "Обзор…")
+                picker.click()
+                form._accept()
+                return form.result()
+
+            with patch.object(Form, "exec", new=configure), \
+                    patch.object(QFileDialog, "getExistingDirectory", return_value=str(root)):
+                main.settings_btn.click()
+            main.close()
+            reopened = self.window(root)
+            with patch.object(QFileDialog, "getExistingDirectory") as choose:
+                self.assertEqual(reopened.pdf.destination(), root)
+                choose.assert_not_called()
+            reopened.storage.set_setting("pdf_folder", str(root / "пропавшая папка"))
+            with patch("arshin_generator.ui.pdf.message", return_value=True), \
+                    patch.object(QFileDialog, "getExistingDirectory", return_value="") as choose:
+                self.assertIsNone(reopened.pdf.destination())
+                choose.assert_called_once()
 
     def test_automatic_single_export_uses_next_unused_name_and_keeps_manual_folder(self):
         with TemporaryDirectory() as directory:

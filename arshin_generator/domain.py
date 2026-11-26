@@ -4,6 +4,12 @@ from pathlib import Path
 from typing import TypeAlias
 
 Scalar: TypeAlias = str | int | bool | None
+
+
+class PdfError(ValueError):
+    """An explanation suitable for the PDF batch results."""
+
+
 READY = "Готов"
 CHECKING = "Проверяется"
 REVIEW = "Требует проверки"

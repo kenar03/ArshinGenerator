@@ -1,6 +1,7 @@
 ﻿param(
     [switch] $TestInstaller,
     [switch] $CheckConnection,
+    [switch] $TestPdf,
     [string] $UpgradeFrom = '',
     [string] $Python = 'python'
 )
@@ -19,9 +20,25 @@ function Get-WorkbookHash {
 }
 $baseHash = Get-WorkbookHash
 
-function Test-Executable($exe, $report, [switch] $ImportSample, [switch] $Legacy) {
+function Test-Guide($folder) {
+    $guide = Join-Path $folder 'Инструкция.txt'
+    if (Test-Path -LiteralPath (Join-Path $folder 'Инструкция.md')) { throw 'The old Markdown guide is still present.' }
+    $bytes = [IO.File]::ReadAllBytes($guide)
+    $expected = (Get-Content -Raw -Encoding utf8 -LiteralPath (Join-Path $root 'docs/quick_start.txt')) -replace '\r?\n', "`r`n"
+    if ($bytes.Length -lt 3 -or [BitConverter]::ToString($bytes, 0, 3) -ne 'EF-BB-BF' -or
+        [IO.File]::ReadAllText($guide) -cne $expected) {
+        throw 'The packaged guide is not the expected UTF-8 text file.'
+    }
+}
+
+function Test-Executable($exe, $report, [switch] $ImportSample, [switch] $Legacy, [switch] $ExportPdf) {
     $args = @('--smoke-check', ('"' + $report + '"'))
-    if ($ImportSample) { $args += ('"' + $sample + '"') }
+    if ($ExportPdf) {
+        $pdfFolder = Join-Path $qa 'PDF'
+        New-Item -ItemType Directory -Force -Path $pdfFolder | Out-Null
+        $args += @('--smoke-pdf', ('"' + $pdfFolder + '"'))
+    }
+    if ($ImportSample -or $ExportPdf) { $args += ('"' + $sample + '"') }
     $oldPath = $env:PATH
     $oldPythonPath = $env:PYTHONPATH
     $oldPythonHome = $env:PYTHONHOME
@@ -32,9 +49,18 @@ function Test-Executable($exe, $report, [switch] $ImportSample, [switch] $Legacy
         $env:PYTHONPATH = Join-Path $qa 'absent-python'
         $env:QT_QPA_PLATFORM = 'windows'
         $process = Start-Process -FilePath $exe -ArgumentList $args -WindowStyle Hidden -PassThru
-        if (-not $process.WaitForExit(30000)) { throw "Timeout for $exe" }
+        $timeout = if ($ExportPdf) { 165000 } else { 30000 }
+        if (-not $process.WaitForExit($timeout)) { throw "Timeout for $exe" }
         if (-not (Test-Path -LiteralPath $report)) { throw "Missing application report, exit $($process.ExitCode)" }
         $check = Get-Content -Raw -Encoding utf8 -LiteralPath $report | ConvertFrom-Json
+        if ($ExportPdf) {
+            $pdf = Join-Path $pdfFolder (([IO.Path]::GetFileNameWithoutExtension($sample)) + '.pdf')
+            if ($process.ExitCode -ne 0 -or $check.results[0].status -ne 'created' -or
+                (Get-Item -LiteralPath $pdf).Length -le 0) {
+                throw "Packaged Excel PDF check failed. See $report."
+            }
+            return $check
+        }
         if ($process.ExitCode -ne 0 -or $check.error) { throw "App failed: $($check.error)" }
         if ($check.schema -ne 'cc92b2a1f8670d230a405d42f9ad08a729a6a35cab94751d5bb1208cf493e361') {
             throw 'Unexpected XSD.'
@@ -84,6 +110,7 @@ if (-not $TestInstaller) {
     Expand-Archive -LiteralPath (Join-Path $release 'SI-Export-Portable-x64.zip') -DestinationPath $qa
     $portable = Join-Path $qa 'SI-Export'
     $relocated = Join-Path $qa 'Перенесённая папка СИ-Экспорт'
+    Test-Guide $portable
     $before = Test-Executable (Join-Path $portable 'SI-Export.exe') (Join-Path $qa 'portable-1.json') -ImportSample
     if ($before.data -ne (Join-Path $portable 'data')) { throw 'Incorrect portable data directory.' }
     Move-Item -LiteralPath $portable -Destination $relocated
@@ -91,6 +118,9 @@ if (-not $TestInstaller) {
     if ($after.previous -ne '1' -or $after.data -ne (Join-Path $relocated 'data') -or
             $after.input_folder -ne $before.input_folder) { throw 'Portable data did not survive the move.' }
     $result.portable = @{ started = $true; relocated = $true; restored_last_folder = $true; sample_results = 25 }
+    if ($TestPdf) {
+        $result.pdf = Test-Executable (Join-Path $relocated 'SI-Export.exe') (Join-Path $qa 'portable-pdf.json') -ExportPdf
+    }
     if ($CheckConnection) {
         $result.connection = Test-RegistryConnection (Join-Path $relocated 'SI-Export.exe') (Join-Path $qa 'portable-connection.json')
     }
@@ -162,11 +192,14 @@ else {
             $expectedPrevious = '2'
         }
         else {
+            New-Item -ItemType Directory -Force $installTarget | Out-Null
+            Set-Content -LiteralPath (Join-Path $installTarget 'Инструкция.md') -Value 'Previous guide'
             Install-TestPackage $installer 'install.log' -SelectDesktop
             if (Test-Path -LiteralPath $legacyExe) { throw 'A clean installation contains a legacy executable path.' }
             $before = Test-Executable $exe (Join-Path $qa 'installed-1.json') -ImportSample
             $expectedPrevious = '1'
         }
+        Test-Guide $installTarget
         if ((Get-ItemPropertyValue -LiteralPath $key -Name DisplayName) -ne 'СИ-Экспорт') {
             throw 'Incorrect application name in Installed apps.'
         }
@@ -191,6 +224,9 @@ else {
         }
         if (Test-Path -LiteralPath (Join-Path $installTarget 'portable.flag')) { throw 'Installed build has portable mode flag.' }
         $after = Test-Executable $exe (Join-Path $qa 'installed-2.json')
+        if ($TestPdf) {
+            $result.pdf = Test-Executable $exe (Join-Path $qa 'installed-pdf.json') -ExportPdf
+        }
         if ($CheckConnection) {
             $result.connection = Test-RegistryConnection $exe (Join-Path $qa 'installed-connection.json')
         }

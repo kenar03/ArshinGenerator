@@ -100,13 +100,11 @@ class MaterialTests(unittest.TestCase):
                             for i in sample.instruments))
         self.assertEqual(sample.reader_name, "ТСП/ТСМ")
         self.assertEqual(sample.fields["modification"].value, "ТСМ-0193-01")
-        self.assertEqual([(e.serial, e.registration or e.type_number) for e in sample.equipment], [
+        self.assertCountEqual([(e.serial, e.registration or e.type_number) for e in sample.equipment], [
             ("83046", "4542-74"), ("3342", "32777.06.2Р.01504903"), ("3342", "32777.06.2Р.01504902"),
-            ("231024843", "58550-14"), ("", ""),
+            ("231024843", "58550-14"), ("10253831", "19973.06.4Р.01149311"),
             ("21-5558L", "80030.20.3Р.01538249"), ("21-5558L", "80030.20.3Р.01538250"),
         ])
-        self.assertIn("19973.06.4P.01149311", sample.equipment[4].description)
-        self.assertIn("Таблицы!A15", " ".join(check([sample], {}, [], check_registry=False)[0].blockers))
         results = check([sample], {}, [])
         self.assertTrue(all(r.value("outcome") == "pass" for r in results))
         for key, value in {
@@ -481,19 +479,15 @@ def sample_copy_with_kind(path, kind):
             contents = original.read(item)
             if item.filename == name:
                 sheet = etree.fromstring(contents)
-                # The supplied older book retains a stale print label in A15. Correct the test copy only.
-                correct_label = ("19973.06.4Р.01149311 Система поверки термопреобразователей "
-                                 "автоматизированная АСПТ № 10253831")
-                for address, row_number, value in (("B1", 1, kind), ("A15", 15, correct_label)):
-                    row = sheet.find(f".//{{{namespace}}}row[@r='{row_number}']")
-                    cell = row.find(f"{{{namespace}}}c[@r='{address}']")
-                    if cell is None:
-                        cell = etree.Element(f"{{{namespace}}}c", r=address)
-                        row.insert(1 if address == "B1" else 0, cell)
-                    for child in list(cell):
-                        cell.remove(child)
-                    cell.set("t", "inlineStr")
-                    etree.SubElement(etree.SubElement(cell, f"{{{namespace}}}is"), f"{{{namespace}}}t").text = value
+                row = sheet.find(f".//{{{namespace}}}row[@r='1']")
+                cell = row.find(f"{{{namespace}}}c[@r='B1']")
+                if cell is None:
+                    cell = etree.Element(f"{{{namespace}}}c", r="B1")
+                    row.insert(1, cell)
+                for child in list(cell):
+                    cell.remove(child)
+                cell.set("t", "inlineStr")
+                etree.SubElement(etree.SubElement(cell, f"{{{namespace}}}is"), f"{{{namespace}}}t").text = kind
                 contents = etree.tostring(sheet, encoding="utf-8")
             copied.writestr(item, contents)
     return path

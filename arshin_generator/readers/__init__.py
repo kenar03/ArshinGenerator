@@ -24,6 +24,10 @@ class ProtocolReader(ReaderContract):
 READERS: tuple[ProtocolReader, ...] = (rtd,)
 
 
+def matching_readers(book):
+    return [reader for reader in READERS if reader.matches(book)]
+
+
 def read_protocol(path: Path) -> Protocol:
     if path.suffix.casefold() not in EXTENSIONS:
         return Protocol(path.absolute(), "", error="Поддерживаются книги Excel XLSM, XLSX, XLTM и XLTX.", unsupported=True)
@@ -39,7 +43,7 @@ def read_protocol(path: Path) -> Protocol:
         protocol.digest = sha256(snapshot).hexdigest()
         workbook = load_workbook(BytesIO(snapshot), read_only=True, data_only=True, keep_links=False)
         try:
-            matches = [reader for reader in READERS if reader.matches(workbook)]
+            matches = matching_readers(workbook)
             if len(matches) == 1:
                 reader = matches[0]
                 protocol.reader = reader.VERSION

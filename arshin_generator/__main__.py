@@ -4,6 +4,7 @@ from importlib.resources import files
 import json
 import logging
 from logging.handlers import RotatingFileHandler
+from multiprocessing import freeze_support
 from pathlib import Path
 import sys
 
@@ -25,11 +26,25 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=APP_NAME)
     parser.add_argument("paths", nargs="*", type=Path)
     parser.add_argument("--smoke-check", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--smoke-pdf", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--check-connection", type=Path, help=argparse.SUPPRESS)
     service = parser.add_mutually_exclusive_group()
     service.add_argument("--history", action="store_true", help="Открыть историю выгрузок и резервное копирование")
     service.add_argument("--view-xml", type=Path, help="Открыть сохранённый XML")
     arguments = parser.parse_args(argv)
+    if arguments.smoke_pdf:
+        if not arguments.smoke_check or not arguments.paths:
+            parser.error("--smoke-pdf requires --smoke-check and input files")
+        from arshin_generator.pdf_export import create_pdfs, plan_pdf
+
+        logging.basicConfig(level=logging.INFO, filename=arguments.smoke_check.with_suffix(".log"),
+                            encoding="utf-8", format="%(asctime)s %(levelname)s %(message)s")
+        jobs = plan_pdf(arguments.paths, arguments.smoke_pdf.resolve())
+        results = create_pdfs(jobs)
+        report = {"version": VERSION, "results": [dict(file=result.source.name, status=result.status,
+                                                        detail=result.detail) for result in results]}
+        arguments.smoke_check.write_text(json.dumps(report, ensure_ascii=False), encoding="utf-8")
+        return int(any(result.status != "created" for result in results))
     if arguments.check_connection:
         log = arguments.check_connection.with_suffix(".log")
         logging.basicConfig(level=logging.INFO, filename=log, encoding="utf-8",
@@ -108,4 +123,5 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
+    freeze_support()
     sys.exit(main())

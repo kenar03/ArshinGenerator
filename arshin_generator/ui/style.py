@@ -10,6 +10,9 @@ BORDER = "#bac4d0"
 ACCENT = "#304e70"
 ACCENT_HOVER = "#294462"
 ACCENT_PRESSED = "#223953"
+PDF_ACCENT = "#326752"
+PDF_HOVER = "#285743"
+PDF_PRESSED = "#214938"
 FOCUS = "#4e729e"
 SELECTION = "#dde7f3"
 HOVER = "#edf2f8"
@@ -42,9 +45,19 @@ QPushButton#primary {{
 QPushButton#primary:hover {{ background: {ACCENT_HOVER}; }}
 QPushButton#primary:pressed {{ background: {ACCENT_PRESSED}; }}
 QPushButton#primary:focus {{ border-color: {SURFACE}; outline: 1px solid {FOCUS}; }}
-QPushButton:disabled, QToolButton:disabled, QPushButton#primary:disabled {{
+QToolButton#pdfAction {{
+    color: {SURFACE}; background: {PDF_ACCENT}; border-color: {PDF_ACCENT}; font-weight: 600;
+    padding-right: 21px;
+}}
+QToolButton#pdfAction:hover {{ background: {PDF_HOVER}; }}
+QToolButton#pdfAction:pressed {{ background: {PDF_PRESSED}; }}
+QToolButton#pdfAction::menu-button {{ width: 16px; border-left: 1px solid #60927d; }}
+QToolButton#pdfAction::menu-arrow {{ width: 8px; height: 6px; }}
+QPushButton:disabled, QToolButton:disabled, QPushButton#primary:disabled, QToolButton#pdfAction:disabled {{
     color: {DISABLED_INK}; background: {DISABLED_SURFACE}; border-color: {BORDER};
 }}
+QProgressBar {{ border: 1px solid {BORDER}; background: {HEADER}; border-radius: 2px; min-height: 7px; max-height: 7px; }}
+QProgressBar::chunk {{ background: {PDF_ACCENT}; }}
 
 QLineEdit, QComboBox, QPlainTextEdit, QTextEdit {{
     color: {INK}; background: {SURFACE}; border: 1px solid {BORDER}; border-radius: 2px;

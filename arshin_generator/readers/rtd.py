@@ -8,6 +8,7 @@ from ..dates import expiry_before_anniversary
 from ..domain import Datum, ElementReading, Equipment, Instrument, Protocol
 from ..normalization import DASHES, family_prefix, serial, serial_list
 from ..public_registry import TYPE_NUMBER
+from .rtd_print import prepare_pdf
 
 VERSION = "rtd-v1"
 DISPLAY_NAME = "ТСП/ТСМ"

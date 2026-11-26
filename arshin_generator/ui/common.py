@@ -36,7 +36,7 @@ def apply_dialog_icon(dialog):
         dialog.setWindowFlag(Qt.WindowType.WindowSystemMenuHint)
 
 
-def message(parent, title, detail, *, ask=False, error=False, confirm_text="Продолжить"):
+def message(parent, title, detail, *, ask=False, error=False, confirm_text="Продолжить", cancel_text="Отмена"):
     dialog = QMessageBox(parent)
     apply_dialog_icon(dialog)
     dialog.setWindowTitle(title)
@@ -46,7 +46,7 @@ def message(parent, title, detail, *, ask=False, error=False, confirm_text="Пр
     dialog.setIcon(icon)
     if ask:
         yes = dialog.addButton(confirm_text, QMessageBox.ButtonRole.AcceptRole)
-        no = dialog.addButton("Отмена", QMessageBox.ButtonRole.RejectRole)
+        no = dialog.addButton(cancel_text, QMessageBox.ButtonRole.RejectRole)
         dialog.setDefaultButton(no)
     else:
         yes = dialog.addButton("Закрыть", QMessageBox.ButtonRole.AcceptRole)

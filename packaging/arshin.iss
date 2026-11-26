@@ -5,7 +5,7 @@
   #error OutputPath must point to the release directory
 #endif
 #ifndef AppVersion
-  #define AppVersion "2.5.0"
+  #define AppVersion "2.6.0"
 #endif
 
 [Setup]
@@ -45,6 +45,7 @@ Source: "{#PortablePath}\*"; DestDir: "{app}"; Excludes: "portable.flag,data"; F
 Source: "{#PortablePath}\SI-Export.exe"; DestDir: "{app}"; DestName: "ArshinGenerator.exe"; Flags: ignoreversion; Check: KeepLegacyLauncher
 
 [InstallDelete]
+Type: files; Name: "{app}\Инструкция.md"
 Type: files; Name: "{autoprograms}\Аршин · Генератор XML.lnk"; Check: KeepLegacyLauncher
 Type: files; Name: "{autodesktop}\Аршин · Генератор XML.lnk"; Check: KeepLegacyLauncher
 

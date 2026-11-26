@@ -11,7 +11,7 @@ import sqlite3
 from PySide6.QtCore import QStandardPaths, QThread, QTimer, Qt, Signal
 from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (
-    QDialog, QFileDialog, QHBoxLayout, QHeaderView, QMainWindow, QMenu, QToolButton,
+    QBoxLayout, QDialog, QFileDialog, QHBoxLayout, QHeaderView, QMainWindow, QMenu, QToolButton,
     QVBoxLayout, QWidget,
 )
 
@@ -26,6 +26,7 @@ from ..verification import RegistrySession
 from .common import apply_dialog_icon, button, fit_window, label, message, selected, table
 from .protocol_list import ProtocolCheckDelegate, ProtocolHeader, ProtocolTableModel
 from .protocols import ProtocolDialog
+from .pdf import PdfControls
 from .workflow import laboratory_settings
 
 
@@ -129,7 +130,9 @@ class MainWindow(QMainWindow):
         header.addWidget(self.settings_btn, alignment=Qt.AlignmentFlag.AlignTop)
         layout.addLayout(header)
 
-        actions = QHBoxLayout()
+        self.action_bar = QHBoxLayout()
+        self.file_actions = QHBoxLayout()
+        self.export_actions = QHBoxLayout()
         self.add_btn = QToolButton()
         self.add_btn.setText("Добавить протоколы")
         self.add_btn.clicked.connect(self.pick_files)
@@ -137,17 +140,22 @@ class MainWindow(QMainWindow):
         add = QMenu(self.add_btn)
         add.addAction("Выбрать папку…", self.pick_folder)
         self.add_btn.setMenu(add)
-        actions.addWidget(self.add_btn)
+        self.file_actions.addWidget(self.add_btn)
         self.remove_btn = button("Удалить выбранные", self.remove_protocols)
-        actions.addWidget(self.remove_btn)
+        self.file_actions.addWidget(self.remove_btn)
         self.recheck_btn = button("Перепроверить", self.reload_protocols)
-        actions.addWidget(self.recheck_btn)
-        actions.addStretch()
+        self.file_actions.addWidget(self.recheck_btn)
+        self.file_actions.addStretch()
         self.preview_btn = button("Просмотреть", self.show_results)
         self.export_btn = button("Сформировать XML", self.export_xml, primary=True)
-        actions.addWidget(self.preview_btn)
-        actions.addWidget(self.export_btn)
-        layout.addLayout(actions)
+        self.export_actions.addStretch()
+        self.export_actions.addWidget(self.preview_btn)
+        self.export_actions.addWidget(self.export_btn)
+        self.pdf = PdfControls(self)
+        self.export_actions.addWidget(self.pdf.action)
+        self.action_bar.addLayout(self.file_actions)
+        self.action_bar.addLayout(self.export_actions)
+        layout.addLayout(self.action_bar)
 
         self.empty = label("Добавьте протоколы Excel или перетащите их сюда.")
         self.empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -175,6 +183,7 @@ class MainWindow(QMainWindow):
         footer.addWidget(self.notice, 1)
         footer.addWidget(self.summary, alignment=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignBottom)
         layout.addLayout(footer)
+        layout.addWidget(self.pdf.footer)
         QShortcut(QKeySequence("Ctrl+O"), self, activated=self.pick_files)
         QShortcut(QKeySequence(Qt.Key.Key_Delete), self, activated=self.remove_protocols)
         self.recheck()
@@ -187,7 +196,19 @@ class MainWindow(QMainWindow):
         self.notice.setText(text)
         self.notice.setVisible(bool(text))
 
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        margins = self.centralWidget().layout().contentsMargins()
+        needed = (self.file_actions.sizeHint().width() + self.export_actions.sizeHint().width()
+                  + margins.left() + margins.right() + self.action_bar.spacing())
+        direction = QBoxLayout.Direction.LeftToRight if event.size().width() >= needed else QBoxLayout.Direction.TopToBottom
+        self.action_bar.setDirection(direction)
+
     def closeEvent(self, event):
+        if self.pdf.thread is not None:
+            self.pdf.status.setToolTip("Дождитесь окончания создания PDF.")
+            event.ignore()
+            return
         if self.busy:
             self.set_notice("Дождитесь окончания проверки.")
             if self.lookup_thread:
@@ -206,16 +227,24 @@ class MainWindow(QMainWindow):
         event.acceptProposedAction()
 
     def pick_files(self):
+        paths = self.choose_input_files()
+        if paths:
+            self.import_paths(paths)
+
+    def choose_input_files(self):
         paths, _ = QFileDialog.getOpenFileNames(self, "Выбрать протоколы", self.storage.setting("input_folder"),
                                                 "Книги Excel (*.xlsm *.xlsx *.xltm *.xltx *.xls *.xlsb)")
-        if paths:
-            self.import_paths([Path(path) for path in paths])
+        return [Path(path) for path in paths]
 
     def pick_folder(self):
+        folder = self.choose_input_folder()
+        if folder:
+            self.import_paths([folder])
+
+    def choose_input_folder(self):
         folder = QFileDialog.getExistingDirectory(self, "Выбрать папку с протоколами",
                                                    self.storage.setting("input_folder"))
-        if folder:
-            self.import_paths([Path(folder)])
+        return Path(folder) if folder else None
 
     def import_paths(self, paths):
         if self.busy:
